@@ -1,0 +1,4 @@
+- _key: auth-service
+  title: auth-service
+  description: Credential verification service.
+  technology: Rust + Python

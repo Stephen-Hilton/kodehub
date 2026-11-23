@@ -1,0 +1,11 @@
+/target
+/.kode
+node_modules
+/app/dist
+/app/src-tauri/target
+/app/test-results
+/app/playwright-report
+.DS_Store
+*.local.mk
+local.mk
+*.tmp.mjs

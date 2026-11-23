@@ -1,0 +1,14 @@
+[package]
+name = "kodehub-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kodehub-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true

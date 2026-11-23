@@ -1,0 +1,3 @@
+- _key: secure-authentication
+  title: Secure authentication
+  logic: all_of

@@ -1,0 +1,257 @@
+{
+  "scenario": "demo-locked-account",
+  "description": "doc 08 demo: locked accounts must return invalid_credentials. Round 1 leaks timing; the blind reviewer blocks it; round 2 equalises timing with a dummy-hash verification.",
+  "responses": [
+    {
+      "role": "orchestrator",
+      "label": "plan",
+      "output": {
+        "summary": "Add a `locked` flag to User and make verify_credentials return InvalidCredentials for locked accounts, indistinguishably from other failures.",
+        "changes": [
+          {
+            "symbol": "User",
+            "display_name": "User",
+            "kind": "class",
+            "language": "rust",
+            "action": "modify",
+            "component": "",
+            "description": "Add `locked: bool` (serde default false)."
+          },
+          {
+            "symbol": "verify_credentials",
+            "display_name": "verify_credentials",
+            "kind": "function",
+            "language": "rust",
+            "action": "modify",
+            "component": "",
+            "description": "Reject locked accounts with the generic InvalidCredentials result."
+          },
+          {
+            "symbol": "",
+            "display_name": "test_locked_account_is_invalid",
+            "kind": "test",
+            "language": "rust",
+            "action": "add",
+            "component": "credential-verification",
+            "description": "R1 edge case: locked account \u2192 invalid_credentials."
+          }
+        ],
+        "tests": [
+          "A locked account with the correct password returns invalid_credentials."
+        ],
+        "risks": [
+          "Rejecting locked accounts early could create a timing side channel that reveals account state."
+        ]
+      }
+    },
+    {
+      "role": "tester",
+      "label": "write tests",
+      "output": {
+        "tests": [
+          {
+            "display_name": "test_locked_account_is_invalid",
+            "language": "rust",
+            "body": "let mut store = UserStore::new();\nstore.add_user(\"alice\", \"correct horse\");\nif let Some(user) = store.users.get_mut(\"alice\") {\n    user.locked = true;\n}\nassert_eq!(\n    verify_credentials(&store, \"alice\", \"correct horse\"),\n    AuthResult::InvalidCredentials\n);",
+            "verifies": [
+              "r1-generic-failure"
+            ],
+            "tests_for": [
+              "verify_credentials"
+            ],
+            "description": "R1 edge case: a locked account must also return invalid_credentials (even with the right password)."
+          }
+        ],
+        "notes": "Covers the new edge case only; unknown user / wrong password / empty username are already tested."
+      }
+    },
+    {
+      "role": "coder",
+      "label": "implement plan",
+      "output": {
+        "changes": [
+          {
+            "symbol": "User",
+            "display_name": "User",
+            "kind": "class",
+            "language": "rust",
+            "signature": "",
+            "body": "pub username: String,\npub password_hash: String,\n#[serde(default)]\npub locked: bool,",
+            "attributes_json": "{\"derives\": [\"Debug\", \"Clone\", \"Default\", \"PartialEq\", \"Eq\"]}",
+            "component": "",
+            "member_of": "",
+            "description": "User gains a locked flag."
+          },
+          {
+            "symbol": "verify_credentials",
+            "display_name": "verify_credentials",
+            "kind": "function",
+            "language": "rust",
+            "signature": "(store: &UserStore, username: &str, password: &str) -> AuthResult",
+            "body": "match store.find_user(username) {\n    Some(user) if !user.locked && verify_password(password, &user.password_hash) => {\n        AuthResult::Authenticated {\n            username: user.username,\n        }\n    }\n    _ => AuthResult::InvalidCredentials,\n}",
+            "attributes_json": "",
+            "component": "",
+            "member_of": "",
+            "description": "Reject locked accounts."
+          }
+        ],
+        "responses": [],
+        "notes": "PRIVATE-CODER-NOTE-7f3a: checking locked first is the cheapest path, so I short-circuit before hashing."
+      }
+    },
+    {
+      "role": "reviewer",
+      "label": "blind review round 1",
+      "output": {
+        "verdict": "changes_requested",
+        "summary": "Locked-account handling is functionally correct but leaks account state through timing.",
+        "findings": [
+          {
+            "id": "",
+            "severity": "blocking",
+            "location": "verify_credentials",
+            "status": "open",
+            "finding": "Timing difference between failure paths: for unknown users and locked accounts the Argon2 verification is skipped, so a failed login returns measurably faster than a wrong password. That reveals which usernames exist and which are locked, violating R1's intent. Always perform one verification (against a fixed dummy hash when there is no user) before deciding."
+          },
+          {
+            "id": "",
+            "severity": "minor",
+            "location": "User",
+            "status": "open",
+            "finding": "`locked` should default to false for existing serialized users; confirm #[serde(default)] is present (it is)."
+          }
+        ]
+      }
+    },
+    {
+      "role": "coder",
+      "label": "rework round 1",
+      "output": {
+        "changes": [
+          {
+            "symbol": "",
+            "display_name": "dummy_password_hash",
+            "kind": "function",
+            "language": "rust",
+            "signature": "() -> &'static str",
+            "body": "static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();\nDUMMY.get_or_init(|| hash_password(\"kodehub-timing-equaliser\"))",
+            "attributes_json": "{}",
+            "component": "password-hashing",
+            "member_of": "",
+            "description": "Fixed Argon2id hash used to equalise timing when no user exists."
+          },
+          {
+            "symbol": "verify_credentials",
+            "display_name": "verify_credentials",
+            "kind": "function",
+            "language": "rust",
+            "signature": "(store: &UserStore, username: &str, password: &str) -> AuthResult",
+            "body": "// Always run exactly one Argon2 verification so every failure path costs the same time.\nlet user = store.find_user(username);\nlet hash = match &user {\n    Some(u) => u.password_hash.as_str(),\n    None => dummy_password_hash(),\n};\nlet password_ok = verify_password(password, hash);\nmatch user {\n    Some(user) if password_ok && !user.locked => AuthResult::Authenticated {\n        username: user.username,\n    },\n    _ => AuthResult::InvalidCredentials,\n}",
+            "attributes_json": "",
+            "component": "",
+            "member_of": "",
+            "description": "Constant-work failure paths."
+          }
+        ],
+        "responses": [
+          {
+            "finding_id": "r0-f0",
+            "action": "fixed",
+            "explanation": "PRIVATE-CODER-RESPONSE-91c2: Every path now runs exactly one Argon2 verification (against a cached dummy hash when the user is unknown) and only then checks `locked`, so unknown, locked and wrong-password failures cost the same."
+          },
+          {
+            "finding_id": "r0-f1",
+            "action": "disputed",
+            "explanation": "PRIVATE-CODER-RESPONSE-0b55: #[serde(default)] is already on the field; no change needed."
+          }
+        ],
+        "notes": "PRIVATE-CODER-NOTE-c4d1: OnceLock keeps the dummy hash cost to one hash per process."
+      }
+    },
+    {
+      "role": "reviewer",
+      "label": "blind review round 2",
+      "output": {
+        "verdict": "approve",
+        "summary": "All failure paths now perform one Argon2 verification; locked accounts are indistinguishable from other failures.",
+        "findings": [
+          {
+            "id": "r0-f0",
+            "severity": "blocking",
+            "location": "verify_credentials",
+            "status": "resolved",
+            "finding": "Timing difference between failure paths."
+          },
+          {
+            "id": "r0-f1",
+            "severity": "minor",
+            "location": "User",
+            "status": "resolved",
+            "finding": "`locked` default."
+          }
+        ]
+      }
+    },
+    {
+      "role": "orchestrator",
+      "label": "plan (example \u2192 test)",
+      "output": {
+        "summary": "Turn the saved run-now example (locked user, right password \u2192 invalid_credentials) into a regression test.",
+        "changes": [
+          {
+            "symbol": "",
+            "display_name": "test_example_locked_user_right_password",
+            "kind": "test",
+            "language": "rust",
+            "action": "add",
+            "component": "credential-verification",
+            "description": "R1 example saved from run now."
+          }
+        ],
+        "tests": [
+          "A locked user with the correct password is rejected with invalid_credentials."
+        ],
+        "risks": []
+      }
+    },
+    {
+      "role": "tester",
+      "label": "write tests (example)",
+      "output": {
+        "tests": [
+          {
+            "display_name": "test_example_locked_user_right_password",
+            "language": "rust",
+            "body": "let mut store = UserStore::new();\nstore.add_user(\"alice\", \"correct horse\");\nif let Some(u) = store.users.get_mut(\"alice\") {\n    u.locked = true;\n}\nassert_eq!(\n    verify_credentials(&store, \"alice\", \"correct horse\"),\n    AuthResult::InvalidCredentials\n);",
+            "verifies": [
+              "r1-generic-failure"
+            ],
+            "tests_for": [
+              "verify_credentials"
+            ],
+            "description": "R1 example saved from run now."
+          }
+        ],
+        "notes": "Example from a real run; the code already satisfies it."
+      }
+    },
+    {
+      "role": "coder",
+      "label": "implement plan (example)",
+      "output": {
+        "changes": [],
+        "responses": [],
+        "notes": "No code change needed: the behaviour already holds."
+      }
+    },
+    {
+      "role": "reviewer",
+      "label": "blind review (example)",
+      "output": {
+        "verdict": "approve",
+        "summary": "Test-only change matching the requirement example.",
+        "findings": []
+      }
+    }
+  ]
+}

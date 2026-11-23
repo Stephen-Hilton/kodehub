@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = ["app/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+kodehub-core = { path = "crates/kodehub-core" }
+kodehub-store = { path = "crates/kodehub-store" }
+kodehub-render = { path = "crates/kodehub-render" }
+kodehub-runner = { path = "crates/kodehub-runner" }
+kodehub-agents = { path = "crates/kodehub-agents" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+blake3 = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+toml = "0.8"
+futures = "0.3"
+async-trait = "0.1"
+regex = "1"
+tempfile = "3"
+portable-pty = "0.9"
+base64 = "0.22"
+libc = "0.2"
+
+[profile.dev.package."*"]
+opt-level = 1

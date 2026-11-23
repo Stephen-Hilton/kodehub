@@ -1,0 +1,6 @@
+- _key: credential-verification
+  title: credential-verification
+  description: Looks up users and checks submitted credentials.
+- _key: password-hashing
+  title: password-hashing
+  description: Argon2id hashing and verification.

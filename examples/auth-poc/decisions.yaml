@@ -1,0 +1,7 @@
+- _key: generic-failure-message
+  title: Do not reveal which credential failed
+  choice: Return a single `invalid_credentials` result for every failed login.
+  rationale: Prevents username enumeration.
+  alternatives:
+    - Distinct "unknown user" and "wrong password" errors (rejected — enables enumeration).
+  made_by: human

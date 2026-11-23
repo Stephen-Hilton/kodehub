@@ -1,0 +1,8 @@
+- _key: rust-lib-macos
+  language: rust
+  os: macos
+  kind: rust-lib
+- _key: python-pkg-macos
+  language: python
+  os: macos
+  kind: python-pkg

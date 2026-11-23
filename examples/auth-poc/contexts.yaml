@@ -1,0 +1,3 @@
+- _key: authentication
+  title: Authentication
+  description: Everything involved in proving who a user is.

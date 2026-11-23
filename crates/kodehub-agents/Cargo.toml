@@ -1,0 +1,22 @@
+[package]
+name = "kodehub-agents"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kodehub-core.workspace = true
+kodehub-store.workspace = true
+kodehub-runner.workspace = true
+kodehub-render.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+axum.workspace = true

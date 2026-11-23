@@ -1,0 +1,18 @@
+services:
+  arangodb:
+    image: arangodb:3.12
+    container_name: kodehub-arangodb
+    environment:
+      ARANGO_ROOT_PASSWORD: ${KODEHUB_ARANGO_PASSWORD:-kodehub}
+    ports:
+      - "127.0.0.1:${KODEHUB_ARANGO_PORT:-8528}:8529"
+    volumes:
+      - kodehub-arango-data:/var/lib/arangodb3
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- --header 'Authorization: Basic cm9vdDprb2RlaHVi' http://127.0.0.1:8529/_api/version >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  kodehub-arango-data:

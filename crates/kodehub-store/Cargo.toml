@@ -1,0 +1,20 @@
+[package]
+name = "kodehub-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kodehub-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true

@@ -1,0 +1,33 @@
+- _key: r1-generic-failure
+  title: R1 — Generic failure
+  statement: Failed logins return one generic error.
+  intent: An attacker must not learn whether a username exists or which credential was wrong.
+  constraints:
+    - The same error is returned for an unknown user and for a wrong password.
+  examples:
+    - description: Unknown user
+      input: { username: bob, password: correct horse }
+      expected: invalid_credentials
+    - description: Wrong password
+      input: { username: alice, password: wrong }
+      expected: invalid_credentials
+  edge_cases:
+    - description: Empty username
+      input: { username: "", password: anything }
+      expected: invalid_credentials
+  out_of_scope:
+    - Rate limiting and lockout policy.
+- _key: r2-hashed-storage
+  title: R2 — Hashed storage
+  statement: Passwords are stored only as Argon2id hashes.
+  intent: A leaked user table must not reveal passwords.
+  constraints:
+    - Plaintext passwords are never stored.
+    - Hashes use Argon2id with a random salt.
+  examples:
+    - description: Hashing the same password twice gives different hashes that both verify
+      input: { password: hunter2 }
+      expected: two distinct Argon2id hashes, both verify
+  edge_cases: []
+  out_of_scope:
+    - Parameter tuning for production hardware.
