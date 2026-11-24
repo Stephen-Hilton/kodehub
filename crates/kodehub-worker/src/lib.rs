@@ -112,3 +112,39 @@ pub async fn agent(runner: &Runner, input: &Value) -> Result<Value> {
     };
     Ok(json!({"ok": true, "output": out}))
 }
+
+/// Transcription container: run the local Whisper model over one audio file (spec §14.1).
+/// `KODEHUB_TRANSCRIBE_CMD` is the command (the image sets `python3 /app/transcribe.py`); it gets
+/// the audio file path as its last argument and prints the text.
+pub async fn transcribe(s: &StorageClient, input: &Value) -> Result<Value> {
+    let key = input["audio_key"]
+        .as_str()
+        .context("audio_key is required")?;
+    let audio = s
+        .get(BUCKET, key)
+        .await?
+        .with_context(|| format!("audio {key} not found"))?;
+    let dir = tempfile::tempdir()?;
+    let ext = input["ext"].as_str().unwrap_or("webm");
+    let path = dir.path().join(format!("audio.{ext}"));
+    std::fs::write(&path, &audio)?;
+    let cmd = std::env::var("KODEHUB_TRANSCRIBE_CMD")
+        .unwrap_or_else(|_| "python3 /app/transcribe.py".into());
+    let mut parts = cmd.split_whitespace();
+    let prog = parts.next().context("empty KODEHUB_TRANSCRIBE_CMD")?;
+    let out = tokio::process::Command::new(prog)
+        .args(parts)
+        .arg(&path)
+        .output()
+        .await
+        .with_context(|| format!("cannot run {prog}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "transcription failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // the audio is not kept once transcribed
+    let _ = s.delete(BUCKET, key).await;
+    Ok(json!({"ok": true, "text": String::from_utf8_lossy(&out.stdout).trim()}))
+}

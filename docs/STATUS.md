@@ -1,54 +1,38 @@
-# Kodehub pilot — build status
+# Kodehub v0.1 — build status
 
-_Last updated by the build agent on 2026-11-05._
+_Last updated by the build agent on 2026-11-24._
 
-`make check` is green: fmt, clippy `-D warnings`, unit and integration tests against a real
-ArangoDB / cargo / pytest, UI typecheck and unit tests, and the Playwright end-to-end demo.
+`make check` is green: fmt, clippy `-D warnings`, unit and integration tests against ArangoDB in
+a local Kind cluster, UI typecheck and unit tests, the Playwright end-to-end suite, and the
+cluster check (image builds, deploy, smoke: health, storage round trip, an end-to-end *Test now*
+through scheduler → orchestrator → build Job → test Jobs, an agent task in its own container,
+and speech transcribed by Whisper in the cluster).
 
-## Milestones
+The plan and acceptance criteria are in `docs/09-v0.1-audit-and-plan.md`; every decision is in
+`docs/decisions.md` (D-041 … D-052 for v0.1).
 
-| | Status | Evidence |
+| Step | Status | Evidence |
 | --- | --- | --- |
-| **M0** Foundations | ✅ | Workspace + `app/` (Tauri v2 / React / TS). `make dev` → `GET /health` reports DB connectivity. `make check`. |
-| **M1** Graph core | ✅ | `kodehub-store/tests/m1_graph_core.rs`: golden content hashes, idempotent re-seed, one body edit makes exactly one version, a dependency change alters exactly the dependents' closure hashes, a second `current_version` edge is refused (unique index). |
-| **M2** Render/build/run | ✅ | `kodehub-runner/tests/m2_render_build_run.rs`: byte-identical renders, the seed compiles (Rust) and imports (Python) incl. namespaces, the second run is a cache hit in < 1 s, only dependents rebuild, the 10 s timeout kills the process group. |
-| **M3** Tests & traceability | ✅ | `m3_tests_traceability.rs`: coverage per requirement, orphans, `impact(hash_password)` = group + R1 + R2, a broken helper turns requirements red via propagation, exact and near duplicates. |
-| **M4** API & MCP | ✅ | `kodehub-server/tests/m4_http_api.rs` drives the seed scenario purely over HTTP (+ WebSocket events, MCP over stdio). `m4_claude_mcp.rs`: real Claude Code lists requirements and runs coverage over MCP. |
-| **M5** Agents & changesets | ✅ / ⚠️ | Recorded: `m5_agents_demo.rs` (blind review asserted, Decision recorded, merge only after tests, coverage green, cache-hit run now). **Claude Code backend, live:** `m5_live_claude_code.rs` passes on a subscription token with no API key (about 2 min). **API backend:** mock-tested only, because no `KODEHUB_ANTHROPIC_API_KEY` was available (D-030). |
-| **M6** Desktop UI | ✅ | `app/e2e/demo.spec.ts`: the entire doc 08 demo performed in the UI (Playwright), screenshots in `.kode/shots/e2e/`. Tauri bundle builds (`make desktop-build`). |
-| **M7** Releases & environments | ✅ | `m7_releases.rs`: immutable manifests, gated dev → test → qa → prod with exactly one `currently_running` per environment, one-time human approval for prod, rollback walks back, diffs list exactly the changed symbols (with reasons), bisect. |
-| **M8** (stretch) PyO3 binding | ✅ | `m8_pyo3_binding.rs`: Python `login()` calls Rust `verify_credentials` through a generated extension (asserted in the render, cached), and a Rust signature change marks the wrapper (and R1) at risk. Each extension builds in its own target dir. |
+| S1 Audit and plan | ✅ | `docs/09-v0.1-audit-and-plan.md` |
+| S2 Identity, tenancy, settings, credentials, audit | ✅ | `kodehub-store/tests/s2_identity.rs`, `kodehub-server/tests/s2_http_auth.rs` |
+| S3 SCD versions at every C4 level, philosophy, requirements, use cases, lifecycle | ✅ | `kodehub-server/tests/s3_c4_model.rs`, `m1_graph_core.rs` |
+| S4 Releases and environments (selection, open/cut, clone, patch, five environments) | ✅ | `kodehub-server/tests/m7_releases.rs` |
+| S5 Kind, images, storage service (local / cloud / hybrid, per-project backups) | ✅ | `kodehub-storage/tests/s5_storage.rs`, `scripts/k8s.sh smoke` |
+| S6 Claim and lease, work queue, scheduler, intents and negotiation | ✅ | `kodehub-store/tests/s6_queue.rs`, `kodehub-scheduler/tests/s6_scheduler.rs` |
+| S7 Build and test containers, shell test bundles, formal runs, baseline | ✅ | `kodehub-runner/tests/s7_bundles.rs`, `kodehub-server/tests/s7_containers.rs`, in-cluster smoke |
+| S8 Agents: types, dispatcher, kickoff chain, tests before code, escalation, blockers, budgets, agent containers | ✅ | `kodehub-server/tests/s8_agents.rs`, `s8_agent_containers.rs`, `m5_*` |
+| S9 Git import (import agent mapping) and export, graph backups | ✅ | `kodehub-server/tests/s9_git.rs` |
+| S10 UI: screens, in-node badges and overlays | ✅ | `app/e2e/demo.spec.ts`, `app/e2e/v01.spec.ts` |
+| S11 Speech transcription, remote MCP over OAuth 2.1 | ✅ | `kodehub-server/tests/s11_oauth_mcp.rs`, in-cluster smoke |
 
-## Critical reviews (headless Claude Code agents)
+## Not done / known limits
 
-| Round | Scope | Outcome |
-| --- | --- | --- |
-| `docs/reviews/review-m4.md` | M0–M4 | 2 critical, 6 high, 12 medium. All but a few pilot-scope items fixed (D-027). |
-| `docs/reviews/review-m6.md` | M5–M7 + UI (UI 6.5/10) | 22 findings, all accepted and fixed (D-036, D-037). |
-| `docs/reviews/review-final.md` | Completion + verification (UI 7.5/10; M5/M8 "partial") | 15 findings: per-launch UI secret for human-only actions, no code/trace edits outside changesets, requirement-centric `covered_revision`, PyO3 per-closure target dirs, demo ends green, and more. All fixed (D-039). |
-
-## Guardrails worth knowing
-
-- Code changes only through changesets. A merge needs passing affected tests, an attested blind
-  review (engine reviewer, or a human with the UI secret), no new orphans, and a verifying test
-  for every edited requirement.
-- Human-only actions (approve, requirement edits, prod approval, chat Apply, terminal…) need the
-  per-launch UI secret. Agents over MCP/HTTP can't perform them.
-- Generated code runs with a cleared environment in a no-network sandbox that can't read
-  credentials or the UI secret.
-
-## Open items
-
-- Run the M5 demo live on the **API backend** (needs a Console key):
-  `KODEHUB_LIVE_DEMO=1 KODEHUB_LIVE_BACKEND=api make live-test`.
-- Exact pinning / lockfiles for third-party crates and packages (D-027 "not done").
-- Doc 02's merge guardrail (split merged functions whose option branches diverge) is a later
-  phase.
-
-## How to look at it
-
-```sh
-make dev            # server + UI on http://127.0.0.1:7878
-make seed           # import the demo project
-make desktop        # Tauri window (with make dev running)
-```
+- Live agents in the cluster need a stored credential (an API key, or a personal subscription
+  token on a user-owned project). CI-style runs use the recorded backend.
+- The sysadmin agent and the test author's schedule balancing exist as agent roles and actions
+  (`set_caps`, `schedule`), but nothing yet wakes the sysadmin agent on a timer with cluster
+  metrics; caps are settings.
+- Opaque (non-Rust/Python) imported code stays staged, not decomposed.
+- Hash-only referencing inside code bodies, multi-cluster deployment and IDE-grade editing remain
+  out of scope.
+- `docker-compose.yml` is obsolete (everything runs in Kind) but still in the tree.

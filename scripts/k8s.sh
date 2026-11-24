@@ -72,7 +72,9 @@ images() {
   done
   # the one small agent base image (spec §4.1)
   DOCKER_BUILDKIT=1 docker build -q -f "$ROOT/deploy/images/agent.Dockerfile" -t kodehub/agent:dev "$ROOT/deploy/images" >/dev/null
-  for img in kodehub/kodehub:dev kodehub/test-rust:dev kodehub/test-python:dev kodehub/agent:dev arangodb:3.12; do load_image "$img"; done
+  # speech transcription: a local Whisper model (spec §14.1)
+  DOCKER_BUILDKIT=1 docker build -q -f "$ROOT/deploy/images/transcribe.Dockerfile" -t kodehub/transcribe:dev "$ROOT/deploy/images" >/dev/null
+  for img in kodehub/kodehub:dev kodehub/test-rust:dev kodehub/test-python:dev kodehub/agent:dev kodehub/transcribe:dev arangodb:3.12; do load_image "$img"; done
 }
 
 images_browser() {
@@ -168,6 +170,17 @@ w=json.load(sys.stdin)
 assert w["state"]=="done", w
 assert (w.get("result") or {}).get("backend")=="recorded-in-container", w.get("result")
 print("in-cluster: an agent task ran in its own container")'
+  # speech to text in a transcription container (macOS `say` makes the audio)
+  if command -v say >/dev/null; then
+    local wav; wav="$(mktemp -d)/s.wav"
+    say -o "$wav" --data-format=LEI16@16000 "Checkout never loses an order."
+    curl -sf -X POST -H "Authorization: Bearer $tok" -H "x-kodehub-project: $proj" -H 'content-type: audio/wav' \
+      --data-binary @"$wav" $api/api/transcribe | python3 -c '
+import sys,json
+t=json.load(sys.stdin)["text"].lower()
+assert "order" in t, t
+print("in-cluster: transcribed speech: %r" % t)'
+  fi
 }
 
 case "${1:-}" in

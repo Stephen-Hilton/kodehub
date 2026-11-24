@@ -4,6 +4,64 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-052 S11: speech transcription and remote MCP over OAuth
+- **Context:** Spec §14.1 (spoken philosophy and requirements) and §13A.2 (remote MCP with the
+  standard OAuth flow, each assistant its own agent user).
+- **Decision:**
+  - The UI records audio (MediaRecorder) and uploads it to `POST /api/transcribe`; a
+    `transcribe` job (`kodehub/transcribe:dev`: faster-whisper with the `tiny.en` model baked in,
+    ffmpeg for decoding any browser format) returns the text. The audio is deleted after
+    transcription. No browser speech service is used, so Chrome and Tauri's WebKit behave the
+    same; audio never leaves the cluster. A raw transcript becomes the philosophy with
+    `raw_transcript` kept, and the kickoff chain's first architect step cleans it up.
+  - PyAV is not used (PyAV 16 broke faster-whisper's call and 14.x has no wheel here); ffmpeg
+    decodes to 16 kHz mono PCM handed to the model as an array.
+  - Remote MCP: `POST /mcp` (JSON-RPC; batches; notifications get 202) reuses the stdio server's
+    handler and calls the API with the **caller's own token**, so the MCP service adds no logic
+    or security of its own. Unauthenticated calls get 401 with `WWW-Authenticate:
+    Bearer resource_metadata=…`.
+  - OAuth 2.1: RFC 9728 / 8414 discovery, RFC 7591 dynamic registration (public clients;
+    redirect URIs https or loopback http), `/oauth/authorize` = a Kodehub sign-in + consent page
+    (the human re-enters their password, which also defeats CSRF), PKCE S256 only, single-use
+    codes (2 min), access tokens (1 h) that are ordinary PATs of an agent user named after the
+    client and acting for the approving human, rotating refresh tokens (30 days, never accepted
+    as bearer tokens). Codes and tokens are stored only as hashes. Revoking in Settings takes
+    effect on the next call.
+- **Consequence:** `make check` transcribes real speech (macOS `say`) in the cluster.
+
+## D-051 S10: the UI — screens, in-node badges and overlays
+- **Context:** Spec §8: keep the graph rendering; information inside nodes; overlays next to the
+  element instead of side panels; new screens.
+- **Decision:**
+  - The Cytoscape map is untouched. An HTML layer (`NodeBadges`) follows Cytoscape's render,
+    pan, zoom and layout events and draws small chips on each visible node: lifecycle dot,
+    tests passed/total (rolled up; colour by state), business / technical requirement counts
+    (own · with children), work in progress, candidate marker, build dot. Code-node chips sit
+    just above the node so its label stays readable.
+  - Clicking a chip opens a `Popover` beside it: tests (runs, history, *Test now*),
+    requirements (own and inherited, grouped by the level they come from, with the philosophy as
+    tiebreaker), lifecycle (explanation, versions, work), work in progress. Clicking a code
+    node opens the former node panel in the same kind of floating card.
+  - The left and right sidebars are gone. A top bar holds the project switcher and screens:
+    Map, Requirements (philosophy editor, requirements list, where each attaches, push-down
+    suggestions), Use cases (draft → checking → live, link expected-outcome tests), Work
+    (approvals and external blockers first, the queue, spend, the agents' activity and
+    changesets), Releases (the former drawer), Settings (layered values with their source,
+    schedules, credentials with the subscription-token warning, external agents and tokens, Git
+    bridge, backups), Projects (list and the create flow: name, sharing, philosophy typed or
+    spoken, starting contexts, template).
+  - The map stays mounted while other screens show (a remount lost the layout).
+  - Templates: `master` (built-in contexts with best-practice requirements at the lowest level)
+    or `project:<id>` (copy contexts, requirement groups, requirements and their edges — never
+    code).
+  - The map endpoint carries `test_counts`, `in_progress`, `lifecycle`, `requirements` and
+    `candidates` per node; `/api/node-tests` backs the test overlay.
+  - An architect item that fails its own retry limit now stops (blocked + a human notification)
+    instead of retrying forever.
+- **Consequence:** The splitter / resizable-panes e2e spec was retired with the panes; the doc 08
+  demo spec runs on the new screens, and `v01.spec.ts` covers project creation, badges,
+  overlays, settings and use cases.
+
 ## D-050 S9: Git import and export, database backups
 - **Context:** Spec §13 and §3.4: a one-time Git import through an import container and an
   import agent, a Git export container on demand or on a schedule, and off-site backup of the

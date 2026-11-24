@@ -24,6 +24,21 @@ export interface MapNode {
   version?: string | null;
   version_at?: string | null;
   changed_since?: boolean;
+  /** v0.1 in-node badges (spec §8.3). */
+  lifecycle?: "planned" | "in_build" | "ready_for_test" | "live";
+  requirements?: { own: Record<string, number>; total: Record<string, number> };
+  test_counts?: { own: TestTally; total: TestTally };
+  in_progress?: number;
+  candidates?: number;
+  seq?: number;
+}
+
+export interface TestTally {
+  passed: number;
+  failed: number;
+  total: number;
+  built: number;
+  last_run?: string | null;
 }
 
 export interface MapEdge {
@@ -188,6 +203,54 @@ export const api = {
   createProject: (b: Json) => call<Json>("POST", "/api/projects", b),
   openProject: (id: string) => call<Json>("POST", `/api/projects/${id}/open`),
   commonContexts: () => call<{ name: string; description: string }[]>("GET", "/api/projects/contexts"),
+  users: () => call<{ key: string; display_name: string }[]>("GET", "/api/users"),
+  orgs: () => call<Json[]>("GET", "/api/orgs"),
+  createOrg: (name: string) => call<Json>("POST", "/api/orgs", { name }),
+  shares: (id: string) => call<Json>("GET", `/api/projects/${id}/shares`),
+  share: (id: string, grantee: string, permission: string | null) => call<Json>("PUT", `/api/projects/${id}/shares`, { grantee, permission }),
+  // v0.1: philosophy, cascade, use cases, lifecycle
+  philosophy: () => call<Json>("GET", "/api/philosophy"),
+  setPhilosophy: (text: string, raw_transcript?: string) => call<Json>("PUT", "/api/philosophy", { text, raw_transcript }),
+  cascade: (node: string) => call<Json>("GET", `/api/cascade?node=${encodeURIComponent(node)}`),
+  requirementsBy: (q: { kind?: string; level?: string }) =>
+    call<Json[]>("GET", `/api/requirements-by?${new URLSearchParams(q as Record<string, string>).toString()}`),
+  pushDown: () => call<Json[]>("GET", "/api/push-down"),
+  nodeTests: (node: string) => call<Json[]>("GET", `/api/node-tests?node=${encodeURIComponent(node)}`),
+  nodeVersions: (node: string) => call<Json[]>("GET", `/api/node-versions?node=${encodeURIComponent(node)}`),
+  useCases: () => call<Json[]>("GET", "/api/use-cases"),
+  createUseCase: (b: Json) => call<Json>("POST", "/api/use-cases", b),
+  linkUseCase: (key: string, edge: string, to: string) => call<Json>("POST", `/api/use-cases/${key}/links`, { edge, to }),
+  setUseCaseState: (key: string, state: string) => call<Json>("POST", `/api/use-cases/${key}/state`, { state }),
+  // work queue, schedules, approvals, notifications
+  workItems: (state?: string) => call<Json[]>("GET", `/api/work-items${state ? `?state=${state}` : ""}`),
+  queueStats: () => call<Json>("GET", "/api/queue/stats"),
+  cancelWork: (key: string) => call<Json>("POST", `/api/work-items/${key}/cancel`),
+  unblock: () => call<Json>("POST", "/api/work-items/unblock"),
+  schedules: () => call<Json[]>("GET", "/api/schedules"),
+  replanSchedules: () => call<Json[]>("POST", "/api/schedules/replan"),
+  setScheduleEnabled: (key: string, enabled: boolean) => call<Json>("POST", `/api/schedules/${key}/enabled`, { enabled }),
+  testNow: (target: string) => call<Json>("POST", "/api/test-now", { target }),
+  approvals: (state = "pending") => call<Json[]>("GET", `/api/approvals?state=${state}`),
+  decide: (key: string, approve: boolean, note = "") => call<Json>("POST", `/api/approvals/${key}/decide`, { approve, note }),
+  notifications: () => call<Json[]>("GET", "/api/notifications?unread=true"),
+  readNotification: (key: string) => call<Json>("POST", `/api/notifications/${key}/read`),
+  agentTypes: () => call<Json[]>("GET", "/api/agent-types"),
+  // layered settings, credentials, agent users and tokens
+  scopeSettings: (scope: string) => call<Json>("GET", `/api/scopes/${scope}/settings`),
+  setSetting: (scope: string, key: string, value: Json) => call<Json>("PUT", `/api/scopes/${scope}/settings/${key}`, { value }),
+  clearSetting: (scope: string, key: string) => call<Json>("DELETE", `/api/scopes/${scope}/settings/${key}`),
+  credentials: (scope: string) => call<Json[]>("GET", `/api/credentials?scope=${encodeURIComponent(scope)}`),
+  putCredential: (b: { scope: string; provider: string; kind: string; secret: string; label?: string }) => call<Json>("POST", "/api/credentials", b),
+  deleteCredential: (id: string) => call<Json>("DELETE", `/api/credentials/${id}`),
+  agentUsers: () => call<Json[]>("GET", "/api/agent-users"),
+  createAgentUser: (name: string) => call<Json>("POST", "/api/agent-users", { name }),
+  tokens: () => call<Json[]>("GET", "/api/tokens"),
+  createToken: (agent: string, name: string, projects: string[] | null, permission: string) =>
+    call<Json>("POST", "/api/tokens", { agent, name, projects, permission }),
+  revokeToken: (id: string) => call<Json>("DELETE", `/api/tokens/${id}`),
+  gitImport: (repo_url: string) => call<Json>("POST", "/api/git/import", { repo_url }),
+  gitExport: (repo_url: string, branch: string) => call<Json>("POST", "/api/git/export", { repo_url, branch }),
+  backup: () => call<Json>("POST", "/api/backups"),
   seed: (path: string) => call("POST", "/api/seed", { path }),
   map: (at?: string | null) => call<MapData>("GET", "/api/map" + (at ? `?at=${encodeURIComponent(at)}` : "")),
   requirements: () => call<{ requirements: Requirement[]; groups: Group[]; summary: Record<string, number> }>("GET", "/api/requirements"),

@@ -125,9 +125,11 @@ function blend(hex: string): string {
 
 const DEPTH_LABELS = ["Contexts", "Containers", "Components", "Code"];
 
-export function SystemMap({ data, selected, highlight, onSelect, showTests, setShowTests, historyMode, children }: {
+export function SystemMap({ data, selected, highlight, onSelect, showTests, setShowTests, historyMode, children, onCy }: {
   data: MapData | null; selected: string | null; highlight: Set<string> | null; onSelect: (id: string | null, node?: MapNode) => void;
   showTests: boolean; setShowTests: (b: boolean) => void; historyMode: boolean; children?: React.ReactNode;
+  /** The Cytoscape instance, for layers drawn over the graph (in-node badges). */
+  onCy?: (c: Core) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const cy = useRef<Core | null>(null);
@@ -142,6 +144,8 @@ export function SystemMap({ data, selected, highlight, onSelect, showTests, setS
   const [qIdx, setQIdx] = useState(0);
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
+  const onCyRef = useRef(onCy);
+  onCyRef.current = onCy;
   const depth = depthMode === "auto" ? zoomDepth : depthMode;
 
   // create once
@@ -160,6 +164,7 @@ export function SystemMap({ data, selected, highlight, onSelect, showTests, setS
     });
     c.on("zoom", () => { if (!auto.current) setZoomDepth(depthForZoom(c.zoom() / (fitZoom.current || 1))); });
     (window as unknown as { __kodehubCy: Core }).__kodehubCy = c;
+    onCyRef.current?.(c);
     let fitTimer: number | undefined;
     const ro = new ResizeObserver(() => {
       c.resize();

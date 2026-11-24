@@ -201,6 +201,8 @@ impl Kubernetes {
         match (spec.kind.as_str(), spec.container_type.as_deref()) {
             ("test", Some(t)) => format!("{}{t}:dev", self.test_image_prefix),
             ("agent", _) => self.agent_image.clone(),
+            ("transcribe", _) => std::env::var("KODEHUB_TRANSCRIBE_IMAGE")
+                .unwrap_or_else(|_| "kodehub/transcribe:dev".into()),
             _ => self.build_image.clone(),
         }
     }

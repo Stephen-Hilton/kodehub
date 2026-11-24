@@ -353,6 +353,27 @@ impl Store {
             .as_i64()
             .unwrap_or(3);
         let retries = w["retry_count"].as_i64().unwrap_or(0) + 1;
+        // the architect is the last agent in line: when it too fails its retry limit, no agent
+        // can resolve this — stop and tell a human instead of retrying forever
+        if retries >= limit && w["agent_type"] == "architect" {
+            let msg = format!(
+                "An architect agent could not resolve work item {key} after {retries} attempts: {reason}"
+            );
+            self.notify(
+                &project,
+                "escalation_exhausted",
+                &msg,
+                json!({"work_item": key}),
+            )
+            .await?;
+            return self
+                .g_patch(
+                    WORK_ITEMS,
+                    key,
+                    &json!({"state": "blocked", "blocked_reason": msg}),
+                )
+                .await;
+        }
         let escalate = retries >= limit && w["agent_type"] != "architect";
         let next = NewWorkItem {
             project,

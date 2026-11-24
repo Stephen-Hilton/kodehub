@@ -4,7 +4,7 @@ import { relTime } from "../lib/health";
 import { Check, Chevron, Diamond, Rocket, Undo, X } from "./icons";
 import { useToast } from "./Toasts";
 
-export function ReleasesDrawer({ releases, environments, onClose }: { releases: Json[]; environments: Json[]; onClose: () => void }) {
+export function ReleasesDrawer({ releases, environments, onClose, inline }: { releases: Json[]; environments: Json[]; onClose: () => void; inline?: boolean }) {
   const toast = useToast();
   const [name, setName] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -70,15 +70,15 @@ export function ReleasesDrawer({ releases, environments, onClose }: { releases: 
 
   return (
     <>
-      <div className="drawer-backdrop" onClick={onClose} />
-      <div className="drawer right" role="dialog" aria-label="Releases" data-testid="releases-drawer">
+      {!inline && <div className="drawer-backdrop" onClick={onClose} />}
+      <div className={inline ? "screen releases-screen" : "drawer right"} role={inline ? undefined : "dialog"} aria-label="Releases" data-testid="releases-drawer">
         <div className="drawer-head">
           <Rocket size={18} />
           <div style={{ flex: 1 }}>
             <div className="drawer-title">Releases & environments</div>
             <div className="faint" style={{ fontSize: 12 }}>Open in {ENVS[0] ?? "dev"}, immutable once promoted, moved through gated environments. {ENVS.filter(needsHuman).join(", ") || "prod"} needs your sign-off.</div>
           </div>
-          <button className="btn icon ghost-btn" aria-label="Close" onClick={onClose}><X size={15} /></button>
+          {!inline && <button className="btn icon ghost-btn" aria-label="Close" onClick={onClose}><X size={15} /></button>}
         </div>
         <div className="drawer-body">
           <div className="envs" data-testid="env-pipeline">

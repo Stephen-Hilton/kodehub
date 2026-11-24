@@ -17,8 +17,8 @@ export function MissionBanner({ mission, requirements, openChangesets, connected
         </div>
       </div>
       <div className="mission">
-        <span className="mission-tag">Mission</span>
-        <span className="mission-text" title={mission?.statement}>{mission?.statement ?? "No mission yet"}</span>
+        <span className="mission-tag">Philosophy</span>
+        <span className="mission-text" title={mission?.statement}>{mission?.statement ?? "No philosophy document yet"}</span>
       </div>
       <div className="kpis">
         <div className="kpi" title="Requirements whose tests all pass at current closure hashes">

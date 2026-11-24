@@ -478,3 +478,85 @@ pub async fn restore(
         .await?;
     Ok(Json(out))
 }
+
+// ---------------------------------------------------------------------- speech transcription
+
+/// Speech to text for the philosophy document and requirements (spec §14.1): the audio goes to
+/// storage, a transcription container runs a local Whisper model, the text comes back. No
+/// browser speech service is used, so Chrome and Tauri's WebKit behave the same.
+pub async fn transcribe(
+    State(s): State<AppState>,
+    Extension(p): Extension<ProjectCtx>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> ApiResult<Value> {
+    if body.is_empty() {
+        return Err(ApiError::bad_request("no audio"));
+    }
+    if body.len() > 25 * 1024 * 1024 {
+        return Err(ApiError::bad_request("audio over 25 MB"));
+    }
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("audio/webm");
+    let ext = match ct.split(';').next().unwrap_or("") {
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/ogg" => "ogg",
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => "m4a",
+        "audio/mpeg" => "mp3",
+        _ => "webm",
+    };
+    let storage = kodehub_storage::StorageClient::from_env_or_local(&s.runner.home);
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let audio_key = format!("projects/{}/audio/{id}.{ext}", p.id);
+    let in_key = format!("projects/{}/jobs/transcribe-{id}/input.json", p.id);
+    let out_key = format!("projects/{}/jobs/transcribe-{id}/output.json", p.id);
+    let err = |e: anyhow::Error| ApiError::internal(e.to_string());
+    storage
+        .put(kodehub_storage::BUCKET, &audio_key, body)
+        .await
+        .map_err(err)?;
+    storage
+        .put(
+            kodehub_storage::BUCKET,
+            &in_key,
+            serde_json::to_vec(&json!({"audio_key": audio_key, "ext": ext})).unwrap_or_default(),
+        )
+        .await
+        .map_err(err)?;
+    let outcome = kodehub_runner::jobs::JobRuntime::from_env()
+        .run(&kodehub_runner::jobs::JobSpec {
+            kind: "transcribe".into(),
+            container_type: None,
+            input_key: in_key,
+            output_key: out_key.clone(),
+            timeout: std::time::Duration::from_secs(300),
+            env: vec![],
+            secret_env: vec![],
+            name: format!("transcribe-{}", &id[..8]),
+        })
+        .await?;
+    let out: Value = match storage
+        .get(kodehub_storage::BUCKET, &out_key)
+        .await
+        .map_err(err)?
+    {
+        Some(b) => serde_json::from_slice(&b).unwrap_or(Value::Null),
+        None => {
+            return Err(ApiError::internal(format!(
+                "transcription wrote no output: {}",
+                outcome.logs
+            )))
+        }
+    };
+    if out["ok"] != true {
+        return Err(ApiError::internal(
+            out["error"]
+                .as_str()
+                .unwrap_or("transcription failed")
+                .to_string(),
+        ));
+    }
+    Ok(Json(json!({"text": out["text"]})))
+}

@@ -345,6 +345,156 @@ impl Store {
         Ok(out)
     }
 
+    /// Test counts per node (spec §8.3, §14.4): `own` (tests reaching a symbol, or tests a C4
+    /// node directly contains) and `total` (everything beneath, rolled up), each with passed /
+    /// failed / total from the latest formal run at the current closure, plus how many of the
+    /// tests have a built bundle.
+    pub async fn test_counts(&self) -> Result<BTreeMap<String, Value>> {
+        let g = self.load_code_graph().await?;
+        let rows = self
+            .aql(
+                "FOR t IN @@symbols FILTER t.kind == 'test'
+                   LET cv = FIRST(FOR e IN @@has_version FILTER e._from == t._id AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key)
+                   LET run = FIRST(FOR r IN @@test_runs FILTER r.test_version == cv AND r.closure_hash == t.closure_hash
+                                     AND r.formal != false SORT r.ran_at DESC LIMIT 1 RETURN r)
+                   LET built = LENGTH(FOR b IN @@built_from FILTER b._to == CONCAT(@pfx, 'versions/', cv) LIMIT 1 RETURN 1) > 0
+                   RETURN {id: t._key, status: run ? run.status : 'not_run', ran_at: run.ran_at, built}",
+                json!({}),
+            )
+            .await?;
+        let status: BTreeMap<String, Value> = rows
+            .into_iter()
+            .filter_map(|r| Some((r["id"].as_str()?.to_string(), r)))
+            .collect();
+        let tally = |set: &BTreeSet<String>| {
+            let (mut p, mut f, mut b) = (0u64, 0u64, 0u64);
+            let mut last: Option<String> = None;
+            for t in set {
+                if let Some(r) = status.get(t) {
+                    match r["status"].as_str() {
+                        Some("pass") => p += 1,
+                        Some("fail") => f += 1,
+                        _ => {}
+                    }
+                    if r["built"] == true {
+                        b += 1;
+                    }
+                    if let Some(at) = r["ran_at"].as_str() {
+                        if last.as_deref().is_none_or(|l| at > l) {
+                            last = Some(at.to_string());
+                        }
+                    }
+                }
+            }
+            json!({"passed": p, "failed": f, "total": set.len(), "built": b, "last_run": last})
+        };
+        let edges = self
+            .aql(
+                "FOR e IN @@contains RETURN {p: e._from, c: e._to}",
+                json!({}),
+            )
+            .await?;
+        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for e in &edges {
+            if let (Some(p), Some(c)) = (e["p"].as_str(), e["c"].as_str()) {
+                children.entry(p.into()).or_default().push(c.into());
+            }
+        }
+        let mut out = BTreeMap::new();
+        let mut per_symbol: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for s in g.symbols.values() {
+            let set: BTreeSet<String> = if status.contains_key(&s.id) {
+                [s.id.clone()].into()
+            } else {
+                g.tests_reaching(&s.id).into_iter().collect()
+            };
+            out.insert(
+                format!("symbols/{}", s.id),
+                json!({"own": tally(&set), "total": tally(&set)}),
+            );
+            per_symbol.insert(format!("symbols/{}", s.id), set);
+        }
+        fn beneath(
+            n: &str,
+            children: &BTreeMap<String, Vec<String>>,
+            per_symbol: &BTreeMap<String, BTreeSet<String>>,
+            depth: usize,
+        ) -> BTreeSet<String> {
+            let mut acc = per_symbol.get(n).cloned().unwrap_or_default();
+            if depth < 12 {
+                for c in children.get(n).map(Vec::as_slice).unwrap_or_default() {
+                    acc.extend(beneath(c, children, per_symbol, depth + 1));
+                }
+            }
+            acc
+        }
+        for n in children.keys().filter(|k| !k.contains("symbols/")) {
+            let own: BTreeSet<String> = children[n]
+                .iter()
+                .filter_map(|c| {
+                    c.strip_prefix("symbols/")
+                        .or_else(|| c.split_once("symbols/").map(|x| x.1))
+                })
+                .filter(|k| status.contains_key(*k))
+                .map(str::to_string)
+                .collect();
+            let total = beneath(n, &children, &per_symbol, 0);
+            out.insert(
+                n.clone(),
+                json!({"own": tally(&own), "total": tally(&total)}),
+            );
+        }
+        Ok(out)
+    }
+
+    /// The tests covering a node (a symbol: the tests reaching it; a C4 node: every test reaching
+    /// code beneath it) with their latest formal result and recent history (test overlay).
+    pub async fn tests_for_node(&self, node: &str) -> Result<Vec<Value>> {
+        let g = self.load_code_graph().await?;
+        let mut syms: BTreeSet<String> = BTreeSet::new();
+        if let Some(k) = node.strip_prefix("symbols/") {
+            syms.insert(k.to_string());
+        } else {
+            for v in self
+                .aql(
+                    "FOR v IN 1..10 OUTBOUND @n @@contains FILTER STARTS_WITH(v._id, CONCAT(@pfx, 'symbols/')) RETURN v._key",
+                    json!({"n": node}),
+                )
+                .await?
+            {
+                if let Some(k) = v.as_str() {
+                    syms.insert(k.to_string());
+                }
+            }
+        }
+        let mut tests: BTreeSet<String> = BTreeSet::new();
+        for s in &syms {
+            match g.symbols.get(s) {
+                Some(x) if x.kind == kodehub_core::model::Kind::Test => {
+                    tests.insert(s.clone());
+                }
+                Some(_) => tests.extend(g.tests_reaching(s)),
+                None => {}
+            }
+        }
+        let ids: Vec<String> = tests.into_iter().collect();
+        self.aql(
+            "FOR k IN @ids LET t = DOCUMENT(@@symbols, k)
+               LET cv = FIRST(FOR e IN @@has_version FILTER e._from == t._id AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key)
+               LET runs = (FOR r IN @@test_runs FILTER r.test_symbol == k OR (r.test_version == cv)
+                             SORT r.ran_at DESC LIMIT 6
+                             RETURN {status: r.status, ran_at: r.ran_at, formal: r.formal != false,
+                                     current: r.closure_hash == t.closure_hash, duration_ms: r.duration_ms,
+                                     output: SUBSTRING(r.output || '', 0, 1500)})
+               LET now = FIRST(FOR r IN runs FILTER r.current AND r.formal RETURN r)
+               SORT t.display_name
+               RETURN {id: t._id, key: k, name: t.display_name, language: t.language,
+                       status: now ? now.status : 'not_run', runs}",
+            json!({"ids": ids}),
+        )
+        .await
+    }
+
     /// Requirements by kind and by level (spec §7.1: queryable by both).
     pub async fn requirements_by(
         &self,

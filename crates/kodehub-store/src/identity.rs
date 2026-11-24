@@ -628,7 +628,7 @@ impl Store {
             return Err(unauth());
         }
         let t = self.g_get(TOKENS, &key).await?.ok_or_else(unauth)?;
-        if t["revoked"] == true || expired(&t["expires_at"]) {
+        if t["revoked"] == true || expired(&t["expires_at"]) || t["kind"] == "refresh" {
             return Err(unauth());
         }
         let scope: TokenScope = serde_json::from_value(t["scope"].clone()).map_err(|_| unauth())?;

@@ -198,3 +198,7 @@ pub async fn put_test_container_type(
         s.store.put_test_container_type(&name, b, &p.id()).await?,
     ))
 }
+
+pub async fn node_tests(State(s): State<AppState>, Query(q): Query<NodeQ>) -> ApiResult<Value> {
+    Ok(Json(json!(s.store.tests_for_node(&q.node).await?)))
+}

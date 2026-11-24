@@ -157,6 +157,10 @@ pub struct NewProject {
     /// A raw speech transcript of the philosophy (the architect cleans it up, spec §14.1).
     #[serde(default)]
     pub raw_transcript: Option<String>,
+    /// `master` (the built-in template), `project:<id>` (copy another project's contexts and
+    /// requirements) or none (start from scratch).
+    #[serde(default)]
+    pub template: Option<String>,
     #[serde(default)]
     pub contexts: Vec<String>,
 }
@@ -188,15 +192,60 @@ pub async fn create_project(
             .await?;
     }
     let mut out = created;
+    let mut contexts_in = b.contexts.clone();
+    let master = b.template.as_deref() == Some("master");
+    if master {
+        for c in crate::routes::project_init::master_template()["contexts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            if let Some(c) = c.as_str() {
+                if !contexts_in.iter().any(|x| x == c) {
+                    contexts_in.push(c.to_string());
+                }
+            }
+        }
+    }
     let init = crate::routes::project_init::initialize(
         &s,
         &p,
         &id,
         b.philosophy.as_deref(),
         b.raw_transcript.as_deref(),
-        &b.contexts,
+        &contexts_in,
     )
     .await?;
+    if master {
+        let ps = s.store.for_project(&id);
+        for r in crate::routes::project_init::master_template()["requirements"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            let ctx = format!(
+                "contexts/{}",
+                kodehub_store::slug(r["context"].as_str().unwrap_or(""))
+            );
+            let mut doc = r.clone();
+            doc.as_object_mut().map(|m| m.remove("context"));
+            let d = ps.create_requirement(doc).await?;
+            let rid = d["_id"].as_str().unwrap_or_default().to_string();
+            ps.db
+                .insert_ignore("satisfies", &json!({"_key": kodehub_store::edge_key("satisfies", &ctx, &rid), "_from": ctx, "_to": rid}), None)
+                .await?;
+        }
+        out["template"] = json!("master");
+    } else if let Some(from) = b
+        .template
+        .as_deref()
+        .and_then(|t| t.strip_prefix("project:"))
+    {
+        if s.store.project_permission(&p, from).await?.is_none() {
+            return Err(forbid(format!("no access to template project `{from}`")));
+        }
+        out["template"] = crate::routes::project_init::copy_template(&s, from, &id).await?;
+    }
     // the kickoff chain (spec §14.2): architect → planning agents → tests → code
     let contexts: Vec<String> = init["contexts"]
         .as_array()

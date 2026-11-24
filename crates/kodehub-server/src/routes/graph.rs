@@ -413,6 +413,11 @@ pub async fn map(State(s): State<AppState>, Query(q): Query<MapQuery>) -> ApiRes
     // in-node badges (spec §8.3): lifecycle and requirement counts
     let lifecycle = store.node_lifecycle().await?;
     let req_counts = store.requirement_counts().await?;
+    let test_counts = store.test_counts().await?;
+    let busy = match store.project_id() {
+        Some(p) => store.in_progress_by_node(&p).await?,
+        None => Default::default(),
+    };
     for n in nodes.iter_mut() {
         if let Some(id) = n["id"].as_str().map(str::to_string) {
             if let Some(l) = lifecycle.get(&id) {
@@ -421,6 +426,10 @@ pub async fn map(State(s): State<AppState>, Query(q): Query<MapQuery>) -> ApiRes
             if let Some(c) = req_counts.get(&id) {
                 n["requirements"] = c.clone();
             }
+            if let Some(c) = test_counts.get(&id) {
+                n["test_counts"] = c.clone();
+            }
+            n["in_progress"] = json!(busy.get(&id).copied().unwrap_or(0));
         }
     }
     Ok(Json(

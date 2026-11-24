@@ -6,6 +6,7 @@ pub mod c4;
 pub mod changesets;
 pub mod graph;
 pub mod identity;
+pub mod oauth;
 pub mod project_init;
 pub mod queue;
 pub mod releases;
@@ -22,6 +23,26 @@ use crate::AppState;
 pub fn api() -> Router<AppState> {
     Router::new()
         .route("/health", get(graph::health))
+        // remote MCP behind OAuth 2.1 (spec §13A.2)
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::authorization_server),
+        )
+        .route("/oauth/register", post(oauth::register))
+        .route(
+            "/oauth/authorize",
+            get(oauth::authorize_page).post(oauth::authorize_submit),
+        )
+        .route("/oauth/token", post(oauth::token))
+        .route("/mcp", post(oauth::mcp))
         .route("/api/health", get(graph::health))
         // accounts, orgs, projects, agent users, tokens, settings, credentials, audit
         .route("/api/auth/status", get(identity::status))
@@ -109,6 +130,10 @@ pub fn api() -> Router<AppState> {
         .route("/api/git/import", post(queue::git_import))
         .route("/api/git/export", post(queue::git_export))
         .route("/api/backups", post(queue::backup))
+        .route(
+            "/api/transcribe",
+            post(queue::transcribe).layer(axum::extract::DefaultBodyLimit::max(26 * 1024 * 1024)),
+        )
         .route("/api/projects/restore", post(queue::restore))
         .route("/api/agent-types/{name}", put(queue::put_agent_type))
         .route("/api/events", get(crate::events::ws_events))
@@ -154,6 +179,7 @@ pub fn api() -> Router<AppState> {
         .route("/api/lifecycle", get(c4::lifecycle))
         .route("/api/requirement-counts", get(c4::requirement_counts))
         .route("/api/node-versions", get(c4::versions))
+        .route("/api/node-tests", get(c4::node_tests))
         .route(
             "/api/use-cases",
             get(c4::list_use_cases).post(c4::create_use_case),

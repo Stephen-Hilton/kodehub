@@ -18,6 +18,79 @@ pub const COMMON_CONTEXTS: &[(&str, &str)] = &[
     ("Operations", "Deployment, monitoring and internal tooling."),
 ];
 
+/// The built-in master template: common contexts with best-practice requirements placed at the
+/// lowest level where they apply (spec §6.1, §7.2).
+pub fn master_template() -> serde_json::Value {
+    json!({
+        "contexts": ["Authentication & Authorization", "Data Platform", "Web System", "Operations"],
+        "requirements": [
+            {"_key": "tpl-authn-every-call", "context": "Authentication & Authorization", "kind": "technical",
+             "title": "Every call is authenticated", "statement": "Every API call is authenticated and scoped to the caller's permissions."},
+            {"_key": "tpl-secrets-encrypted", "context": "Data Platform", "kind": "technical",
+             "title": "Secrets are encrypted at rest", "statement": "Credentials and secrets are stored encrypted and never logged."},
+            {"_key": "tpl-backups", "context": "Data Platform", "kind": "business",
+             "title": "Data survives the loss of a machine", "statement": "Every project's data is backed up off-site and can be restored alone."},
+            {"_key": "tpl-web-accessible", "context": "Web System", "kind": "business",
+             "title": "Accessible interface", "statement": "Every screen is usable with a keyboard and a screen reader."},
+            {"_key": "tpl-ops-health", "context": "Operations", "kind": "technical",
+             "title": "Health is observable", "statement": "Every deployable unit exposes a health check."}
+        ]
+    })
+}
+
+/// Copy contexts, requirements and the requirement edges between them from another project
+/// (a template from a project the caller can read). Code is never copied.
+pub async fn copy_template(s: &AppState, from: &str, to: &str) -> Result<Value, ApiError> {
+    let src = s.store.for_project(from);
+    let dst = s.store.for_project(to);
+    let mut copied = json!({"contexts": 0, "requirements": 0});
+    for coll in ["contexts", "requirement_groups", "requirements"] {
+        for mut d in src
+            .aql(
+                "FOR d IN @@c RETURN UNSET(d, '_id', '_rev')",
+                json!({"@c": coll}),
+            )
+            .await?
+        {
+            if coll == "requirements" {
+                d["revision"] = json!(1);
+                d["covered_revision"] = json!(0);
+                d["at_risk"] = json!(false);
+            }
+            if coll == "contexts" {
+                d["lifecycle"] = json!("planned");
+            }
+            dst.db.upsert(coll, &d, None).await?;
+            if let Some(n) = copied.get_mut(coll).and_then(|v| v.as_u64()) {
+                copied[coll] = json!(n + 1);
+            }
+        }
+    }
+    for coll in ["satisfies", "includes", "contains"] {
+        let rows = src
+            .aql(
+                "FOR e IN @@c FILTER !STARTS_WITH(e._from, CONCAT(@pfx, 'symbols/')) AND !STARTS_WITH(e._to, CONCAT(@pfx, 'symbols/'))
+                   AND !STARTS_WITH(e._to, CONCAT(@pfx, 'containers/')) AND !STARTS_WITH(e._from, CONCAT(@pfx, 'containers/'))
+                   RETURN {_from: e._from, _to: e._to}",
+                json!({"@c": coll}),
+            )
+            .await?;
+        for e in rows {
+            let (f, t) = (
+                e["_from"].as_str().unwrap_or(""),
+                e["_to"].as_str().unwrap_or(""),
+            );
+            if dst.get_node(f).await.is_ok() && dst.get_node(t).await.is_ok() {
+                let k = kodehub_store::edge_key(coll, f, t);
+                dst.db
+                    .insert_ignore(coll, &json!({"_key": k, "_from": f, "_to": t}), None)
+                    .await?;
+            }
+        }
+    }
+    Ok(copied)
+}
+
 /// Create the philosophy document and the chosen contexts inside the new project.
 pub async fn initialize(
     s: &AppState,

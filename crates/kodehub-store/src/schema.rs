@@ -66,6 +66,8 @@ pub fn global_document_collections() -> Vec<&'static str> {
         crate::schedules::TRIGGERS,
         crate::metering::USAGE,
         crate::governance::NOTIFICATIONS,
+        crate::oauth::CLIENTS,
+        crate::oauth::CODES,
     ];
     v.extend(crate::identity::IDENTITY_DOCS);
     v

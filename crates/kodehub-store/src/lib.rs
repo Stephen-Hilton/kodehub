@@ -11,6 +11,7 @@ pub mod identity;
 pub mod import;
 pub mod intents;
 pub mod metering;
+pub mod oauth;
 pub mod projects;
 pub mod queries;
 pub mod queue;
