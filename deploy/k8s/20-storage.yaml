@@ -1,5 +1,7 @@
-# Storage service (spec §3.4). Pilot default: local mode on a volume. Set
-# KODEHUB_STORAGE_MODE=hybrid plus KODEHUB_STORAGE_UPSTREAM_* for off-site backups.
+# Storage service (spec §3.4). Pilot default: local mode on a volume. The mode and upstream come
+# from the `storage-profile` ConfigMap and `storage-upstream` Secret that scripts/k8s.sh writes:
+# KODEHUB_STORAGE_BACKEND=seaweedfs selects hybrid mode with SeaweedFS as the cold tier (D-054);
+# for AWS S3 or another S3 store, put its KODEHUB_STORAGE_UPSTREAM_* values in those two.
 apiVersion: v1
 kind: Service
 metadata: { name: storage, namespace: kodehub }
@@ -31,8 +33,10 @@ spec:
           image: kodehub/kodehub:dev
           imagePullPolicy: Never
           command: ["kodehub-storage"]
+          envFrom:
+            - configMapRef: { name: storage-profile, optional: true }
+            - secretRef: { name: storage-upstream, optional: true }
           env:
-            - { name: KODEHUB_STORAGE_MODE, value: local }
             - { name: KODEHUB_STORAGE_DIR, value: /data/objects }
             - name: KODEHUB_STORAGE_TOKEN
               valueFrom: { secretKeyRef: { name: kodehub-secrets, key: storage-token } }

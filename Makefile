@@ -12,7 +12,7 @@ export KODEHUB_DB ?= kodehub
 -include local.mk
 export KODEHUB_ENV_FILE ?=
 
-.PHONY: help db db-down build dev ui-build desktop desktop-build seed check fmt lint test test-unit test-integration app-check ui-test live-test clean kind-up kind-down images deploy k8s-smoke k8s-check up
+.PHONY: help db db-down build dev ui-build desktop desktop-build seed check fmt lint test test-unit test-integration app-check ui-test live-test clean kind-up kind-down images deploy k8s-smoke seaweed-check k8s-check up
 
 help:
 	@echo "make up       the whole stack in Kind (server + UI on http://127.0.0.1:17878)"
@@ -42,8 +42,12 @@ deploy:
 k8s-smoke:
 	scripts/k8s.sh smoke
 
-# The cluster path end to end: image, deploy, smoke test
-k8s-check: images deploy k8s-smoke
+# The storage service against SeaweedFS (the optional S3 cold tier) in the cluster
+seaweed-check:
+	scripts/k8s.sh seaweed-check
+
+# The cluster path end to end: image, deploy, smoke test, the S3 tier
+k8s-check: images deploy k8s-smoke seaweed-check
 
 # The whole stack in Kind
 up: k8s-check

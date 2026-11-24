@@ -8,6 +8,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let s = kodehub_storage::from_env()?;
+    // an S3 upstream (SeaweedFS, AWS S3, …) may start after us or be brand new: create the
+    // bucket, retrying for a while; serving local objects does not wait on it
+    if let Some(up) = s.upstream.clone() {
+        tokio::spawn(async move {
+            for attempt in 1..=60 {
+                match up.ensure_bucket().await {
+                    Ok(()) => {
+                        tracing::info!("upstream bucket `{}` ready", up.bucket);
+                        return;
+                    }
+                    Err(e) if attempt == 60 => tracing::warn!("upstream bucket: {e}"),
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+                }
+            }
+        });
+    }
     let hours: f64 = std::env::var("KODEHUB_STORAGE_BACKUP_HOURS")
         .ok()
         .and_then(|v| v.parse().ok())

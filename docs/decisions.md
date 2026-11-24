@@ -4,6 +4,33 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-054 SeaweedFS as the self-hosted S3 tier (MinIO dropped)
+- **Context:** MinIO's community edition is no longer a dependable open-source option (no
+  published community binaries or images, admin features removed, community edition in
+  maintenance). D-046 had already replaced it with our own `kodehub-storage`, but only because
+  its images could not be pulled here, and left no self-hosted durable object store.
+- **Decision:** Two roles, deliberately separate:
+  - `kodehub-storage` stays the only object interface Kodehub components talk to (project-scoped
+    keys, Kodehub tokens, local / cloud / hybrid modes, per-project backups). It does **not**
+    grow into an object store (no replication, erasure coding or healing).
+  - **SeaweedFS** (Apache 2.0, `chrislusf/seaweedfs:3.97`) is the optional self-hosted S3 store
+    behind it, reached as an ordinary SigV4 upstream. Garage was set aside as AGPLv3 (the same
+    concern as MinIO); RustFS as too young; Ceph RGW as too heavy for one cluster.
+  - `deploy/k8s/optional/seaweedfs.yaml`: one pod in single-server mode with its S3 gateway on a
+    ClusterIP service. `KODEHUB_STORAGE_BACKEND=seaweedfs scripts/k8s.sh deploy` applies it,
+    generates its S3 identity into `.kode/k8s-secrets.env`, and switches storage to hybrid with
+    SeaweedFS as the cold tier through the `storage-profile` ConfigMap and the `storage-upstream`
+    Secret. The default stays `local`.
+  - The storage service creates its upstream bucket at startup (S3 CreateBucket, "already
+    exists" is fine, retried while the store starts).
+  - `make check` runs `scripts/k8s.sh seaweed-check`: `kodehub-storage/tests/s5_seaweedfs.rs`
+    against the in-cluster SeaweedFS (bucket creation, a wrong secret refused, cloud-mode
+    objects, hybrid full + incremental backups, single-project restore). With the SeaweedFS
+    profile, the smoke test also checks that a backup reaches the cold tier.
+- **Consequence:** Moving to AWS S3, GCS (S3 interop) or another S3 store is a change to the
+  profile values only. SeaweedFS's S3 coverage is partial, but Kodehub uses only put, get,
+  delete, list and create-bucket.
+
 ## D-053 Sysadmin timer and the test budget
 - **Context:** Spec §11.4 (a cluster manager agent wakes on an interval, sleeps when all is
   well, sets caps to fit the compute) and §11.5 (turn a test budget into a concrete plan; the
@@ -242,8 +269,8 @@ Record build-time decisions here: context, decision, consequence. Newest first.
     `k8s-check` (image build, deploy, smoke: health, a storage round trip, UI served, API
     requires a token, scheduler ready). `make dev` keeps a host server against the Kind DB for a
     fast loop; `make up` runs everything in the cluster.
-  - The MinIO images are not pullable here, so `kodehub-storage` serves S3 path-style objects
-    itself (PUT/GET/HEAD/DELETE, ListObjectsV2 XML) with a bearer token instead of SigV4.
+  - The MinIO images are not pullable here (and MinIO is dropped for good: D-054), so
+    `kodehub-storage` serves S3 path-style objects itself (PUT/GET/HEAD/DELETE, ListObjectsV2 XML) with a bearer token instead of SigV4.
     `cloud` and `hybrid` use an upstream that is real S3 (SigV4 presigned requests via
     `rusty-s3`) or another `kodehub-storage` (bearer). Backups: per project (objects under
     `projects/<p>/`), first a full tar bundle, then incremental bundles with deletions;

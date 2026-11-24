@@ -41,6 +41,10 @@ cd app && npm install && cd ..   # once
 make up                          # Kind cluster, images, ArangoDB, storage, server, schedulers
 ```
 
+Objects stay on the storage service's own volume by default. To add a self-hosted S3 cold tier
+(SeaweedFS, Apache 2.0) with scheduled per-project backups:
+`KODEHUB_STORAGE_BACKEND=seaweedfs scripts/k8s.sh deploy` (D-054).
+
 Sign in (the first account administers the installation), create a project (or load the auth
 example on an empty map), and watch the Work screen. Agents in the cluster need a credential in
 Settings → Credentials: an Anthropic API key, or — for a personal project you own — a Claude
@@ -105,7 +109,7 @@ make live-test  # real Claude Code agents (M4 MCP + M5 demo); token chosen by en
 v0.1 acceptance tests: `kodehub-store/tests/s2_identity.rs`, `s6_queue.rs`;
 `kodehub-server/tests/s2_http_auth.rs`, `s3_c4_model.rs`, `m7_releases.rs` (S4),
 `s7_containers.rs`, `s8_agents.rs`, `s8_agent_containers.rs`, `s9_git.rs`, `s11_oauth_mcp.rs`;
-`kodehub-storage/tests/s5_storage.rs`; `kodehub-scheduler/tests/s6_scheduler.rs`;
+`kodehub-storage/tests/s5_storage.rs`, `s5_seaweedfs.rs`; `kodehub-scheduler/tests/s6_scheduler.rs`;
 `kodehub-runner/tests/s7_bundles.rs`; `app/e2e/demo.spec.ts`, `app/e2e/v01.spec.ts`.
 
 | Milestone | Acceptance tests |

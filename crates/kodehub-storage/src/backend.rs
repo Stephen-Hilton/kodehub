@@ -252,6 +252,32 @@ impl Upstream {
         Ok(())
     }
 
+    /// Create the upstream bucket if it does not exist yet (S3 CreateBucket; "already exists"
+    /// counts as success). A bearer upstream is another kodehub-storage, whose buckets are
+    /// implicit, so this is a no-op there.
+    pub async fn ensure_bucket(&self) -> Result<()> {
+        if let UpstreamAuth::Bearer(_) = self.auth {
+            return Ok(());
+        }
+        let (b, c) = self.s3()?;
+        let r = self
+            .http
+            .put(b.create_bucket(&c).sign(PRESIGN))
+            .send()
+            .await?;
+        let status = r.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = r.text().await.unwrap_or_default();
+        if status.as_u16() == 409
+            && (body.contains("BucketAlreadyOwnedByYou") || body.contains("BucketAlreadyExists"))
+        {
+            return Ok(());
+        }
+        bail!("upstream CreateBucket {}: {status} {body}", self.bucket)
+    }
+
     /// ListObjectsV2 (keys and sizes) under a prefix.
     pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>> {
         let url = match &self.auth {

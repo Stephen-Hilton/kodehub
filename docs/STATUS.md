@@ -6,10 +6,11 @@ _Last updated by the build agent on 2026-11-24._
 a local Kind cluster, UI typecheck and unit tests, the Playwright end-to-end suite, and the
 cluster check (image builds, deploy, smoke: health, storage round trip, an end-to-end *Test now*
 through scheduler → orchestrator → build Job → test Jobs, an agent task in its own container,
-and speech transcribed by Whisper in the cluster).
+and speech transcribed by Whisper in the cluster), and the storage service's S3 path against
+SeaweedFS in the cluster.
 
 The plan and acceptance criteria are in `docs/09-v0.1-audit-and-plan.md`; every decision is in
-`docs/decisions.md` (D-041 … D-052 for v0.1).
+`docs/decisions.md` (D-041 … D-054 for v0.1).
 
 | Step | Status | Evidence |
 | --- | --- | --- |
@@ -18,6 +19,7 @@ The plan and acceptance criteria are in `docs/09-v0.1-audit-and-plan.md`; every 
 | S3 SCD versions at every C4 level, philosophy, requirements, use cases, lifecycle | ✅ | `kodehub-server/tests/s3_c4_model.rs`, `m1_graph_core.rs` |
 | S4 Releases and environments (selection, open/cut, clone, patch, five environments) | ✅ | `kodehub-server/tests/m7_releases.rs` |
 | S5 Kind, images, storage service (local / cloud / hybrid, per-project backups) | ✅ | `kodehub-storage/tests/s5_storage.rs`, `scripts/k8s.sh smoke` |
+| SeaweedFS as the optional S3 cold tier (D-054) | ✅ | `kodehub-storage/tests/s5_seaweedfs.rs` via `scripts/k8s.sh seaweed-check` |
 | S6 Claim and lease, work queue, scheduler, intents and negotiation | ✅ | `kodehub-store/tests/s6_queue.rs`, `kodehub-scheduler/tests/s6_scheduler.rs` |
 | S7 Build and test containers, shell test bundles, formal runs, baseline | ✅ | `kodehub-runner/tests/s7_bundles.rs`, `kodehub-server/tests/s7_containers.rs`, in-cluster smoke |
 | S8 Agents: types, dispatcher, kickoff chain, tests before code, escalation, blockers, budgets, agent containers | ✅ | `kodehub-server/tests/s8_agents.rs`, `s8_agent_containers.rs`, `m5_*` |

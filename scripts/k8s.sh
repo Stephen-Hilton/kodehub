@@ -4,7 +4,10 @@
 #   scripts/k8s.sh images    build kodehub/kodehub:dev and load it (and arangodb:3.12) into Kind
 #   scripts/k8s.sh deploy    apply every manifest and wait for the stack
 #   scripts/k8s.sh smoke     health of server, storage and the DB through the host ports
+#   scripts/k8s.sh seaweed-check   run the storage service's S3 test against in-cluster SeaweedFS
 #   scripts/k8s.sh down      delete the cluster
+# KODEHUB_STORAGE_BACKEND=seaweedfs (on deploy) runs storage in hybrid mode with SeaweedFS as
+# the cold tier; the default, local, keeps every object on the storage service's own volume.
 set -euo pipefail
 CLUSTER=kodehub
 NS=kodehub
@@ -12,6 +15,7 @@ CTX="kind-$CLUSTER"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 K="kubectl --context $CTX"
 SECRETS="${KODEHUB_HOME:-$ROOT/.kode}/k8s-secrets.env"
+SEAWEED_IMAGE=chrislusf/seaweedfs:3.97
 
 ensure_cluster() {
   if ! kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
@@ -30,6 +34,12 @@ ensure_cluster() {
       echo "secret-key=$(head -c 32 /dev/urandom | base64)"
       echo "storage-token=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')"
     } > "$SECRETS"
+  fi
+  # added after the first release of this script: S3 keys for the optional SeaweedFS tier
+  if ! grep -q '^s3-access-key=' "$SECRETS"; then
+    ( umask 077
+      echo "s3-access-key=kodehub$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+      echo "s3-secret-key=$(head -c 30 /dev/urandom | base64 | tr -d '/+=')" ) >> "$SECRETS"
   fi
   $K -n $NS create secret generic kodehub-secrets --from-env-file="$SECRETS" \
     --dry-run=client -o yaml | $K apply -f - >/dev/null
@@ -83,8 +93,63 @@ images_browser() {
   load_image kodehub/test-browser:dev
 }
 
+secret_val() { grep "^$1=" "$SECRETS" | cut -d= -f2-; }
+
+# SeaweedFS in single-server mode, its S3 identity from the generated keys
+seaweed() {
+  ensure_cluster
+  docker image inspect "$SEAWEED_IMAGE" >/dev/null 2>&1 || docker pull -q "$SEAWEED_IMAGE" >/dev/null
+  load_image "$SEAWEED_IMAGE"
+  local cfg; cfg=$(python3 -c 'import json,sys;print(json.dumps({"identities":[{"name":"kodehub","credentials":[{"accessKey":sys.argv[1],"secretKey":sys.argv[2]}],"actions":["Admin","Read","Write","List","Tagging"]}]}))' \
+    "$(secret_val s3-access-key)" "$(secret_val s3-secret-key)")
+  $K -n $NS create secret generic seaweedfs-s3 --from-literal=s3.json="$cfg" \
+    --dry-run=client -o yaml | $K apply -f - >/dev/null
+  $K apply -f "$ROOT/deploy/k8s/optional/seaweedfs.yaml" >/dev/null
+  $K -n $NS rollout status deployment/seaweedfs --timeout=180s >/dev/null
+}
+
+# Which object store backs the storage service (D-054): local (default) or seaweedfs
+storage_profile() {
+  case "${KODEHUB_STORAGE_BACKEND:-local}" in
+    local)
+      $K -n $NS create configmap storage-profile --from-literal=KODEHUB_STORAGE_MODE=local \
+        --dry-run=client -o yaml | $K apply -f - >/dev/null
+      $K -n $NS delete secret storage-upstream --ignore-not-found >/dev/null ;;
+    seaweedfs)
+      seaweed
+      $K -n $NS create configmap storage-profile \
+        --from-literal=KODEHUB_STORAGE_MODE=hybrid \
+        --from-literal=KODEHUB_STORAGE_UPSTREAM_URL=http://seaweedfs-s3.$NS.svc:8333 \
+        --from-literal=KODEHUB_STORAGE_UPSTREAM_AUTH=sigv4 \
+        --from-literal=KODEHUB_STORAGE_UPSTREAM_BUCKET=kodehub-cold \
+        --dry-run=client -o yaml | $K apply -f - >/dev/null
+      $K -n $NS create secret generic storage-upstream \
+        --from-literal=KODEHUB_STORAGE_UPSTREAM_ACCESS_KEY="$(secret_val s3-access-key)" \
+        --from-literal=KODEHUB_STORAGE_UPSTREAM_SECRET_KEY="$(secret_val s3-secret-key)" \
+        --dry-run=client -o yaml | $K apply -f - >/dev/null ;;
+    *) echo "KODEHUB_STORAGE_BACKEND must be local or seaweedfs" >&2; exit 2 ;;
+  esac
+}
+
+# The storage service's S3 integration test against the in-cluster SeaweedFS, through a
+# port-forward (the Kind cluster exposes no SeaweedFS host port)
+seaweed_check() {
+  seaweed
+  local port=18334 pf
+  $K -n $NS port-forward svc/seaweedfs-s3 $port:8333 >/dev/null 2>&1 &
+  pf=$!
+  trap 'kill $pf 2>/dev/null || true' RETURN
+  for _ in $(seq 1 30); do curl -sf "http://127.0.0.1:$port/healthz" >/dev/null && break; sleep 1; done
+  KODEHUB_TEST_S3_URL="http://127.0.0.1:$port" \
+  KODEHUB_TEST_S3_ACCESS_KEY="$(secret_val s3-access-key)" \
+  KODEHUB_TEST_S3_SECRET_KEY="$(secret_val s3-secret-key)" \
+    cargo test -q -p kodehub-storage --test s5_seaweedfs
+  echo "seaweedfs: the storage service's S3 path works against SeaweedFS in the cluster"
+}
+
 deploy() {
   db
+  storage_profile
   $K apply -f "$ROOT/deploy/k8s/" >/dev/null
   # pick up a freshly loaded image
   $K -n $NS rollout restart deployment/storage deployment/kodehub-server >/dev/null
@@ -111,6 +176,13 @@ smoke() {
   curl -sf -X PUT -H "Authorization: Bearer $tok" --data-binary "smoke-$$" http://127.0.0.1:19000/kodehub/projects/smoke/object >/dev/null \
     && [ "$(curl -sf -H "Authorization: Bearer $tok" http://127.0.0.1:19000/kodehub/projects/smoke/object)" = "smoke-$$" ] \
     || { echo "storage round trip failed" >&2; fail=1; }
+  # hybrid mode: a backup of that project lands in the cold tier (SeaweedFS)
+  if [ "$($K -n $NS get configmap storage-profile -o jsonpath='{.data.KODEHUB_STORAGE_MODE}' 2>/dev/null)" = hybrid ]; then
+    curl -sf -X POST -H "Authorization: Bearer $tok" "http://127.0.0.1:19000/_backup?project=smoke" >/dev/null \
+      && curl -sf -H "Authorization: Bearer $tok" "http://127.0.0.1:19000/_backups?project=smoke" | grep -q 'backups/smoke/' \
+      && echo "storage: hybrid backup reached the cold tier" \
+      || { echo "hybrid backup to the cold tier failed" >&2; fail=1; }
+  fi
   # the UI is served, and the API demands a token
   curl -sf http://127.0.0.1:17878/ | grep -qi '<div id="root"' || { echo "UI not served" >&2; fail=1; }
   [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:17878/api/map)" = "401" ] || { echo "API not protected" >&2; fail=1; }
@@ -190,6 +262,7 @@ case "${1:-}" in
   images-browser) images_browser ;;
   deploy) deploy ;;
   smoke) smoke ;;
+  seaweed-check) seaweed_check ;;
   down) kind delete cluster --name "$CLUSTER" ;;
-  *) echo "usage: $0 up|db|images|deploy|smoke|down" >&2; exit 2 ;;
+  *) echo "usage: $0 up|db|images|deploy|smoke|seaweed-check|down" >&2; exit 2 ;;
 esac
