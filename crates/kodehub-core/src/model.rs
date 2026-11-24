@@ -173,14 +173,17 @@ pub const DOCUMENT_COLLECTIONS: &[&str] = &[
     "releases",
     "environments",
     "chat_messages",
+    "philosophy",
+    "use_cases",
+    "c4_versions",
+    "change_logs",
 ];
 
 /// All edge collections (doc 02).
 pub const EDGE_COLLECTIONS: &[&str] = &[
     "contains",
     "member_of",
-    "current_version",
-    "previous_version",
+    "has_version",
     "calls",
     "depends_on",
     "tested_by",
@@ -197,10 +200,14 @@ pub const EDGE_COLLECTIONS: &[&str] = &[
     "deployed_to",
     "currently_running",
     "previously_ran",
+    "relates_to",
+    "expected_by",
+    "built_from",
 ];
 
 /// Collections whose documents may never be updated after creation.
-pub const IMMUTABLE_COLLECTIONS: &[&str] = &["versions", "releases", "test_runs", "runs"];
+pub const IMMUTABLE_COLLECTIONS: &[&str] =
+    &["versions", "c4_versions", "releases", "test_runs", "runs"];
 
 pub const ENVIRONMENTS: &[&str] = &["dev", "test", "qa", "prod"];
 

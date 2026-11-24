@@ -305,8 +305,8 @@ async fn full_seed_scenario_over_http() {
     let (s, _) = t
         .req(
             "POST",
-            "/api/edges/current_version",
-            Some(json!({"from": format!("versions/{v}"), "to": "symbols/hash_password"})),
+            "/api/edges/has_version",
+            Some(json!({"from": "symbols/hash_password", "to": format!("versions/{v}")})),
         )
         .await;
     assert_eq!(s, 400);

@@ -1,0 +1,4 @@
+# The project's philosophy document (spec §7.1): the tiebreaker when requirements are
+# ambiguous, missing or in conflict. One per project.
+title: Secure authentication
+text: Provide secure, simple authentication that never leaks information about why a login failed.

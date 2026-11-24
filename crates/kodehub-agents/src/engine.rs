@@ -1175,7 +1175,7 @@ impl Engine {
         self.activity(
             cs_key,
             "orchestrator",
-            "Merged — all current_version edges moved in one transaction",
+            "Promoted — every candidate became stable in one transaction",
         )
         .await;
         if self.opts.warm_cache {

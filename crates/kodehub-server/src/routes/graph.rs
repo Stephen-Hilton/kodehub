@@ -177,9 +177,11 @@ pub async fn list_symbols(State(s): State<AppState>) -> ApiResult<Vec<Value>> {
     Ok(Json(
         s.store
             .aql(
-                "FOR s IN @@symbols LET v = FIRST(FOR e IN @@current_version FILTER e._to == s._id RETURN DOCUMENT(e._from))
+                "FOR s IN @@symbols LET e1 = FIRST(FOR e IN @@has_version FILTER e._from == s._id AND e.state == 'stable' RETURN e)
+                 LET v = e1 ? DOCUMENT(e1._to) : null
                  SORT s.language, s.display_name
-                 RETURN MERGE(s, {version: v._key, signature: v.signature})",
+                 RETURN MERGE(s, {version: v._key, signature: v.signature, seq: e1.seq,
+                                  lifecycle: s.lifecycle || (v ? 'live' : 'planned')})",
                 json!({}),
             )
             .await?,
@@ -227,7 +229,7 @@ pub async fn symbol_detail(State(s): State<AppState>, Path(key): Path<String>) -
         .store
         .aql(
             "FOR k IN @tests LET t = DOCUMENT(@@symbols, k)
-               LET cv = FIRST(FOR e IN @@current_version FILTER e._to == t._id RETURN PARSE_IDENTIFIER(e._from).key)
+               LET cv = FIRST(FOR e IN @@has_version FILTER e._from == t._id AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key)
                LET run = FIRST(FOR r IN @@test_runs FILTER r.test_version == cv AND r.closure_hash == t.closure_hash SORT r.ran_at DESC LIMIT 1 RETURN r)
                SORT t.display_name
                RETURN {id: t._key, name: t.display_name, language: t.language, status: run ? run.status : 'not_run', output: run.output, ran_at: run.ran_at}",
@@ -294,15 +296,16 @@ pub async fn map(State(s): State<AppState>, Query(q): Query<MapQuery>) -> ApiRes
                 (FOR x IN @@components RETURN MERGE(x, {level: 'component'})),
                 (FOR x IN @@symbols RETURN MERGE(x, {level: 'symbol'})))
                FILTER @at == null OR n.created_at == null OR n.created_at <= @at
-               LET parent = FIRST(FOR p IN parents FILTER p.child == n._id AND !STARTS_WITH(p.parent, CONCAT(@pfx, 'missions/')) RETURN p.parent)
-               LET cv = n.level == 'symbol' ? FIRST(FOR e IN @@current_version FILTER e._to == n._id RETURN e) : null
+               LET parent = FIRST(FOR p IN parents FILTER p.child == n._id AND !STARTS_WITH(p.parent, CONCAT(@pfx, 'missions/')) AND !STARTS_WITH(p.parent, CONCAT(@pfx, 'philosophy/')) RETURN p.parent)
+               LET cv = FIRST(FOR e IN @@has_version FILTER e._from == n._id AND e.state == 'stable' RETURN e)
+               LET cand = LENGTH(FOR e IN @@has_version FILTER e._from == n._id AND e.state == 'candidate' RETURN 1)
                LET at_v = (@at == null || n.level != 'symbol') ? null : FIRST(
-                    APPEND(
-                      (FOR e IN @@previous_version FILTER e._to == n._id AND e.current_since <= @at AND e.superseded_at > @at RETURN e._from),
-                      (FOR e IN @@current_version FILTER e._to == n._id AND e.since <= @at RETURN e._from)))
+                    FOR e IN @@has_version FILTER e._from == n._id AND e.validFrom != null
+                      AND e.validFrom <= @at AND (e.validTo == null OR e.validTo > @at) RETURN e._to)
                RETURN {id: n._id, key: n._key, level: n.level, label: n.display_name || n.title || n._key,
                        parent, kind: n.kind, language: n.language, tags: n.tags, description: n.description,
-                       version: cv ? PARSE_IDENTIFIER(cv._from).key : null,
+                       version: (cv && n.level == 'symbol') ? PARSE_IDENTIFIER(cv._to).key : null,
+                       seq: cv.seq, candidates: cand, lifecycle_raw: n.lifecycle,
                        version_at: at_v ? PARSE_IDENTIFIER(at_v).key : null}",
             json!({"at": q.at}),
         )
@@ -403,14 +406,25 @@ pub async fn map(State(s): State<AppState>, Query(q): Query<MapQuery>) -> ApiRes
         }
     }
     nodes.extend(ghosts);
-    let mission = store
-        .aql(
-            "FOR m IN @@missions FILTER m.scope == 'program' LIMIT 1 RETURN m",
-            json!({}),
-        )
-        .await?;
+    let mission = store.get_philosophy().await?.map(|p| {
+        json!({"_key": "philosophy", "title": p["title"], "statement": p["text"],
+               "revision": p["revision"], "kind": "philosophy"})
+    });
+    // in-node badges (spec §8.3): lifecycle and requirement counts
+    let lifecycle = store.node_lifecycle().await?;
+    let req_counts = store.requirement_counts().await?;
+    for n in nodes.iter_mut() {
+        if let Some(id) = n["id"].as_str().map(str::to_string) {
+            if let Some(l) = lifecycle.get(&id) {
+                n["lifecycle"] = l["state"].clone();
+            }
+            if let Some(c) = req_counts.get(&id) {
+                n["requirements"] = c.clone();
+            }
+        }
+    }
     Ok(Json(
-        json!({"mission": mission.first(), "nodes": nodes, "edges": out_edges, "at": q.at}),
+        json!({"mission": mission, "nodes": nodes, "edges": out_edges, "at": q.at}),
     ))
 }
 

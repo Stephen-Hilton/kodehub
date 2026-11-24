@@ -78,6 +78,13 @@ pub fn content_hash(c: &VersionContent) -> String {
         .to_string()
 }
 
+/// BLAKE3 hex digest of any value's canonical JSON (C4 definitions, release manifests).
+pub fn hash_value(v: &Value) -> String {
+    blake3::hash(canonical_json(v).as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

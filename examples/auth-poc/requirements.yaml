@@ -1,4 +1,5 @@
 - _key: r1-generic-failure
+  kind: business
   title: R1 — Generic failure
   statement: Failed logins return one generic error.
   intent: An attacker must not learn whether a username exists or which credential was wrong.
@@ -18,6 +19,7 @@
   out_of_scope:
     - Rate limiting and lockout policy.
 - _key: r2-hashed-storage
+  kind: technical
   title: R2 — Hashed storage
   statement: Passwords are stored only as Argon2id hashes.
   intent: A leaked user table must not reveal passwords.

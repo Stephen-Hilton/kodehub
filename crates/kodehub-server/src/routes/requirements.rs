@@ -9,14 +9,19 @@ use serde_json::{json, Value};
 use crate::error::{ApiError, ApiResult};
 use crate::AppState;
 
+/// The philosophy document, in the v0.05 mission shape (`statement`) for older clients.
 pub async fn missions(State(s): State<AppState>) -> ApiResult<Vec<Value>> {
     Ok(Json(
         s.store
-            .aql(
-                "FOR m IN @@missions SORT m.scope == 'program' DESC, m.title RETURN m",
-                json!({}),
-            )
-            .await?,
+            .get_philosophy()
+            .await?
+            .map(|p| {
+                let mut v = p.clone();
+                v["statement"] = p["text"].clone();
+                v["scope"] = json!("program");
+                vec![v]
+            })
+            .unwrap_or_default(),
     ))
 }
 

@@ -1,6 +1,11 @@
-//! Changesets — the graph equivalent of a pull request (doc 04). Proposed versions are real
-//! (immutable, content-addressed) version nodes linked by `proposes`; nothing becomes current
-//! until `merge`, which moves every `current_version` edge in one transaction.
+//! Changesets (spec §5.8) — a work item's candidate versions, built, tested and promoted
+//! together. Proposed versions are real (immutable, content-addressed) version nodes linked by
+//! `proposes`, and each existing node gets a *candidate* `has_version` edge (no `validFrom`), so
+//! the stable version is never disturbed. `merge` promotes every candidate in one transaction:
+//! all or nothing.
+//!
+//! State names are the v0.05 ones (D-044): draft/planned ≈ open, approved ≈ submitted,
+//! building, reviewing, testing, ready, merged ≈ promoted, rejected.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -54,6 +59,9 @@ pub struct ProposeVersion {
 pub struct MergeChecks {
     pub tests_ok: bool,
     pub review_ok: bool,
+    /// The project's `blind_review` setting at check time.
+    #[serde(default)]
+    pub review_required: bool,
     /// Requirement edits: each requirement has a proposed test verifying it (review M6 #1).
     #[serde(default)]
     pub requirements_covered: bool,
@@ -89,8 +97,7 @@ pub fn new_symbol_key(language: Language, display_name: &str) -> String {
 const MERGE_WRITE: &[&str] = &[
     "symbols",
     "versions",
-    "current_version",
-    "previous_version",
+    "has_version",
     "calls",
     "depends_on",
     "member_of",
@@ -344,14 +351,22 @@ impl Store {
         let base_version: Option<String> = if is_new {
             None
         } else {
-            self.aql(
-                "FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/', @k) RETURN PARSE_IDENTIFIER(e._from).key",
-                json!({"k": symbol_key}),
+            self.stable_version_in(&format!("symbols/{symbol_key}"), None)
+                .await?
+        };
+        let candidate_seq = if is_new {
+            None
+        } else {
+            Some(
+                self.add_candidate(
+                    &format!("symbols/{symbol_key}"),
+                    "versions",
+                    &hash,
+                    key_of(key),
+                    p.by.as_deref().unwrap_or("agent"),
+                )
+                .await?,
             )
-            .await?
-            .first()
-            .and_then(Value::as_str)
-            .map(String::from)
         };
         let proposal = json!({
             "base_version": base_version,
@@ -372,6 +387,7 @@ impl Store {
             "description": p.description,
             "by": p.by.clone().unwrap_or_else(|| "agent".into()),
             "round": cs["rounds"],
+            "candidate_seq": candidate_seq,
             "at": now_iso(),
         });
         let mut proposals = cs["proposals"].as_object().cloned().unwrap_or_default();
@@ -387,6 +403,8 @@ impl Store {
         Self::ensure_editable(&cs)?;
         let mut proposals = cs["proposals"].as_object().cloned().unwrap_or_default();
         proposals.remove(symbol);
+        self.discard_candidates(key_of(key), Some(&format!("symbols/{}", key_of(symbol))))
+            .await?;
         self.patch_changeset(key, json!({"proposals": proposals}))
             .await
             .map(|_| ())
@@ -736,12 +754,20 @@ impl Store {
                 }
             }
         }
+        // spec §5.6: blind review is a project setting, on by default (hard rule 6)
+        let review_required = match self.project_id() {
+            Some(p) => self
+                .setting(&p, "blind_review")
+                .await?
+                .as_bool()
+                .unwrap_or(true),
+            None => true,
+        };
         let checks = MergeChecks {
             tests_ok: failing.is_empty() && missing.is_empty() && !affected.is_empty(),
-            review_ok: !reviews.is_empty()
-                && open_blocking.is_empty()
-                && review_current
-                && attested,
+            review_ok: !review_required
+                || (!reviews.is_empty() && open_blocking.is_empty() && review_current && attested),
+            review_required,
             requirements_covered: uncovered_reqs.is_empty(),
             uncovered_requirements: uncovered_reqs,
             review_attested: attested,
@@ -808,15 +834,10 @@ impl Store {
             for (pkey, p) in &proposals {
                 if p["new"] != json!(true) {
                     let cur = self
-                        .db
-                        .aql(
-                            "FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/', @k) RETURN PARSE_IDENTIFIER(e._from).key",
-                            json!({"k": pkey}),
-                            Some(&trx),
-                        )
+                        .stable_version_in(&format!("symbols/{pkey}"), Some(&trx))
                         .await?;
                     let base = p["base_version"].as_str();
-                    if base.is_some() && cur.first().and_then(Value::as_str) != base {
+                    if base.is_some() && cur.as_deref() != base {
                         return Err(StoreError::Conflict(format!(
                             "`{}` changed since it was proposed; re-propose against the current version",
                             p["display_name"].as_str().unwrap_or(pkey)
@@ -834,7 +855,11 @@ impl Store {
                     )));
                 }
                 if exists {
-                    self.write_version_in(pkey, &content, by, &trx, false).await?;
+                    let sym = self.db.get("symbols", pkey, Some(&trx)).await?;
+                    if sym["kind"] != json!(content.kind) || sym["language"] != json!(content.language) {
+                        return Err(StoreError::Invalid(format!("version kind/language must match symbol `{pkey}`")));
+                    }
+                    self.promote_in(&format!("symbols/{pkey}"), "versions", &hash, Some(&key), by, &trx).await?;
                 } else {
                     self.db.insert("symbols", &json!({
                         "_key": pkey, "display_name": p["display_name"], "kind": p["kind"], "language": p["language"],
@@ -843,9 +868,7 @@ impl Store {
                     }), Some(&trx)).await.map_err(|e| if e.is_unique_violation() {
                         StoreError::Conflict(format!("display name `{}` already taken", p["display_name"]))
                     } else { e })?;
-                    self.db.insert("current_version", &json!({
-                        "_from": format!("versions/{hash}"), "_to": format!("symbols/{pkey}"), "since": now_iso(),
-                    }), Some(&trx)).await?;
+                    self.promote_in(&format!("symbols/{pkey}"), "versions", &hash, Some(&key), by, &trx).await?;
                 }
                 merged.insert(pkey.clone(), hash);
             }
@@ -960,7 +983,7 @@ impl Store {
             }
             let in_trx = self.db.get("changesets", &key, Some(&trx)).await?;
             let mut history = in_trx["history"].as_array().cloned().unwrap_or_default();
-            history.push(json!({"state": "merged", "at": now_iso(), "by": by, "note": "all current_version edges moved"}));
+            history.push(json!({"state": "merged", "at": now_iso(), "by": by, "note": "every candidate promoted in one transaction"}));
             self.db.patch("changesets", &key, &json!({
                 "state": "merged", "merged_at": now_iso(), "merged_by": by, "merged_versions": merged,
                 "history": history, "checks": checks, "updated_at": now_iso(),
@@ -984,6 +1007,7 @@ impl Store {
         let v = self
             .transition(key, ChangesetState::Rejected, by, reason)
             .await?;
+        self.discard_candidates(key_of(key), None).await?;
         let cs = self.get_changeset(key).await?;
         for r in cs["requirements"].as_array().cloned().unwrap_or_default() {
             if let Some(r) = r.as_str() {

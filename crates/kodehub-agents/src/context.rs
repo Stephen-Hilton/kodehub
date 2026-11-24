@@ -10,17 +10,13 @@ use serde_json::{json, Value};
 
 use crate::Result;
 
+/// The project's philosophy document (spec §7.1), the tiebreaker for every agent.
 pub async fn mission(store: &Store) -> Result<String> {
-    let m = store
-        .aql(
-            "FOR m IN @@missions FILTER m.scope == 'program' LIMIT 1 RETURN m.statement",
-            json!({}),
-        )
-        .await?;
-    Ok(m.first()
-        .and_then(Value::as_str)
-        .unwrap_or("(no mission)")
-        .to_string())
+    Ok(store
+        .get_philosophy()
+        .await?
+        .and_then(|p| p["text"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "(no philosophy document)".to_string()))
 }
 
 fn render_examples(label: &str, v: &Value) -> String {

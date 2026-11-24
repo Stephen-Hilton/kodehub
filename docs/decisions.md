@@ -4,6 +4,45 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-044 S3: SCD versions at every level, philosophy root, lifecycle
+- **Context:** Spec §5.2 wants node → version edges with `validFrom`/`validTo` at every C4 level,
+  candidates that never disturb the live version, plus requirement kinds, inheritance, a
+  philosophy node, use cases and lifecycle states.
+- **Decision:**
+  - One edge collection, `has_version` (node → version), replaces `current_version` and
+    `previous_version`. Fields: `seq` (per-node version number), `state` (candidate | stable |
+    retired | discarded), `validFrom`, `validTo`, `changeset`. Invariant 1 is enforced by the
+    database: `stable_of` is set only on the stable edge and carries a **sparse unique index**.
+    Promotion closes the old edge and opens the new one with the same timestamp, in one
+    transaction; `check_invariants` also verifies that intervals never overlap.
+  - Code versions stay content-addressed in `versions`; context/container/component definitions
+    (title, description, technology, tags, attributes, …) are hashed into immutable
+    `c4_versions`. Every generic write of a C4 node syncs its version; a no-op write makes none.
+  - Candidates: proposing a version for an existing symbol adds a candidate edge (no
+    `validFrom`); withdraw/reject marks it `discarded`; merge promotes it. New symbols still wait
+    for merge (D-023).
+  - Changeset state names are kept (draft, planned, approved, building, reviewing, testing,
+    ready, merged, rejected, escalated) and mapped onto spec §5.8 (open, submitted, …, promoted)
+    rather than renamed through the engine, UI and recordings. The review gate honours the
+    `blind_review` setting; `MergeChecks.review_required` records it.
+  - `philosophy/philosophy` is the single philosophy node and the **root of the C4 graph**
+    (`contains` → contexts); project-level requirements and `traces_to` point at it. It keeps its
+    revision history. Missions are retired: `/api/missions` and agent context read the
+    philosophy. The seed moved from `missions.yaml` to `philosophy.yaml`.
+  - Requirements carry `kind` (default `technical`; any lower-case word, so the list can grow).
+    `requirements_for(node)` walks `contains`/`member_of` up to the philosophy and merges own and
+    inherited requirements (groups expanded), nearest first. Per-node counts report own and
+    own-plus-children by kind; the map carries them and the lifecycle on every node.
+  - Lifecycle is derived: code is planned (no stable version), in_build (candidate, or an explicit
+    rework flag), ready_for_test (stable with tests), live (stable and its tests pass). Stable code
+    without tests is in_build: spec §14.4 requires tests before "ready for test". Parents roll up
+    (all planned → planned; any not yet built → in_build; else the least advanced state).
+  - Use cases (`use_cases`, `relates_to` → requirements, `expected_by` → tests) start in draft;
+    going live needs at least one expected-outcome test. Containerized agents cannot change the
+    state.
+- **Consequence:** Release manifests still use the v0.05 edges until S4. Re-seeding over a changed
+  graph works (requirement `kind` is editable).
+
 ## D-043 S2: tenancy, identity and the auth layer
 - **Context:** v0.05 had one server-wide "active project" and a per-launch UI secret. v0.1 needs
   users, orgs, sharing and per-call permissions (spec §6, §11, §13A).

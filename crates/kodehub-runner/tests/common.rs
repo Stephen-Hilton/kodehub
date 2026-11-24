@@ -49,7 +49,7 @@ pub async fn seeded(prefix: &str) -> Store {
 
 pub async fn edit_body(s: &Store, symbol: &str, f: impl Fn(&str) -> String) -> String {
     let doc = s
-        .aql("FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/', @k) RETURN DOCUMENT(e._from)", json!({"k": symbol}))
+        .aql("FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/', @k) AND e.state == 'stable' RETURN DOCUMENT(e._to)", json!({"k": symbol}))
         .await
         .unwrap();
     let mut c = version_content_from_doc(&doc[0]).unwrap();

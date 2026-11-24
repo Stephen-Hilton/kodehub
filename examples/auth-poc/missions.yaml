@@ -1,4 +1,0 @@
-- _key: secure-auth
-  title: Secure authentication
-  statement: Provide secure, simple authentication that never leaks information about why a login failed.
-  scope: program

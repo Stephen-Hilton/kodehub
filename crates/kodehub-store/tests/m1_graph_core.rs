@@ -48,7 +48,7 @@ async fn changing_one_body_creates_one_version_and_flips_edges() {
     let before_versions = count(&s, "versions").await;
     let old = s
         .aql(
-            "FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/verify_credentials') RETURN e._from",
+            "FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/verify_credentials') AND e.state == 'stable' RETURN e._to",
             json!({}),
         )
         .await
@@ -67,23 +67,55 @@ async fn changing_one_body_creates_one_version_and_flips_edges() {
     assert_eq!(count(&s, "versions").await, before_versions + 1);
     let cur = s
         .aql(
-            "FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/verify_credentials') RETURN e._from",
+            "FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/verify_credentials') AND e.state == 'stable' RETURN e._to",
             json!({}),
         )
         .await
         .unwrap();
     assert_eq!(cur, vec![json!(format!("versions/{}", out.version))]);
+    // the old version is retired, not deleted: its edge closed with validTo (type 2 SCD)
     let prev = s
         .aql(
-            "FOR e IN @@previous_version FILTER e._to == CONCAT(@pfx, 'symbols/verify_credentials') RETURN e",
+            "FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/verify_credentials') AND e.state == 'retired' RETURN e",
             json!({}),
         )
         .await
         .unwrap();
     assert_eq!(prev.len(), 1);
-    assert_eq!(prev[0]["_from"], json!(old));
-    assert_eq!(prev[0]["superseded_by"], json!(out.version));
-    assert!(prev[0]["superseded_at"].is_string());
+    assert_eq!(prev[0]["_to"], json!(old));
+    assert_eq!(prev[0]["retired_by"], json!(out.version));
+    assert!(prev[0]["validTo"].is_string());
+    let new_edge = s
+        .stable_edge_in("symbols/verify_credentials", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        new_edge["validFrom"], prev[0]["validTo"],
+        "intervals meet, never overlap"
+    );
+    assert_eq!(
+        new_edge["seq"].as_i64(),
+        Some(prev[0]["seq"].as_i64().unwrap() + 1)
+    );
+    // as-of lookup returns the version that was stable at that moment
+    let before = prev[0]["validFrom"].as_str().unwrap().to_string();
+    let asof = s
+        .version_as_of("symbols/verify_credentials", &before)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        format!("versions/{}", asof["version"].as_str().unwrap()),
+        old
+    );
+    let now = kodehub_core::model::now_iso();
+    let asof = s
+        .version_as_of("symbols/verify_credentials", &now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(asof["version"], json!(out.version));
     // writing the same content again is a no-op
     let again = s
         .write_version("verify_credentials", &content, "test")
@@ -122,7 +154,7 @@ async fn changing_a_dependency_changes_exactly_the_dependents_closure_hashes() {
     assert!(expected.contains("test_unknown_user_is_invalid"));
     assert!(!expected.contains("verify_credentials"));
 
-    let doc = s.aql("FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/hash_password') RETURN DOCUMENT(e._from)", json!({})).await.unwrap();
+    let doc = s.aql("FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/hash_password') AND e.state == 'stable' RETURN DOCUMENT(e._to)", json!({})).await.unwrap();
     let mut content = version_content_from_doc(&doc[0]).unwrap();
     content.body.push_str("\n// changed");
     s.write_version("hash_password", &content, "test")
@@ -140,21 +172,21 @@ async fn changing_a_dependency_changes_exactly_the_dependents_closure_hashes() {
 }
 
 #[tokio::test]
-async fn a_second_current_version_edge_is_rejected() {
+async fn a_second_stable_version_edge_is_rejected() {
     let s = seeded("invariant").await;
-    let v = s.aql("FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/hash_password') RETURN PARSE_IDENTIFIER(e._from).key", json!({})).await.unwrap();
+    let v = s.aql("FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/hash_password') AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key", json!({})).await.unwrap();
     // even pointing the *same* version at it again is refused
     let err = s
-        .force_add_current_version(v[0].as_str().unwrap(), "hash_password")
+        .force_add_stable_version(v[0].as_str().unwrap(), "hash_password")
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::Invariant(_)), "{err:?}");
     // and the generic edge API refuses protected collections outright
     let err = s
         .insert_edge(
-            "current_version",
-            "versions/x",
+            "has_version",
             "symbols/hash_password",
+            "versions/x",
             json!({}),
         )
         .await

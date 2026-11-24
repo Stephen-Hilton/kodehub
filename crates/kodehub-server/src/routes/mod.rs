@@ -2,6 +2,7 @@
 //! these 1:1 via `kodehub_core::tools`.
 
 pub mod agents;
+pub mod c4;
 pub mod changesets;
 pub mod graph;
 pub mod identity;
@@ -111,6 +112,26 @@ pub fn api() -> Router<AppState> {
         .route("/api/health/nodes", get(graph::node_health))
         // requirements & decisions
         .route("/api/missions", get(requirements::missions))
+        .route(
+            "/api/philosophy",
+            get(c4::get_philosophy).put(c4::put_philosophy),
+        )
+        .route("/api/cascade", get(c4::cascade))
+        .route("/api/requirements-by", get(c4::requirements_by))
+        .route("/api/push-down", get(c4::push_down))
+        .route("/api/lifecycle", get(c4::lifecycle))
+        .route("/api/requirement-counts", get(c4::requirement_counts))
+        .route("/api/node-versions", get(c4::versions))
+        .route(
+            "/api/use-cases",
+            get(c4::list_use_cases).post(c4::create_use_case),
+        )
+        .route(
+            "/api/use-cases/{key}",
+            get(c4::get_use_case).patch(c4::patch_use_case),
+        )
+        .route("/api/use-cases/{key}/links", post(c4::link_use_case))
+        .route("/api/use-cases/{key}/state", post(c4::set_use_case_state))
         .route(
             "/api/requirements",
             get(requirements::list).post(requirements::create),

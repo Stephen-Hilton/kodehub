@@ -1,6 +1,6 @@
 # Edges as [from, to] or [from, to, {data}]. Code collections affect closure hashes.
 contains:
-  - [missions/secure-auth, contexts/authentication]
+  - [philosophy/philosophy, contexts/authentication]
   - [contexts/authentication, containers/auth-service]
   - [containers/auth-service, components/credential-verification]
   - [containers/auth-service, components/password-hashing]
@@ -94,7 +94,7 @@ includes:
   - [requirement_groups/secure-authentication, requirements/r1-generic-failure]
   - [requirement_groups/secure-authentication, requirements/r2-hashed-storage]
 traces_to:
-  - [requirement_groups/secure-authentication, missions/secure-auth]
+  - [requirement_groups/secure-authentication, philosophy/philosophy]
 justified_by:
   - [symbols/verify_credentials, decisions/generic-failure-message]
 compiles_to:

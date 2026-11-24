@@ -77,6 +77,24 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
     // seeding writes versions: serialise with merges and deployments
     let _write = store.write_lock.lock().await;
     let mut report = SeedReport::default();
+    if let Some(v) = read_yaml(&dir.join("philosophy.yaml"))? {
+        let text = v["text"]
+            .as_str()
+            .ok_or_else(|| StoreError::Seed("philosophy.yaml needs `text`".into()))?;
+        let before = store.get_philosophy().await?;
+        store
+            .set_philosophy_with(text, "seed", v["title"].as_str(), None)
+            .await?;
+        if before.is_none() {
+            report.documents_created += 1;
+        } else if before
+            .and_then(|b| b["text"].as_str().map(str::to_string))
+            .as_deref()
+            != Some(text.trim())
+        {
+            report.documents_updated += 1;
+        }
+    }
     for coll in DOC_FILES {
         let Some(v) = read_yaml(&dir.join(format!("{coll}.yaml")))? else {
             continue;
@@ -242,6 +260,8 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
         }
     }
     store.refresh_closure_hashes(None).await?;
+    // contexts, containers and components get their (versioned) definitions
+    store.sync_all_c4_versions("seed").await?;
     let problems = store.check_invariants().await?;
     if !problems.is_empty() {
         return Err(StoreError::Invariant(problems.join("; ")));

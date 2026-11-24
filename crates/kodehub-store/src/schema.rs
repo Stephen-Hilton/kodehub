@@ -16,13 +16,15 @@ pub const META: &str = "kodehub_meta";
 
 /// (collection, fields, unique, sparse)
 const INDEXES: &[(&str, &[&str], bool, bool)] = &[
-    // Invariant 1: a symbol has at most one current_version edge (exactly-one checked on write).
-    ("current_version", &["_to"], true, false),
+    // Invariant 1: a node has at most one stable version (`stable_of` is set only on the stable
+    // edge; the sparse unique index ignores every other edge).
+    ("has_version", &["stable_of"], true, true),
+    ("has_version", &["_from", "seq"], false, false),
+    ("has_version", &["changeset"], false, true),
     // Invariant 5: an environment has at most one currently_running edge.
     ("currently_running", &["_from"], true, false),
     // Display names are unique per language within a project (pilot simplification).
     ("symbols", &["language", "display_name"], true, false),
-    ("previous_version", &["_to"], false, false),
     ("test_runs", &["test_version", "closure_hash"], false, false),
     ("artifacts", &["closure_hash", "build_target"], true, false),
     ("runs", &["symbol", "ran_at"], false, false),

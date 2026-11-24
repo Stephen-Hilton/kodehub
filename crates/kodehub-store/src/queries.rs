@@ -14,7 +14,7 @@ pub const REACH_EDGES: &str = "@@contains, @@calls, @@depends_on, @@member_of";
 /// Test result lookup at the test symbol's *current* closure hash.
 const TEST_STATUS_FN: &str = "
     LET __t = DOCUMENT(tid)
-    LET __cv = FIRST(FOR e IN @@current_version FILTER e._to == tid RETURN PARSE_IDENTIFIER(e._from).key)
+    LET __cv = FIRST(FOR e IN @@has_version FILTER e._from == tid AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key)
     LET __run = FIRST(FOR tr IN @@test_runs FILTER tr.test_version == __cv AND tr.closure_hash == __t.closure_hash
                        SORT tr.ran_at DESC LIMIT 1 RETURN tr)
 ";
@@ -308,9 +308,10 @@ impl Store {
     /// Exact duplicates: symbols whose current versions share a content hash.
     pub async fn duplicates(&self) -> Result<Vec<Value>> {
         self.aql(
-            "FOR e IN @@current_version COLLECT v = e._from INTO g
+            "FOR e IN @@has_version FILTER e.state == 'stable' AND STARTS_WITH(e._from, CONCAT(@pfx, 'symbols/'))
+               COLLECT v = e._to INTO g
                FILTER LENGTH(g) > 1
-               LET syms = (FOR x IN g LET s = DOCUMENT(x.e._to) SORT s.display_name
+               LET syms = (FOR x IN g LET s = DOCUMENT(x.e._from) SORT s.display_name
                            RETURN {id: s._id, display_name: s.display_name, language: s.language})
                SORT v
                RETURN {content_hash: PARSE_IDENTIFIER(v).key, symbols: syms}",
