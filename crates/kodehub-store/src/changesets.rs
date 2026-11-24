@@ -75,6 +75,9 @@ pub struct MergeChecks {
     pub missing_tests: Vec<String>,
     pub open_blocking: Vec<Value>,
     pub new_orphans: Vec<String>,
+    /// Tests failing here that already failed at the baseline (not blamed on the change).
+    #[serde(default)]
+    pub preexisting_failures: Vec<String>,
 }
 
 impl MergeChecks {
@@ -678,18 +681,43 @@ impl Store {
         let affected = self.affected_tests(key, &g, &touched).await?;
         let mut failing = Vec::new();
         let mut missing = Vec::new();
+        let mut preexisting = Vec::new();
+        // the baseline: the same test on the stable graph, before this change (spec §5.6)
+        let base = self.load_code_graph().await?;
         for t in &affected {
             let s = g.symbol(t)?;
             let closure = g.closure_hash(t)?;
+            // only formal runs count toward promotion; agents' own runs are informal
             let rows = self
                 .aql(
-                    "FOR r IN @@test_runs FILTER r.test_version == @v AND r.closure_hash == @c SORT r.ran_at DESC LIMIT 1 RETURN r.status",
+                    "FOR r IN @@test_runs FILTER r.test_version == @v AND r.closure_hash == @c AND r.formal != false
+                     SORT r.ran_at DESC LIMIT 1 RETURN r.status",
                     json!({"v": s.version, "c": closure}),
                 )
                 .await?;
             match rows.first().and_then(Value::as_str) {
                 Some("pass") => {}
-                Some(_) => failing.push(t.clone()),
+                Some(_) => {
+                    let was_failing = match (base.symbols.get(t), base.closure_hash(t).ok()) {
+                        (Some(bs), Some(bc)) => self
+                            .aql(
+                                "FOR r IN @@test_runs FILTER r.test_version == @v AND r.closure_hash == @c AND r.formal != false
+                                 SORT r.ran_at DESC LIMIT 1 RETURN r.status",
+                                json!({"v": bs.version, "c": bc}),
+                            )
+                            .await?
+                            .first()
+                            .and_then(Value::as_str)
+                            .is_some_and(|st| st != "pass"),
+                        _ => false,
+                    };
+                    if was_failing {
+                        // already failing before the change: the candidate is not blamed
+                        preexisting.push(t.clone());
+                    } else {
+                        failing.push(t.clone());
+                    }
+                }
                 None => missing.push(t.clone()),
             }
         }
@@ -777,6 +805,7 @@ impl Store {
             missing_tests: missing,
             open_blocking,
             new_orphans: vec![],
+            preexisting_failures: preexisting,
         };
         Ok((checks, g, touched))
     }

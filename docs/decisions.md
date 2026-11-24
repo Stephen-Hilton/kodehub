@@ -4,6 +4,40 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-048 S7: build and test containers, shell tests, formal runs
+- **Context:** Spec §5.3–5.7: build once (deterministic, no LLM), test many times from the
+  artifact, tests are plain shell scripts, only formal runs count, baseline blame, failures
+  become rework.
+- **Decision:**
+  - A **test bundle** is the unit a build container produces: the tests of one language, keyed by
+    language + every (test, version, closure hash) + renderer + toolchain. Rust: the crate's
+    test binary from `cargo test --no-run`, checked with `--list` so a missing test can never
+    pass. Python: the rendered package with dependencies and pytest vendored. Every test gets
+    `tests/<fn>.sh`; its exit status is the result (one test per process, so a test's output
+    cannot forge a pass). A test whose version has `attributes.shell = true` is an authored
+    shell script run next to the language artifact.
+  - Bundles live in the storage service at `projects/<p>/artifacts/<key>/<lang>-test.tar`; an
+    `artifacts` node records it with `built_from` edges to the test versions. An existing
+    bundle is never rebuilt.
+  - Containers never write the graph: the orchestrator puts the job input in storage, runs
+    `kodehub-worker <build|test> --input … --output …`, and reads the output. Runtimes:
+    `kubernetes` (a `batch/v1` Job through the Kubernetes API with the pod's service account;
+    no kubectl) and `local` (the same entrypoint as a subprocess, used by `make dev` and
+    `cargo test`). Storage falls back to `file://$KODEHUB_HOME/objects` off-cluster.
+  - Test container types are images layered on one core image (`kodehub/test-core` → `-rust`,
+    `-python`; `-browser` adds Chromium and is built on demand with
+    `scripts/k8s.sh images-browser`). A bundle names the type it needs.
+  - The orchestrator loop (in `kodehub-server`, stateless, `KODEHUB_WORKER=off` disables it)
+    claims `test_run` items, ensures bundles, runs them, and records `formal: true` runs. A
+    failing test whose previous formal result was not a failure is new: it gets one
+    high-priority `fix_failure` coding item. Coverage, lifecycle and merge checks count only
+    formal runs (`formal != false`); agents' pre-submission runs will be `formal: false`.
+  - Merge checks compare failures with the stable graph's latest formal result for the same
+    test: already failing there → `preexisting_failures`, not blamed and not blocking.
+  - PyO3 extension tests stay on the in-process path (not bundled) in the pilot.
+- **Consequence:** `make check`'s smoke test now drives the full chain in Kind: sign-up, project,
+  seed, *Test now* → scheduler → orchestrator → build Job → test Jobs → formal results.
+
 ## D-047 S6: one claim-and-lease protocol, work queue, scheduler, intents
 - **Context:** Spec §3.3, §4.4, §4.5, §5.7, §10, §11.3, §12.2.
 - **Decision:**

@@ -15,6 +15,7 @@ kodehub-render = { path = "crates/kodehub-render" }
 kodehub-runner = { path = "crates/kodehub-runner" }
 kodehub-agents = { path = "crates/kodehub-agents" }
 kodehub-storage = { path = "crates/kodehub-storage" }
+kodehub-worker = { path = "crates/kodehub-worker" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

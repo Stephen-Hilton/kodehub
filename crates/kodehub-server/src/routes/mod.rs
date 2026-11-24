@@ -150,6 +150,11 @@ pub fn api() -> Router<AppState> {
         )
         .route("/api/use-cases/{key}/links", post(c4::link_use_case))
         .route("/api/use-cases/{key}/state", post(c4::set_use_case_state))
+        .route("/api/test-container-types", get(c4::test_container_types))
+        .route(
+            "/api/test-container-types/{name}",
+            put(c4::put_test_container_type),
+        )
         .route(
             "/api/requirements",
             get(requirements::list).post(requirements::create),

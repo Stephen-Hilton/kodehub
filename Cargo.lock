@@ -1054,8 +1054,10 @@ dependencies = [
  "kodehub-store",
  "libc",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1082,18 +1084,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "clap",
  "futures",
  "kodehub-agents",
  "kodehub-core",
  "kodehub-render",
  "kodehub-runner",
+ "kodehub-storage",
  "kodehub-store",
+ "kodehub-worker",
  "portable-pty",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tower-http",
@@ -1143,6 +1149,23 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "kodehub-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "kodehub-core",
+ "kodehub-runner",
+ "kodehub-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

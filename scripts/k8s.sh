@@ -66,8 +66,17 @@ images() {
   if [ -d "$ROOT/app/node_modules" ]; then (cd "$ROOT/app" && npm run --silent build >/dev/null); fi
   mkdir -p "$ROOT/app/dist"
   DOCKER_BUILDKIT=1 docker build -q -f "$ROOT/deploy/images/kodehub.Dockerfile" -t kodehub/kodehub:dev "$ROOT" >/dev/null
-  load_image kodehub/kodehub:dev
-  load_image arangodb:3.12
+  # test container types: one core layer, language layers on top (spec §5.4.1)
+  for t in core rust python; do
+    DOCKER_BUILDKIT=1 docker build -q -f "$ROOT/deploy/images/test-$t.Dockerfile" -t "kodehub/test-$t:dev" "$ROOT/deploy/images" >/dev/null
+  done
+  for img in kodehub/kodehub:dev kodehub/test-rust:dev kodehub/test-python:dev arangodb:3.12; do load_image "$img"; done
+}
+
+images_browser() {
+  ensure_cluster
+  DOCKER_BUILDKIT=1 docker build -q -f "$ROOT/deploy/images/test-browser.Dockerfile" -t kodehub/test-browser:dev "$ROOT/deploy/images" >/dev/null
+  load_image kodehub/test-browser:dev
 }
 
 deploy() {
@@ -104,14 +113,48 @@ smoke() {
   if $K -n $NS get deployment/kodehub-scheduler >/dev/null 2>&1; then
     $K -n $NS get deployment/kodehub-scheduler -o jsonpath='{.status.readyReplicas}' | grep -q '[1-9]' || { echo "scheduler not ready" >&2; fail=1; }
   fi
-  [ $fail = 0 ] && echo "k8s smoke: ok"
-  return $fail
+  [ $fail = 0 ] || return $fail
+  e2e
+  echo "k8s smoke: ok"
+}
+
+# End to end in the cluster: sign up, create a project, seed it, press "Test now", and wait
+# for the scheduler → orchestrator → build Job → test Jobs chain to record formal results.
+e2e() {
+  local api=http://127.0.0.1:17878 user="smoke$(date +%s)" tok proj item state
+  tok=$(curl -sf -X POST -H 'content-type: application/json' \
+    -d "{\"username\":\"$user\",\"password\":\"smoke-password-1\"}" $api/api/auth/register | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+  proj=$(curl -sf -X POST -H "Authorization: Bearer $tok" -H 'content-type: application/json' \
+    -d '{"name":"smoke"}' $api/api/projects | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+  local H=(-H "Authorization: Bearer $tok" -H "x-kodehub-project: $proj" -H 'content-type: application/json')
+  curl -sf -X POST "${H[@]}" -d '{"path":"/app/examples/auth-poc"}' $api/api/seed >/dev/null
+  curl -sf -X POST "${H[@]}" -d '{"target":"project"}' $api/api/test-now >/dev/null
+  for _ in $(seq 1 300); do
+    item=$(curl -sf "${H[@]}" "$api/api/work-items" | python3 -c '
+import sys,json
+items=[w for w in json.load(sys.stdin) if w["agent_type"]=="test_run"]
+print(json.dumps(items[0]) if items else "")')
+    state=$(echo "$item" | python3 -c 'import sys,json;d=sys.stdin.read().strip();print(json.loads(d)["state"] if d else "")')
+    case "$state" in
+      done) break ;;
+      failed|cancelled) echo "in-cluster test run $state: $item" >&2; return 1 ;;
+    esac
+    sleep 2
+  done
+  echo "$item" | python3 -c '
+import sys,json
+w=json.load(sys.stdin); r=w.get("result") or {}
+assert w["state"]=="done", w["state"]
+assert r.get("runtime")=="kubernetes", r
+assert r.get("tests")==9 and r.get("failed")==0, r
+print("in-cluster: %d tests passed in containers (%d bundles built)" % (r["passed"], r["bundles_built"]))'
 }
 
 case "${1:-}" in
   up) db ;;
   db) db ;;
   images) images ;;
+  images-browser) images_browser ;;
   deploy) deploy ;;
   smoke) smoke ;;
   down) kind delete cluster --name "$CLUSTER" ;;

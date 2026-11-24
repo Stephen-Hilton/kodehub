@@ -13,6 +13,8 @@ kodehub-store.workspace = true
 kodehub-render.workspace = true
 kodehub-runner.workspace = true
 kodehub-agents.workspace = true
+kodehub-storage.workspace = true
+blake3.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,6 +30,8 @@ portable-pty.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
+kodehub-worker.workspace = true
 reqwest.workspace = true
 tokio-tungstenite = "0.26"
 futures.workspace = true

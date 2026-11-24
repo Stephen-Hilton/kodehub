@@ -10,6 +10,8 @@ pub struct StorageClient {
     pub base: String,
     pub token: Option<String>,
     http: reqwest::Client,
+    /// `file://<dir>`: talk to a local directory directly (laptop runs without the service).
+    local: Option<crate::backend::LocalBackend>,
 }
 
 /// The bucket Kodehub keeps project data in.
@@ -22,10 +24,14 @@ pub fn artifact_key(project: &str, closure_hash: &str, target: &str) -> String {
 
 impl StorageClient {
     pub fn new(base: &str, token: Option<String>) -> Self {
+        let local = base
+            .strip_prefix("file://")
+            .map(|d| crate::backend::LocalBackend { root: d.into() });
         StorageClient {
             base: base.trim_end_matches('/').to_string(),
             token: token.filter(|t| !t.is_empty()),
             http: reqwest::Client::new(),
+            local,
         }
     }
 
@@ -40,6 +46,13 @@ impl StorageClient {
         ))
     }
 
+    /// The configured service, else a local directory under `home` (laptop default).
+    pub fn from_env_or_local(home: &std::path::Path) -> Self {
+        Self::from_env().unwrap_or_else(|| {
+            Self::new(&format!("file://{}", home.join("objects").display()), None)
+        })
+    }
+
     fn req(&self, m: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let r = self.http.request(m, format!("{}/{}", self.base, path));
         match &self.token {
@@ -49,6 +62,9 @@ impl StorageClient {
     }
 
     pub async fn put(&self, bucket: &str, key: &str, data: impl Into<Bytes>) -> Result<String> {
+        if let Some(l) = &self.local {
+            return l.put(bucket, key, data.into()).await;
+        }
         let r = self
             .req(reqwest::Method::PUT, &format!("{bucket}/{key}"))
             .body(data.into())
@@ -70,6 +86,9 @@ impl StorageClient {
     }
 
     pub async fn get(&self, bucket: &str, key: &str) -> Result<Option<Bytes>> {
+        if let Some(l) = &self.local {
+            return l.get(bucket, key).await;
+        }
         let r = self
             .req(reqwest::Method::GET, &format!("{bucket}/{key}"))
             .send()
@@ -84,6 +103,9 @@ impl StorageClient {
     }
 
     pub async fn exists(&self, bucket: &str, key: &str) -> Result<bool> {
+        if let Some(l) = &self.local {
+            return Ok(l.get(bucket, key).await?.is_some());
+        }
         let r = self
             .req(reqwest::Method::HEAD, &format!("{bucket}/{key}"))
             .send()
@@ -92,6 +114,10 @@ impl StorageClient {
     }
 
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<()> {
+        if let Some(l) = &self.local {
+            l.delete(bucket, key).await?;
+            return Ok(());
+        }
         let r = self
             .req(reqwest::Method::DELETE, &format!("{bucket}/{key}"))
             .send()
@@ -103,6 +129,9 @@ impl StorageClient {
     }
 
     pub async fn list(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectInfo>> {
+        if let Some(l) = &self.local {
+            return l.list(bucket, prefix).await;
+        }
         let r = self
             .req(reqwest::Method::GET, bucket)
             .query(&[("list-type", "2"), ("prefix", prefix)])

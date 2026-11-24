@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod error;
 pub mod events;
+pub mod orchestrator;
 pub mod routes;
 
 use std::sync::Arc;

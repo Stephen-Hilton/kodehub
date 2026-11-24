@@ -181,3 +181,20 @@ pub async fn set_use_case_state(
         .emit("use_case.changed", json!({"key": k, "state": b.state}));
     Ok(Json(uc))
 }
+
+// ---------------------------------------------------------------------- test container types
+
+pub async fn test_container_types(State(s): State<AppState>) -> ApiResult<Value> {
+    Ok(Json(json!(s.store.test_container_types().await?)))
+}
+
+pub async fn put_test_container_type(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    Path(name): Path<String>,
+    Json(b): Json<Value>,
+) -> ApiResult<Value> {
+    Ok(Json(
+        s.store.put_test_container_type(&name, b, &p.id()).await?,
+    ))
+}

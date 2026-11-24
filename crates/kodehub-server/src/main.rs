@@ -47,6 +47,19 @@ async fn main() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))?;
     }
+    // the orchestrator's container work (test runs in build/test containers)
+    if std::env::var("KODEHUB_WORKER").as_deref() != Ok("off") {
+        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "orchestrator".into());
+        kodehub_server::orchestrator::Orchestrator {
+            store: state.store.clone(),
+            runner: state.runner.clone(),
+            storage: kodehub_storage::StorageClient::from_env_or_local(&state.runner.home),
+            jobs: kodehub_runner::jobs::JobRuntime::from_env(),
+            owner: format!("{host}-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]),
+            events: state.events.clone(),
+        }
+        .spawn();
+    }
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("kodehub-server listening on http://{bind}");
     kodehub_server::serve(listener, state).await?;

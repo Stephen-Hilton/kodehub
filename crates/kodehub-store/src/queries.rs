@@ -16,7 +16,7 @@ const TEST_STATUS_FN: &str = "
     LET __t = DOCUMENT(tid)
     LET __cv = FIRST(FOR e IN @@has_version FILTER e._from == tid AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key)
     LET __run = FIRST(FOR tr IN @@test_runs FILTER tr.test_version == __cv AND tr.closure_hash == __t.closure_hash
-                       SORT tr.ran_at DESC LIMIT 1 RETURN tr)
+                       AND tr.formal != false SORT tr.ran_at DESC LIMIT 1 RETURN tr)
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

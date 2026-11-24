@@ -1,7 +1,9 @@
 //! Build cache, compile, test, run-now and sandbox (doc 03).
 
 pub mod build;
+pub mod bundle;
 pub mod exec;
+pub mod jobs;
 pub mod pyenv;
 pub mod run;
 pub mod testing;

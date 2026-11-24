@@ -9,3 +9,4 @@ node_modules
 *.local.mk
 local.mk
 *.tmp.mjs
+app/tsconfig.tsbuildinfo

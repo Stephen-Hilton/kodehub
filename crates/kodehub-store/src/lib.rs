@@ -17,6 +17,7 @@ pub mod schema;
 pub mod seed;
 pub mod settings;
 pub mod store;
+pub mod test_types;
 pub mod testutil;
 
 pub use arango::{request_project, spawn_scoped, with_project, Arango, ArangoConfig};

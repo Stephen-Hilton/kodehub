@@ -69,6 +69,8 @@ spec:
             - { name: KODEHUB_UI_ORIGINS, value: "http://127.0.0.1:17878,http://localhost:17878" }
             - { name: KODEHUB_RUNTIME, value: kubernetes }
             - { name: KODEHUB_NAMESPACE, value: kodehub }
+            # cargo's registry cache must be writable by the non-root user
+            - { name: CARGO_HOME, value: /data/cargo-home }
           ports: [{ containerPort: 7878 }]
           readinessProbe: { httpGet: { path: /health, port: 7878 }, periodSeconds: 2, failureThreshold: 60 }
           resources: { requests: { cpu: 100m, memory: 256Mi } }
