@@ -323,3 +323,158 @@ pub async fn put_agent_type(
         .await?;
     Ok(Json(s.store.db.get("agent_types", &key, None).await?))
 }
+
+// ---------------------------------------------------------------------- git import / export
+
+#[derive(Deserialize)]
+pub struct GitImport {
+    pub repo_url: String,
+    #[serde(default)]
+    pub r#ref: Option<String>,
+}
+
+/// One-time import of a repository into this project (spec §13.1). Re-importing the same
+/// repository would be a reverse sync, which is out of scope.
+pub async fn git_import(
+    State(s): State<AppState>,
+    Extension(p): Extension<ProjectCtx>,
+    Extension(who): Extension<Principal>,
+    Json(b): Json<GitImport>,
+) -> ApiResult<Value> {
+    let url = b.repo_url.trim().to_string();
+    if !(url.starts_with("https://") || url.starts_with("file://") || url.starts_with("git@")) {
+        return Err(ApiError::bad_request(
+            "repo_url must be https://, git@ or file://",
+        ));
+    }
+    let earlier = s
+        .store
+        .list_work_items(Some(&p.id), None, 2000)
+        .await?
+        .into_iter()
+        .any(|w| {
+            w["agent_type"] == "git_import"
+                && w["task"]["repo_url"] == json!(url)
+                && w["state"] != "failed"
+        });
+    if earlier {
+        return Err(ApiError::conflict(
+            "this repository was already imported; re-import (reverse sync) is out of scope",
+        ));
+    }
+    let w = s
+        .store
+        .enqueue(&NewWorkItem {
+            project: p.id.clone(),
+            agent_type: "git_import".into(),
+            kind: "import".into(),
+            target: Some("philosophy/philosophy".into()),
+            priority: kodehub_store::queue::PRIORITY_NORMAL,
+            task: json!({"repo_url": url, "ref": b.r#ref}),
+            requested_by: Some(who.id()),
+            ..Default::default()
+        })
+        .await?;
+    Ok(Json(w))
+}
+
+#[derive(Deserialize)]
+pub struct GitExport {
+    pub repo_url: String,
+    #[serde(default = "main_branch")]
+    pub branch: String,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+fn main_branch() -> String {
+    "main".into()
+}
+
+/// Mirror the project's live versions to a Git repository (spec §13.2).
+pub async fn git_export(
+    State(s): State<AppState>,
+    Extension(p): Extension<ProjectCtx>,
+    Extension(who): Extension<Principal>,
+    Json(b): Json<GitExport>,
+) -> ApiResult<Value> {
+    let w = s
+        .store
+        .enqueue(&NewWorkItem {
+            project: p.id.clone(),
+            agent_type: "git_export".into(),
+            kind: "export".into(),
+            target: Some("philosophy/philosophy".into()),
+            priority: kodehub_store::queue::PRIORITY_NORMAL,
+            task: json!({"repo_url": b.repo_url, "branch": b.branch,
+                         "message": b.message.unwrap_or_else(|| format!("Kodehub export of {}", p.id))}),
+            requested_by: Some(who.id()),
+            ..Default::default()
+        })
+        .await?;
+    Ok(Json(w))
+}
+
+// ---------------------------------------------------------------------- database backups
+
+/// Back up this project's graph into storage (hybrid mode ships it off-site).
+pub async fn backup(
+    State(s): State<AppState>,
+    Extension(p): Extension<ProjectCtx>,
+) -> ApiResult<Value> {
+    let dump = s.store.export_project(&p.id).await?;
+    let storage = kodehub_storage::StorageClient::from_env_or_local(&s.runner.home);
+    let key = format!("projects/{}/backups/db-{}.json", p.id, chrono_like_now());
+    let bytes = serde_json::to_vec(&dump).map_err(|e| ApiError::internal(e.to_string()))?;
+    storage
+        .put(kodehub_storage::BUCKET, &key, bytes.clone())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(json!({"key": key, "bytes": bytes.len()})))
+}
+
+fn chrono_like_now() -> String {
+    kodehub_core::model::now_iso().replace([':', '.'], "-")
+}
+
+#[derive(Deserialize)]
+pub struct Restore {
+    pub key: String,
+    pub name: String,
+}
+
+/// Restore one project alone from a backup, as a new project owned by the caller.
+pub async fn restore(
+    State(s): State<AppState>,
+    Extension(who): Extension<Principal>,
+    Json(b): Json<Restore>,
+) -> ApiResult<Value> {
+    if !who.is_human() {
+        return Err(ApiError::bad_request(
+            "restores are started by a signed-in human",
+        ));
+    }
+    let source = b.key.split('/').nth(1).unwrap_or_default().to_string();
+    if s.store.project_permission(&who, &source).await? != Some(kodehub_store::Permission::Admin) {
+        return Err(ApiError::bad_request(
+            "restore needs admin access to the backed-up project",
+        ));
+    }
+    let storage = kodehub_storage::StorageClient::from_env_or_local(&s.runner.home);
+    let data = storage
+        .get(kodehub_storage::BUCKET, &b.key)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(format!("backup {}", b.key)))?;
+    let dump: Value =
+        serde_json::from_slice(&data).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let out = s
+        .store
+        .restore_project(
+            &dump,
+            &b.name,
+            &kodehub_store::Owner::User(who.user.clone()),
+        )
+        .await?;
+    Ok(Json(out))
+}

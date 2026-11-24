@@ -182,6 +182,7 @@ pub const DOCUMENT_COLLECTIONS: &[&str] = &[
     "test_container_types",
     "approvals",
     "agent_types",
+    "import_units",
 ];
 
 /// All edge collections (doc 02).

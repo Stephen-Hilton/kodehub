@@ -34,7 +34,7 @@ pub const AGENT_TYPES: &[&str] = &[
     "sysadmin",
 ];
 /// Work done by deterministic containers, not agents (no cap, no LLM).
-pub const CONTAINER_TYPES: &[&str] = &["build", "test_run", "git_import", "git_export"];
+pub const CONTAINER_TYPES: &[&str] = &["build", "test_run", "git_import", "git_export", "backup"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NewWorkItem {

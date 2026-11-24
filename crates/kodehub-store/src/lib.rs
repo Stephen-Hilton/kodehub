@@ -2,6 +2,7 @@
 
 pub mod arango;
 pub mod audit;
+pub mod backups;
 pub mod c4;
 pub mod changesets;
 pub mod credentials;

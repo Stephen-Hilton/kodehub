@@ -840,6 +840,12 @@ impl Store {
         self.merge_inner(key, by, false, true).await
     }
 
+    /// Promote a changeset whose code must not be held to the test and review gates (import);
+    /// orphan checks still apply.
+    pub(crate) async fn merge_bypassing_tests(&self, key: &str, by: &str) -> Result<MergeChecks> {
+        self.merge_inner(key, by, false, true).await
+    }
+
     async fn merge_inner(
         &self,
         key: &str,

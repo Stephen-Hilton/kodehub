@@ -4,6 +4,37 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-050 S9: Git import and export, database backups
+- **Context:** Spec §13 and §3.4: a one-time Git import through an import container and an
+  import agent, a Git export container on demand or on a schedule, and off-site backup of the
+  database as well as storage.
+- **Decision:**
+  - `kodehub-worker git-import` (the build image: git, Rust, Python) clones shallowly and parses:
+    Rust with `syn` (spans enabled, so signatures and bodies are sliced from the original source),
+    Python with the standard `ast` module (run with `python3 -I`), every other language as one
+    opaque module per file (`decomposed: false`). Units carry references (identifiers used).
+  - The orchestrator stages the units in the project (`import_units`) and queues an `import`
+    agent item; the agent answers with one `import_mapping` action (contexts, containers,
+    components with unit-id prefixes). Applying it creates planned C4 nodes (the import was a
+    human's request, so no approval round), assigns leftovers to "unmapped imported code", gives
+    every component a generated requirement ("Preserve imported behaviour: <component>",
+    satisfied by it), and opens an **import changeset** of new code versions that promotes
+    without the test and review gates (there are no Kodehub tests yet) but with the orphan check.
+    Opaque units stay staged on their component.
+  - Re-importing a repository URL already imported in the project is refused (409): it would be a
+    reverse sync, out of scope.
+  - `kodehub-worker git-export` renders every language (tests included) and `KODEHUB.md` (the
+    philosophy and the C4 tree, and a note that the repository is a mirror), fetches the branch to
+    keep history, commits only when something changed, and pushes. Git credentials are layered
+    (`git_token` credentials) and reach the container only as `GIT_TOKEN` in a per-job secret;
+    they are spliced into https URLs and scrubbed from error messages.
+  - Per-project graph backups: `export_project` dumps every collection of one project into
+    `projects/<p>/backups/db-<ts>.json` in storage (so hybrid storage ships it off-site with the
+    project's bundle); `restore_project` loads a dump into a new project. Schedules now carry an
+    `action` (`test_run`, `backup`, `git_export`): the scheduler plans a backup every
+    `db_backup_hours` (default 24) and a mirror export when `git_export` is configured.
+- **Consequence:** Opaque (non-Rust/Python) code is visible as staged units but not yet code nodes.
+
 ## D-049 S8: agents as ephemeral tasks on the work queue
 - **Context:** Spec §4, §10, §12, §14: one tiny agent base image, ephemeral stateless agents,
   per-type caps, escalation to an architect, external blockers to humans, credentials only for

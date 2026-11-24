@@ -53,6 +53,30 @@ impl Store {
         interval_secs: i64,
         source: &str,
     ) -> Result<Value> {
+        self.upsert_action_schedule(
+            project,
+            target,
+            level,
+            interval_secs,
+            source,
+            "test_run",
+            Value::Null,
+        )
+        .await
+    }
+
+    /// A timer schedule for any deterministic action: `test_run`, `backup`, `git_export`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_action_schedule(
+        &self,
+        project: &str,
+        target: &str,
+        level: &str,
+        interval_secs: i64,
+        source: &str,
+        action: &str,
+        task: Value,
+    ) -> Result<Value> {
         if interval_secs < 60 {
             return Err(StoreError::Invalid(
                 "schedules run at most once a minute".into(),
@@ -77,7 +101,7 @@ impl Store {
             "interval_secs": interval_secs, "next_due": ts(next_due),
             "last_run": existing.as_ref().map(|e| e["last_run"].clone()).unwrap_or(Value::Null),
             "owner": null, "lease_expires": null, "enabled": true, "source": source,
-            "always": level == "project",
+            "always": level == "project", "action": action, "task": task,
             "updated_at": now_iso(),
         });
         self.db
@@ -148,8 +172,47 @@ impl Store {
             self.upsert_schedule(project, "project", "project", project_secs, "default")
                 .await?,
         ];
-        let keep: std::collections::BTreeSet<String> =
+        // off-site backup of the graph (spec §3.4) and the scheduled Git mirror (spec §13.2)
+        let backup_h = self
+            .setting(project, "db_backup_hours")
+            .await?
+            .as_f64()
+            .unwrap_or(24.0);
+        if backup_h > 0.0 {
+            out.push(
+                self.upsert_action_schedule(
+                    project,
+                    "backup",
+                    "backup",
+                    ((backup_h * 3600.0) as i64).max(3600),
+                    "default",
+                    "backup",
+                    Value::Null,
+                )
+                .await?,
+            );
+        }
+        let gx = self.setting(project, "git_export").await?;
+        if let Some(url) = gx["repo_url"].as_str() {
+            let every = gx["every_hours"].as_f64().unwrap_or(24.0);
+            out.push(
+                self.upsert_action_schedule(
+                    project,
+                    "git_export",
+                    "git_export",
+                    ((every * 3600.0) as i64).max(3600),
+                    "default",
+                    "git_export",
+                    json!({"repo_url": url, "branch": gx["branch"].as_str().unwrap_or("main"),
+                           "message": "Kodehub scheduled export"}),
+                )
+                .await?,
+            );
+        }
+        let mut keep: std::collections::BTreeSet<String> =
             eligible.iter().map(|(id, _, _)| id.clone()).collect();
+        keep.insert("backup".into());
+        keep.insert("git_export".into());
         for (id, level, secs) in eligible {
             out.push(
                 self.upsert_schedule(project, &id, level, secs, "default")
@@ -196,14 +259,20 @@ impl Store {
             };
             let Some(s) = claimed else { continue };
             let project = s["project"].as_str().unwrap_or_default().to_string();
+            let action = s["action"].as_str().unwrap_or("test_run").to_string();
+            let task = if action == "test_run" {
+                json!({"scope": s["target"], "schedule": s["_key"], "formal": true})
+            } else {
+                s["task"].clone()
+            };
             let item = self
                 .enqueue(&NewWorkItem {
                     project,
-                    agent_type: "test_run".into(),
+                    agent_type: action,
                     kind: format!("scheduled_{}", s["level"].as_str().unwrap_or("node")),
                     target: s["target"].as_str().map(str::to_string),
                     priority: PRIORITY_NORMAL,
-                    task: json!({"scope": s["target"], "schedule": s["_key"], "formal": true}),
+                    task,
                     requested_by: Some(format!("scheduler:{owner}")),
                     ..Default::default()
                 })

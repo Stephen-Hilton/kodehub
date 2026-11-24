@@ -106,6 +106,10 @@ pub fn api() -> Router<AppState> {
             post(queue::read_notification),
         )
         .route("/api/agent-types", get(queue::agent_types))
+        .route("/api/git/import", post(queue::git_import))
+        .route("/api/git/export", post(queue::git_export))
+        .route("/api/backups", post(queue::backup))
+        .route("/api/projects/restore", post(queue::restore))
         .route("/api/agent-types/{name}", put(queue::put_agent_type))
         .route("/api/events", get(crate::events::ws_events))
         // generic graph access

@@ -29,7 +29,7 @@ pub struct Orchestrator {
 }
 
 /// Container work types this loop runs.
-pub const CONTAINER_WORK: &[&str] = &["test_run"];
+pub const CONTAINER_WORK: &[&str] = &["test_run", "git_import", "git_export", "backup"];
 
 impl Orchestrator {
     /// Claim and run one container work item. `Ok(false)` when there was nothing to do.
@@ -41,8 +41,14 @@ impl Orchestrator {
         let key = w["_key"].as_str().unwrap_or_default().to_string();
         let project = w["project"].as_str().unwrap_or_default().to_string();
         let target = w["target"].as_str().unwrap_or("project").to_string();
+        let kind = w["agent_type"].as_str().unwrap_or("test_run").to_string();
         let res = kodehub_store::with_project(project.clone(), async {
-            self.test_target(&project, &target, Some(&key)).await
+            match kind.as_str() {
+                "git_import" => self.git_import(&project, &w).await,
+                "git_export" => self.git_export(&project, &w).await,
+                "backup" => self.backup(&project).await,
+                _ => self.test_target(&project, &target, Some(&key)).await,
+            }
         })
         .await;
         match res {
@@ -70,6 +76,191 @@ impl Orchestrator {
             }
         }
         Ok(true)
+    }
+
+    /// A Git credential for the project (layered: acting user, project, owner), passed to the
+    /// container only as a secret environment variable.
+    async fn git_secret(&self, project: &str) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(self
+            .store
+            .resolve_git_credential(project, None)
+            .await?
+            .map(|s| vec![("GIT_TOKEN".to_string(), s.expose().to_string())])
+            .unwrap_or_default())
+    }
+
+    async fn job_with(
+        &self,
+        kind: &str,
+        name: &str,
+        input: &Value,
+        secret_env: Vec<(String, String)>,
+    ) -> anyhow::Result<Value> {
+        let id = format!(
+            "{}-{}",
+            name,
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let project = kodehub_store::request_project().unwrap_or_else(|| "_".into());
+        let in_key = format!("projects/{project}/jobs/{id}/input.json");
+        let out_key = format!("projects/{project}/jobs/{id}/output.json");
+        self.storage
+            .put(BUCKET, &in_key, serde_json::to_vec(input)?)
+            .await?;
+        let outcome = self
+            .jobs
+            .run(&JobSpec {
+                kind: kind.into(),
+                container_type: None,
+                input_key: in_key,
+                output_key: out_key.clone(),
+                timeout: Duration::from_secs(1800),
+                env: vec![],
+                secret_env,
+                name: name.into(),
+            })
+            .await?;
+        match self.storage.get(BUCKET, &out_key).await? {
+            Some(b) => Ok(serde_json::from_slice(&b)?),
+            None => Ok(
+                json!({"ok": false, "error": format!("{kind} job wrote no output: {}", outcome.logs)}),
+            ),
+        }
+    }
+
+    /// Git import (spec §13.1): the deterministic container clones and parses; the units are
+    /// staged and an import agent is asked for the C4 mapping.
+    async fn git_import(&self, project: &str, w: &Value) -> anyhow::Result<Value> {
+        let key = w["_key"].as_str().unwrap_or_default();
+        let out = self
+            .job_with(
+                "git-import",
+                key,
+                &w["task"],
+                self.git_secret(project).await?,
+            )
+            .await?;
+        if out["ok"] != true {
+            anyhow::bail!(
+                "git import failed: {}",
+                out["error"].as_str().unwrap_or("?")
+            );
+        }
+        let units = out["units"].as_array().cloned().unwrap_or_default();
+        let n = self.store.stage_import(key, &out, &units).await?;
+        let brief: Vec<Value> = units
+            .iter()
+            .map(|u| json!({"id": u["id"], "kind": u["kind"], "language": u["language"], "file": u["file"],
+                            "package": u["package"], "module": u["module"], "decomposed": u["decomposed"]}))
+            .collect();
+        let agent = self
+            .store
+            .enqueue(&NewWorkItem {
+                project: project.into(),
+                agent_type: "import".into(),
+                kind: "map_import".into(),
+                target: Some("philosophy/philosophy".into()),
+                priority: kodehub_store::queue::PRIORITY_NORMAL,
+                task: json!({"import": key, "repo_url": out["repo_url"], "commit": out["commit"],
+                             "summary": out["summary"], "units": brief,
+                             "note": "answer with one import_mapping action naming this import"}),
+                requested_by: w["requested_by"].as_str().map(str::to_string),
+                ..Default::default()
+            })
+            .await?;
+        Ok(
+            json!({"staged": n, "commit": out["commit"], "summary": out["summary"], "import_agent": agent["_key"]}),
+        )
+    }
+
+    /// Git export (spec §13.2): render the live versions as ordinary files and push them.
+    async fn git_export(&self, project: &str, w: &Value) -> anyhow::Result<Value> {
+        let files = self.export_files(project).await?;
+        let mut input = w["task"].clone();
+        input["files"] = json!(files);
+        let out = self
+            .job_with(
+                "git-export",
+                w["_key"].as_str().unwrap_or("export"),
+                &input,
+                self.git_secret(project).await?,
+            )
+            .await?;
+        if out["ok"] != true {
+            anyhow::bail!(
+                "git export failed: {}",
+                out["error"].as_str().unwrap_or("?")
+            );
+        }
+        Ok(out)
+    }
+
+    /// Back up the project's graph into storage (hybrid storage ships it off-site).
+    pub async fn backup(&self, project: &str) -> anyhow::Result<Value> {
+        let dump = self.store.export_project(project).await?;
+        let key = format!(
+            "projects/{project}/backups/db-{}.json",
+            now_iso().replace([':', '.'], "-")
+        );
+        let bytes = serde_json::to_vec(&dump)?;
+        self.storage.put(BUCKET, &key, bytes.clone()).await?;
+        Ok(json!({"key": key, "bytes": bytes.len()}))
+    }
+
+    /// The project as files: one rendered crate / package per language (tests included) and a
+    /// `KODEHUB.md` describing the C4 graph. Kodehub stays the source of truth.
+    pub async fn export_files(&self, project: &str) -> anyhow::Result<BTreeMap<String, String>> {
+        let g = self.store.load_code_graph().await?;
+        let mut files = BTreeMap::new();
+        for lang in [Language::Rust, Language::Python] {
+            let roots: Vec<String> = g
+                .symbols
+                .values()
+                .filter(|s| s.language == lang)
+                .map(|s| s.id.clone())
+                .collect();
+            if roots.is_empty() {
+                continue;
+            }
+            let r = kodehub_render::render(&kodehub_render::RenderRequest {
+                graph: &g,
+                roots,
+                language: lang,
+                include_tests: true,
+                namespaces: vec![],
+                harness: None,
+            })?;
+            for (p, c) in r.files {
+                files.insert(format!("{}/{p}", lang.as_str()), c);
+            }
+        }
+        let tree = self
+            .store
+            .aql(
+                "FOR v, e, p IN 1..6 OUTBOUND CONCAT(@pfx, 'philosophy/philosophy') @@contains
+                   RETURN {depth: LENGTH(p.edges), id: v._id, name: v.title || v.name || v.display_name}",
+                json!({}),
+            )
+            .await?;
+        let mut md = format!(
+            "# {project}\n\nExported by Kodehub — this repository is a mirror. Kodehub is the source of truth;\nchanges made here are not merged back.\n\n## Philosophy\n\n{}\n\n## Architecture\n\n",
+            self.store
+                .get_philosophy()
+                .await?
+                .and_then(|p| p["text"].as_str().map(str::to_string))
+                .unwrap_or_default()
+        );
+        for n in tree {
+            let d = n["depth"].as_u64().unwrap_or(1) as usize;
+            md.push_str(&format!(
+                "{}- {} (`{}`)\n",
+                "  ".repeat(d.saturating_sub(1)),
+                n["name"].as_str().unwrap_or(""),
+                n["id"].as_str().unwrap_or("")
+            ));
+        }
+        files.insert("KODEHUB.md".into(), md);
+        Ok(files)
     }
 
     /// Tests that cover `target`: `project` = every test; a C4 node = tests reaching anything

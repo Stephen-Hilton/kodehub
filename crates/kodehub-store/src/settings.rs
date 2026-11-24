@@ -173,6 +173,18 @@ pub fn registry() -> Vec<SettingDef> {
             description: "Model for agents (per-type overrides in agent types).",
         },
         SettingDef {
+            key: "db_backup_hours",
+            default: || json!(24),
+            per_actor: false,
+            description: "How often each project's graph is backed up into storage (0 = never).",
+        },
+        SettingDef {
+            key: "git_export",
+            default: || json!(null),
+            per_actor: false,
+            description: "Scheduled Git mirror: {repo_url, branch, every_hours} (null = on demand only).",
+        },
+        SettingDef {
             key: "open_registration",
             default: || json!(true),
             per_actor: false,

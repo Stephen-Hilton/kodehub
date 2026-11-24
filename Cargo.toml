@@ -46,6 +46,8 @@ tar = "0.4"
 rusty-s3 = "0.7"
 bytes = "1"
 url = "2"
+syn = { version = "2", features = ["full", "extra-traits"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [profile.dev.package."*"]
 opt-level = 1

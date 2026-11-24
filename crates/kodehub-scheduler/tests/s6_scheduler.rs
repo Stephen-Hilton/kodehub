@@ -61,11 +61,17 @@ async fn two_replicas_plan_and_fire_once() {
         "each due schedule fired exactly once"
     );
     let runs = s.list_work_items(Some(&p), None, 500).await.unwrap();
+    assert_eq!(runs.len(), due);
+    // test runs, plus the scheduled off-site backup of the project's graph
+    assert_eq!(
+        runs.iter().filter(|w| w["agent_type"] == "backup").count(),
+        1
+    );
     assert_eq!(
         runs.iter()
             .filter(|w| w["agent_type"] == "test_run")
             .count(),
-        due
+        due - 1
     );
     s.drop_db().await.unwrap();
 }
