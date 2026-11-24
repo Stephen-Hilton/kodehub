@@ -155,6 +155,14 @@ impl Store {
         ];
         let lifecycle =
             crate::with_project(project.to_string(), async { self.node_lifecycle().await }).await?;
+        // spec §11.5: turn the test budget into a concrete plan — if the estimated test time per
+        // day exceeds `test_budget_pct` of the cluster, the non-daily tiers are thinned
+        // (intervals stretched); the daily project run is always kept
+        let scale = self
+            .test_budget_scale(project, &levels)
+            .await
+            .unwrap_or(1.0);
+        let levels = levels.map(|(c, l, h)| (c, l, h * scale));
         let mut eligible = Vec::new();
         for (coll, level, h) in levels {
             for (id, l) in &lifecycle {
@@ -227,6 +235,60 @@ impl Store {
         )
         .await?;
         Ok(out)
+    }
+
+    /// How much to stretch the tiered intervals so tests fit the budget (≥ 1.0). Capacity is the
+    /// cluster's CPU-seconds per day (`KODEHUB_CLUSTER_CPUS`, else this machine's parallelism);
+    /// a run's cost is the average formal run time of the project's tests (60 s when unknown).
+    pub async fn test_budget_scale(
+        &self,
+        project: &str,
+        levels: &[(&str, &str, f64)],
+    ) -> Result<f64> {
+        let pct = self
+            .setting(project, "test_budget_pct")
+            .await?
+            .as_f64()
+            .unwrap_or(30.0);
+        let cpus = std::env::var("KODEHUB_CLUSTER_CPUS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get() as f64)
+                    .unwrap_or(2.0)
+            });
+        let budget = (pct / 100.0) * cpus * 86400.0;
+        let ps = self.for_project(project);
+        let cost = ps
+            .aql(
+                "RETURN AVG(FOR r IN @@test_runs FILTER r.formal == true SORT r.ran_at DESC LIMIT 200 RETURN r.duration_ms)",
+                json!({}),
+            )
+            .await?
+            .first()
+            .and_then(Value::as_f64)
+            .map(|ms| (ms / 1000.0).max(1.0))
+            .unwrap_or(60.0);
+        let counts = ps
+            .aql(
+                "RETURN {components: LENGTH(@@components), containers: LENGTH(@@containers), contexts: LENGTH(@@contexts)}",
+                json!({}),
+            )
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or(json!({}));
+        let demand: f64 = levels
+            .iter()
+            .map(|(coll, _, h)| counts[*coll].as_f64().unwrap_or(0.0) * (24.0 / h.max(0.01)) * cost)
+            .sum();
+        // the daily run is outside the budget; only the tiers are scaled
+        Ok(if demand > budget && budget > 0.0 {
+            demand / budget
+        } else {
+            1.0
+        })
     }
 
     /// Claim due schedules (claim-and-lease) and turn each into a `test_run` work item. Safe to

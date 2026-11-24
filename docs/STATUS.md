@@ -24,14 +24,14 @@ The plan and acceptance criteria are in `docs/09-v0.1-audit-and-plan.md`; every 
 | S9 Git import (import agent mapping) and export, graph backups | ✅ | `kodehub-server/tests/s9_git.rs` |
 | S10 UI: screens, in-node badges and overlays | ✅ | `app/e2e/demo.spec.ts`, `app/e2e/v01.spec.ts` |
 | S11 Speech transcription, remote MCP over OAuth 2.1 | ✅ | `kodehub-server/tests/s11_oauth_mcp.rs`, in-cluster smoke |
+| §11.4–11.5 Sysadmin timer, test budget → cadence | ✅ | `kodehub-server/tests/s11_sysadmin_budget.rs` |
 
 ## Not done / known limits
 
 - Live agents in the cluster need a stored credential (an API key, or a personal subscription
   token on a user-owned project). CI-style runs use the recorded backend.
-- The sysadmin agent and the test author's schedule balancing exist as agent roles and actions
-  (`set_caps`, `schedule`), but nothing yet wakes the sysadmin agent on a timer with cluster
-  metrics; caps are settings.
+- The sysadmin check reads this machine's CPUs and load (`/proc/loadavg`), not per-node
+  Kubernetes metrics, and cannot yet move work between machines.
 - Opaque (non-Rust/Python) imported code stays staged, not decomposed.
 - Hash-only referencing inside code bodies, multi-cluster deployment and IDE-grade editing remain
   out of scope.

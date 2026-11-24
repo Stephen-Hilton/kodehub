@@ -567,8 +567,95 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Spec §11.4: the sysadmin (cluster manager) agent wakes on an interval, checks health and
+    /// utilization, and goes back to sleep when all is well. The check is deterministic; only when
+    /// agent work is held back by caps, or the machine is overloaded, is a sysadmin agent queued
+    /// with the metrics to form and apply a hypothesis (`set_caps`). Humans' hard limits stay.
+    pub async fn sysadmin_check(&self) -> anyhow::Result<Option<Value>> {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2) as f64;
+        let load1 = std::fs::read_to_string("/proc/loadavg").ok().and_then(|l| {
+            l.split_whitespace()
+                .next()
+                .and_then(|x| x.parse::<f64>().ok())
+        });
+        let claims = self.store.active_claims().await?;
+        let queued = self
+            .store
+            .db
+            .aql_raw(
+                "FOR w IN kodehub_work_items FILTER w.state == 'queued' AND w.agent_type IN @types
+                   COLLECT p = w.project, t = w.agent_type WITH COUNT INTO n RETURN {p, t, n}",
+                json!({"types": kodehub_store::queue::AGENT_TYPES}),
+            )
+            .await?;
+        let overloaded = load1.is_some_and(|l| l > cpus * 1.5);
+        let waiting: u64 = queued.iter().filter_map(|r| r["n"].as_u64()).sum();
+        let running: u64 = claims.values().sum();
+        if waiting == 0 && !overloaded {
+            return Ok(None); // all is well: back to sleep
+        }
+        // the project with the most waiting agent work hosts the sysadmin item
+        let Some(project) = queued
+            .iter()
+            .max_by_key(|r| r["n"].as_u64().unwrap_or(0))
+            .and_then(|r| r["p"].as_str())
+            .map(str::to_string)
+        else {
+            return Ok(None);
+        };
+        let open = self
+            .store
+            .list_work_items(Some(&project), None, 200)
+            .await?
+            .into_iter()
+            .any(|w| {
+                w["agent_type"] == "sysadmin"
+                    && matches!(w["state"].as_str(), Some("queued" | "claimed"))
+            });
+        if open {
+            return Ok(None);
+        }
+        let caps = self.store.resolve_chain(&["app".into()]).await?;
+        let w = self
+            .store
+            .enqueue(&NewWorkItem {
+                project,
+                agent_type: "sysadmin".into(),
+                kind: "tune_caps".into(),
+                target: Some("philosophy/philosophy".into()),
+                priority: kodehub_store::queue::PRIORITY_LOW,
+                task: json!({
+                    "cpus": cpus, "load1": load1, "overloaded": overloaded,
+                    "running_agents": running, "waiting_agent_items": waiting,
+                    "queued_by_type": queued,
+                    "current_caps": caps.get("agent_caps").map(|c| c["value"].clone()),
+                    "hard_limit": caps.get("agent_caps_hard_limit").map(|c| c["value"].clone()),
+                    "note": "if the cluster has spare capacity raise caps for the waiting types; if overloaded scale back; never exceed the hard limit",
+                }),
+                requested_by: Some("sysadmin-timer".into()),
+                ..Default::default()
+            })
+            .await?;
+        Ok(Some(w))
+    }
+
     /// Run forever: claim container work, sleep when idle.
     pub fn spawn(self) {
+        let sys = self.clone();
+        tokio::spawn(async move {
+            let every = std::env::var("KODEHUB_SYSADMIN_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(600);
+            loop {
+                tokio::time::sleep(Duration::from_secs(every)).await;
+                if let Err(e) = sys.sysadmin_check().await {
+                    tracing::warn!("sysadmin check: {e:#}");
+                }
+            }
+        });
         tokio::spawn(async move {
             loop {
                 match self.tick().await {

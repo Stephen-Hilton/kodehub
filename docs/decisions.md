@@ -4,6 +4,21 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-053 Sysadmin timer and the test budget
+- **Context:** Spec §11.4 (a cluster manager agent wakes on an interval, sleeps when all is
+  well, sets caps to fit the compute) and §11.5 (turn a test budget into a concrete plan; the
+  daily run is always kept).
+- **Decision:** Every `KODEHUB_SYSADMIN_SECS` (600) the orchestrator runs a deterministic check
+  (CPUs, 1-minute load, agent work queued vs running). All well → nothing, no LLM call. Work held
+  back by caps or an overloaded machine → one low-priority `sysadmin` work item carrying the
+  metrics and current caps; the agent answers `set_caps`, written at app scope as a
+  system-managed value (human hard limits are never written this way). The scheduler scales the
+  component / container / context intervals by `demand / budget` when the estimated test time
+  per day (average formal run time × runs per day) exceeds `test_budget_pct` of the cluster's
+  CPU-seconds (`KODEHUB_CLUSTER_CPUS`, else this machine); the daily project run is outside the
+  budget.
+- **Consequence:** The test author agent can still override individual cadences with `schedule`.
+
 ## D-052 S11: speech transcription and remote MCP over OAuth
 - **Context:** Spec §14.1 (spoken philosophy and requirements) and §13A.2 (remote MCP with the
   standard OAuth flow, each assistant its own agent user).
