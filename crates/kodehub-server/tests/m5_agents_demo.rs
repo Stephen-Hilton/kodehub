@@ -265,7 +265,9 @@ async fn demo_scenario_with_recorded_agents() {
         "the demo consumed its 6 responses; 4 remain for the optional save-as-example cycle"
     );
     // re-importing the seed over the changed graph works (the UI e2e suite does this)
-    let (s, v) = t.req("POST", "/api/seed", Some(json!({"path": seed_path()}))).await;
+    let (s, v) = t
+        .req("POST", "/api/seed", Some(json!({"path": seed_path()})))
+        .await;
     assert_eq!(s, 200, "re-seed after the demo: {v}");
     t.stop().await;
 }
