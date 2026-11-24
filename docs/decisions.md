@@ -4,6 +4,60 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-049 S8: agents as ephemeral tasks on the work queue
+- **Context:** Spec §4, §10, §12, §14: one tiny agent base image, ephemeral stateless agents,
+  per-type caps, escalation to an architect, external blockers to humans, credentials only for
+  the duration of the work, metering and budgets, the kickoff chain, tests before code.
+- **Decision:**
+  - **Agent types** live in each project's `agent_types` collection (built-ins seeded: coding,
+    test_author, review, planning, architect, import, design, sysadmin; custom types
+    `custom:<name>` with stored instructions). Each has a prompt (`prompts/*.md`), a tool role
+    (read-only graph tools) and an optional model.
+  - **Dispatcher** (`AgentDispatcher` in `kodehub-server`, started by `serve()`): claims agent
+    work items (caps and budget enforced by the claim), registers the intent, then:
+    coding work goes through the existing changeset engine (plan → tests → code → blind review
+    → formal tests → promote); every other role is **one** agent task answering
+    `{change_log, actions}`, applied through the store by `actions.rs` (create_nodes, enqueue
+    with `after` dependencies, propose_requirement_change, set_philosophy (architect only),
+    write_tests, schedule, set_caps (sysadmin only), external_blocker, use_case_verdict,
+    import_mapping).
+  - Requirement edits now **enqueue** a high-priority coding item instead of calling the engine.
+    Plans approve themselves unless `human_engagement = plans` (a new value that keeps the
+    v0.05 human plan approval; the M5 demo and the UI e2e set it). An item waiting on a human
+    plan approval is `waiting_human`; it settles when its changeset ends.
+  - **Approvals**: new contexts (and containers under `human_engagement = containers`) and every
+    requirement change become `approvals` a human decides (`POST /api/approvals/{k}/decide`,
+    human session only); approved proposals are applied.
+  - **External blockers** (no credential, a revoked key …) mark the item `blocked` (no attempt
+    counted) and create a notification flagged `unrelated_to_code`; `POST /api/work-items/unblock`
+    requeues after a human fixed it.
+  - **Tests before code**: `write_tests` opens a `tests_first` changeset of new tests only, which
+    promotes without passing them (they fail until the code exists) and without a code review;
+    orphan checks still apply. Tests are excluded from lifecycle roll-up, so a component holding
+    only tests stays `planned` (and is not scheduled).
+  - **Kickoff chain** on project creation (setting `kickoff`, default on): architect
+    `cleanup_philosophy` (only for a raw transcript) → architect `evaluate_requirements` →
+    one planning item per context; planning agents enqueue the next levels themselves (per
+    container, then per component a test_author item before a coding item).
+  - **Use cases** going live wait in `checking` for an architect's `use_case_verdict` (setting
+    `use_case_check`, default on).
+  - **Each agent task** gets a short-lived, read-only internal Kodehub token for its graph tools
+    (`KODEHUB_TOKEN` for `kodehub mcp`, bearer for the API backend's tool calls), and its usage
+    is recorded per project and work item.
+  - **Credentials and backends**: the project's `agent_backend` (when set) or the server config.
+    `api` uses only a stored API key (or the legacy `KODEHUB_ANTHROPIC_API_KEY`); `claude_code`
+    uses only the owner's stored subscription token, handed to that one `claude` process as
+    `CLAUDE_CODE_OAUTH_TOKEN`, or the developer's CLI login on a laptop. Missing credentials are
+    an external blocker, never a fallback to the other kind.
+  - **Agent containers**: in the cluster (or with `KODEHUB_AGENT_CONTAINERS=always`) every task
+    runs as `kodehub-worker agent` in `kodehub/agent:dev` through `ContainerBackend`. The model
+    credential goes into a per-job Kubernetes Secret deleted with the job; the task input
+    (holding the Kodehub token) is deleted from storage afterwards. The image is the core test
+    layer + the `claude` CLI's standalone native binary (Node only in the builder stage) + the
+    kodehub CLI; ~720 MB, almost all of it the `claude` binary.
+- **Consequence:** The smoke test runs an agent task in its own Kubernetes Job (recorded
+  backend, no credential). Live agents in the cluster need a stored credential.
+
 ## D-048 S7: build and test containers, shell tests, formal runs
 - **Context:** Spec §5.3–5.7: build once (deterministic, no LLM), test many times from the
   artifact, tests are plain shell scripts, only formal runs count, baseline blame, failures

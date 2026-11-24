@@ -43,6 +43,15 @@ async fn demo_scenario_with_recorded_agents() {
     })
     .await;
 
+    // this demo keeps the v0.05 flow where a human approves the plan (v0.1 default: agents
+    // proceed; humans approve requirement changes, new contexts and prod)
+    let pid = t.store.project_id().unwrap();
+    t.uok(
+        "PUT",
+        &format!("/api/scopes/project:{pid}/settings/human_engagement"),
+        Some(json!({"value": "plans"})),
+    )
+    .await;
     // 1. everything green
     t.ok("POST", "/api/seed", Some(json!({"path": seed_path()})))
         .await;
@@ -264,6 +273,17 @@ async fn demo_scenario_with_recorded_agents() {
         4,
         "the demo consumed its 6 responses; 4 remain for the optional save-as-example cycle"
     );
+    // the edit went through the work queue: one coding item, parked for the plan approval and
+    // settled when the changeset merged
+    let items = t.ok("GET", "/api/work-items", None).await;
+    let coding: Vec<&Value> = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["kind"] == "requirement_changed")
+        .collect();
+    assert_eq!(coding.len(), 1, "{items}");
+    assert_eq!(coding[0]["state"], "done", "{}", coding[0]);
     // re-importing the seed over the changed graph works (the UI e2e suite does this)
     let (s, v) = t
         .req("POST", "/api/seed", Some(json!({"path": seed_path()})))

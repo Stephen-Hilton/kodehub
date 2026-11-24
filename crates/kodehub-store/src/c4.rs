@@ -533,7 +533,9 @@ impl Store {
         self.get_use_case(key).await
     }
 
-    /// Move a use case between `draft` and `live` (spec §15.2).
+    /// Move a use case between `draft` and `live` (spec §15.2). With `use_case_check` on (the
+    /// default), going live first passes an architect agent's contradiction check against the
+    /// live use cases (spec §15.3): the use case waits in `checking`.
     pub async fn set_use_case_state(&self, key: &str, state: &str, by: &str) -> Result<Value> {
         if !matches!(state, "draft" | "live") {
             return Err(StoreError::Invalid(
@@ -546,15 +548,77 @@ impl Store {
                 "a use case goes live only with at least one expected-outcome test".into(),
             ));
         }
+        let project = self.project_id().unwrap_or_default();
+        let check = state == "live"
+            && uc["state"] != "live"
+            && self
+                .setting(&project, "use_case_check")
+                .await?
+                .as_bool()
+                .unwrap_or(true);
+        let target_state = if check { "checking" } else { state };
         self.db
             .patch(
                 "use_cases",
                 key,
-                &json!({"state": state, "state_changed_at": now_iso(), "state_changed_by": by}),
+                &json!({"state": target_state, "state_changed_at": now_iso(), "state_changed_by": by}),
+                None,
+            )
+            .await?;
+        if check {
+            let live = self
+                .aql(
+                    "FOR u IN @@use_cases FILTER u.state == 'live' RETURN {key: u._key, name: u.name, description: u.description}",
+                    json!({}),
+                )
+                .await?;
+            self.enqueue(&crate::queue::NewWorkItem {
+                project,
+                agent_type: "architect".into(),
+                kind: "check_use_case".into(),
+                target: Some(format!("use_cases/{key}")),
+                priority: crate::queue::PRIORITY_NORMAL,
+                task: json!({"use_case": uc, "live_use_cases": live,
+                             "note": "check for contradictions with the live use cases; answer with use_case_verdict"}),
+                requested_by: Some(by.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        }
+        self.get_use_case(key).await
+    }
+
+    /// The architect's contradiction check result.
+    pub async fn use_case_verdict(
+        &self,
+        key: &str,
+        ok: bool,
+        conflicts: Value,
+        notes: &str,
+        by: &str,
+    ) -> Result<Value> {
+        let uc = self.get_use_case(key).await?;
+        if uc["state"] != "checking" {
+            return Err(StoreError::Conflict(format!(
+                "use case {key} is not waiting for a check"
+            )));
+        }
+        self.db
+            .patch(
+                "use_cases",
+                key,
+                &json!({"state": if ok { "live" } else { "draft" },
+                        "check": {"ok": ok, "conflicts": conflicts, "notes": notes, "by": by, "at": now_iso()},
+                        "state_changed_at": now_iso()}),
                 None,
             )
             .await?;
         self.get_use_case(key).await
+    }
+
+    /// Apply an import agent's C4 mapping (spec §13.1).
+    pub async fn apply_import_mapping(&self, mapping: &Value, by: &str) -> Result<Value> {
+        crate::import::apply_mapping(self, mapping, by).await
     }
 
     // ------------------------------------------------------------------ lifecycle
@@ -573,11 +637,17 @@ impl Store {
                 "FOR s IN @@symbols
                    LET stable = LENGTH(FOR e IN @@has_version FILTER e._from == s._id AND e.state == 'stable' RETURN 1) > 0
                    LET cand = LENGTH(FOR e IN @@has_version FILTER e._from == s._id AND e.state == 'candidate' RETURN 1)
-                   RETURN {id: s._id, stable, cand, explicit: s.lifecycle}",
+                   RETURN {id: s._id, stable, cand, explicit: s.lifecycle, test: s.kind == 'test'}",
                 json!({}),
             )
             .await?;
         let mut state: BTreeMap<String, String> = BTreeMap::new();
+        // tests are not built code: a component holding only tests is still planned
+        let tests: BTreeSet<String> = syms
+            .iter()
+            .filter(|s| s["test"] == true)
+            .filter_map(|s| s["id"].as_str().map(str::to_string))
+            .collect();
         for s in &syms {
             let id = s["id"].as_str().unwrap_or_default().to_string();
             let h = health
@@ -630,21 +700,29 @@ impl Store {
             Some(f) => f.await.ok().and_then(|v| v.as_bool()).unwrap_or(true),
             None => true,
         };
+        #[allow(clippy::too_many_arguments)]
         fn resolve(
             n: &str,
             children: &BTreeMap<String, Vec<String>>,
             state: &mut BTreeMap<String, String>,
             explicit: &BTreeMap<String, String>,
+            tests: &BTreeSet<String>,
             strict: bool,
             depth: usize,
         ) -> String {
             if let Some(s) = state.get(n) {
                 return s.clone();
             }
-            let kids = children.get(n).cloned().unwrap_or_default();
+            let kids: Vec<String> = children
+                .get(n)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|k| !tests.contains(k))
+                .collect();
             let ks: Vec<String> = if depth < 12 {
                 kids.iter()
-                    .map(|k| resolve(k, children, state, explicit, strict, depth + 1))
+                    .map(|k| resolve(k, children, state, explicit, tests, strict, depth + 1))
                     .collect()
             } else {
                 vec![]
@@ -672,7 +750,7 @@ impl Store {
         let mut out = BTreeMap::new();
         for e in &explicit {
             let id = e["id"].as_str().unwrap_or_default().to_string();
-            resolve(&id, &children, &mut state, &exp, strict, 0);
+            resolve(&id, &children, &mut state, &exp, &tests, strict, 0);
         }
         for (id, s) in &state {
             let own = if level_of(id) == "code" {

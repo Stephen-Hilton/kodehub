@@ -180,6 +180,8 @@ pub const DOCUMENT_COLLECTIONS: &[&str] = &[
     "intents",
     "negotiations",
     "test_container_types",
+    "approvals",
+    "agent_types",
 ];
 
 /// All edge collections (doc 02).

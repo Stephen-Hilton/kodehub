@@ -71,6 +71,8 @@ spec:
             - { name: KODEHUB_NAMESPACE, value: kodehub }
             # cargo's registry cache must be writable by the non-root user
             - { name: CARGO_HOME, value: /data/cargo-home }
+            # agents in their containers reach the API (their graph tools) here
+            - { name: KODEHUB_INTERNAL_URL, value: "http://kodehub-server.kodehub.svc:7878" }
           ports: [{ containerPort: 7878 }]
           readinessProbe: { httpGet: { path: /health, port: 7878 }, periodSeconds: 2, failureThreshold: 60 }
           resources: { requests: { cpu: 100m, memory: 256Mi } }

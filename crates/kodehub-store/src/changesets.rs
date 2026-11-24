@@ -813,6 +813,40 @@ impl Store {
     /// Merge. With `dry_run` the transaction is aborted after the orphan check, so callers can
     /// see whether a merge *would* succeed.
     pub async fn merge_changeset(&self, key: &str, by: &str, dry_run: bool) -> Result<MergeChecks> {
+        self.merge_inner(key, by, dry_run, false).await
+    }
+
+    /// Tests before code (spec §14.3): a changeset holding only new tests, written from the
+    /// requirements for code that does not exist yet, promotes without passing them (they fail
+    /// until the code lands) and without a code review (the test author checked their quality).
+    /// Orphan checks still apply: every test must verify a requirement.
+    pub async fn merge_tests_first(&self, key: &str, by: &str) -> Result<MergeChecks> {
+        let cs = self.get_changeset(key).await?;
+        let proposals = cs["proposals"].as_object().cloned().unwrap_or_default();
+        if cs["tests_first"] != true
+            || proposals.is_empty()
+            || proposals.values().any(|p| p["kind"] != "test")
+        {
+            return Err(StoreError::Invalid(
+                "only a tests-first changeset of new tests promotes without passing them".into(),
+            ));
+        }
+        let mut hist = cs["history"].as_array().cloned().unwrap_or_default();
+        hist.push(
+            json!({"state": "ready", "at": now_iso(), "by": by, "note": "tests before code"}),
+        );
+        self.patch_changeset(key, json!({"state": "ready", "history": hist}))
+            .await?;
+        self.merge_inner(key, by, false, true).await
+    }
+
+    async fn merge_inner(
+        &self,
+        key: &str,
+        by: &str,
+        dry_run: bool,
+        tests_first: bool,
+    ) -> Result<MergeChecks> {
         // one merge/deploy at a time: checks and writes see a stable graph (review M6 #3)
         let _write = self.write_lock.lock().await;
         let key = key_of(key).to_string();
@@ -825,7 +859,10 @@ impl Store {
             )));
         }
         let (mut checks, g, touched) = self.merge_checks(&key).await?;
-        if !dry_run && !(checks.tests_ok && checks.review_ok && checks.requirements_covered) {
+        if !dry_run
+            && !tests_first
+            && !(checks.tests_ok && checks.review_ok && checks.requirements_covered)
+        {
             return Err(StoreError::Conflict(format!(
                 "merge blocked: tests_ok={} (failing {:?}, not run {:?}), review_ok={} (attested {}, open blocking {}), requirements_covered={} {:?}",
                 checks.tests_ok, checks.failing_tests, checks.missing_tests, checks.review_ok, checks.review_attested,

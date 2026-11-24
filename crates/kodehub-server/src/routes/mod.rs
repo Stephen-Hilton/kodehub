@@ -97,6 +97,16 @@ pub fn api() -> Router<AppState> {
         .route("/api/test-now", post(queue::test_now))
         .route("/api/intents", get(queue::intents))
         .route("/api/spend", get(queue::spend))
+        .route("/api/work-items/unblock", post(queue::unblock))
+        .route("/api/approvals", get(queue::approvals))
+        .route("/api/approvals/{key}/decide", post(queue::decide))
+        .route("/api/notifications", get(queue::notifications))
+        .route(
+            "/api/notifications/{key}/read",
+            post(queue::read_notification),
+        )
+        .route("/api/agent-types", get(queue::agent_types))
+        .route("/api/agent-types/{name}", put(queue::put_agent_type))
         .route("/api/events", get(crate::events::ws_events))
         // generic graph access
         .route("/api/node", get(graph::get_node))

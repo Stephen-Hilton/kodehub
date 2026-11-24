@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+kodehub-storage.workspace = true
+blake3.workspace = true
 kodehub-core.workspace = true
 kodehub-store.workspace = true
 kodehub-runner.workspace = true

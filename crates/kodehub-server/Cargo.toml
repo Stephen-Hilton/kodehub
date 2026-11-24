@@ -30,6 +30,7 @@ portable-pty.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 kodehub-worker.workspace = true
 reqwest.workspace = true

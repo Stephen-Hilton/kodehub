@@ -2,11 +2,13 @@
 //! pluggable backend. Agents read the graph through MCP tools and return one structured JSON
 //! result; the engine applies results through the graph API (decisions.md D-025).
 
+pub mod actions;
 pub mod backend;
 pub mod context;
 pub mod engine;
 pub mod environments;
 pub mod prompts;
+pub mod roles;
 pub mod schemas;
 
 use std::sync::Arc;
@@ -88,6 +90,12 @@ pub struct AgentTask {
     pub changeset: Option<String>,
     /// Label for logs, e.g. "plan", "review round 1".
     pub label: String,
+    /// Short-lived Kodehub token for the agent's read-only graph tools (MCP / HTTP), scoped to
+    /// one project and work item. Never a model credential.
+    #[serde(default)]
+    pub api_token: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +107,18 @@ pub struct AgentOutput {
     pub backend: String,
     pub model: String,
     pub duration_ms: u64,
+    /// Token usage reported by the backend (`input_tokens`, `output_tokens`).
+    #[serde(default)]
+    pub usage: Value,
+}
+
+tokio::task_local! {
+    /// The work item an agent call belongs to (metering, tokens).
+    pub static CURRENT_WORK_ITEM: String;
+}
+
+pub fn current_work_item() -> Option<String> {
+    CURRENT_WORK_ITEM.try_with(|w| w.clone()).ok()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +133,9 @@ pub enum AgentError {
     Runner(#[from] kodehub_runner::RunnerError),
     #[error("{0}")]
     Workflow(String),
+    /// An external blocker only a human can clear (spec §4.5): no credential, revoked key.
+    #[error("blocked: {0}")]
+    Blocked(String),
 }
 
 pub type Result<T> = std::result::Result<T, AgentError>;

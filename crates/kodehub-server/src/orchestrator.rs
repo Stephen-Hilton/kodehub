@@ -138,6 +138,7 @@ impl Orchestrator {
                 output_key: out_key.clone(),
                 timeout: Duration::from_secs(if kind == "build" { 1800 } else { 900 }),
                 env: vec![],
+                secret_env: vec![],
                 name: name.into(),
             })
             .await?;
@@ -390,4 +391,269 @@ impl Orchestrator {
             }
         });
     }
+}
+
+/// The agent side of the orchestrator (spec §4): claim agent work items (caps enforced by the
+/// claim), register the intent, run one ephemeral agent task per step, apply its results, and
+/// close, retry, escalate or block the item. Coding work goes through the changeset engine.
+#[derive(Clone)]
+pub struct AgentDispatcher {
+    pub store: Store,
+    pub engine: std::sync::Arc<kodehub_agents::Engine>,
+    pub owner: String,
+    pub events: Events,
+}
+
+impl AgentDispatcher {
+    pub async fn tick(&self) -> anyhow::Result<bool> {
+        let types: Vec<String> = kodehub_store::queue::AGENT_TYPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let Some(w) = self.store.claim_next(&self.owner, &types, 1800).await? else {
+            return Ok(false);
+        };
+        let key = w["_key"].as_str().unwrap_or_default().to_string();
+        let project = w["project"].as_str().unwrap_or_default().to_string();
+        let this = self.clone();
+        let wk = key.clone();
+        kodehub_store::with_project(
+            project.clone(),
+            kodehub_agents::CURRENT_WORK_ITEM.scope(wk, async move { this.handle(&w).await }),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn handle(&self, w: &Value) -> anyhow::Result<()> {
+        let key = w["_key"].as_str().unwrap_or_default().to_string();
+        let project = w["project"].as_str().unwrap_or_default().to_string();
+        let agent_type = w["agent_type"].as_str().unwrap_or("coding").to_string();
+        let kind = w["kind"].as_str().unwrap_or("").to_string();
+        let target = w["target"]
+            .as_str()
+            .unwrap_or("philosophy/philosophy")
+            .to_string();
+        self.events.emit(
+            "agent.activity",
+            json!({"role": agent_type, "work_item": key, "message": format!("claimed {kind} on {target}")}),
+        );
+        // declared intent (spec §10.1): the node it will change
+        let d = self
+            .store
+            .register_intent(&key, std::slice::from_ref(&target), &kind, false)
+            .await?;
+        match d["decision"].as_str() {
+            Some("absorbed") | Some("sequenced") => {
+                self.events.emit(
+                    "agent.activity",
+                    json!({"role": agent_type, "work_item": key, "decision": d}),
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+        let outcome = if agent_type == "coding" {
+            self.coding(w, &kind, &target).await
+        } else if agent_type == "review" {
+            // reviews run inside the changeset engine; a standalone review item is informational
+            Ok(Outcome::Done(
+                json!({"note": "reviews run inside changesets"}),
+            ))
+        } else {
+            self.role(w, &agent_type).await
+        };
+        match outcome {
+            Ok(Outcome::Done(result)) => {
+                let log = result.get("change_log").cloned().unwrap_or(Value::Null);
+                self.store
+                    .complete_work_item(&key, &self.owner, log, result)
+                    .await?;
+            }
+            Ok(Outcome::Waiting(cs)) => {
+                self.store.park_work_item(&key, &self.owner, &cs).await?;
+            }
+            Ok(Outcome::Failed(reason, log)) => {
+                self.store
+                    .fail_work_item(&key, &self.owner, &reason, log)
+                    .await?;
+            }
+            Err(kodehub_agents::AgentError::Blocked(msg)) => {
+                self.store
+                    .notify(
+                        &project,
+                        "external_blocker",
+                        &msg,
+                        json!({"work_item": key, "agent_type": agent_type}),
+                    )
+                    .await?;
+                self.store.block_work_item(&key, &self.owner, &msg).await?;
+            }
+            Err(e) => {
+                self.store
+                    .fail_work_item(&key, &self.owner, &e.to_string(), json!({}))
+                    .await?;
+            }
+        }
+        self.events.emit("work.updated", json!({"work_item": key}));
+        Ok(())
+    }
+
+    /// Coding work: a changeset driven through plan → tests → code → blind review → formal
+    /// tests → promotion. Requirement edits reuse the engine's requirement path.
+    async fn coding(&self, w: &Value, kind: &str, target: &str) -> kodehub_agents::Result<Outcome> {
+        let cs_key = if kind == "requirement_changed" {
+            let req = kodehub_store::key_of(target).to_string();
+            let by = w["requested_by"].as_str().unwrap_or("human").to_string();
+            self.engine.on_requirement_edited(&req, &by).await?
+        } else {
+            let reqs: Vec<String> = self
+                .store
+                .requirements_for(target)
+                .await
+                .ok()
+                .and_then(|c| c["requirements"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r["inherited"] == false || r["distance"].as_u64().unwrap_or(9) <= 1)
+                .filter_map(|r| r["key"].as_str().map(str::to_string))
+                .collect();
+            let failing = w["failing_tests"].clone();
+            let cs = self
+                .store
+                .open_changeset(
+                    &format!("{} {}", kind.replace('_', " "), target),
+                    &format!(
+                        "Work item {}: {kind} on {target}. Task: {}. Failing tests: {failing}. Earlier attempts: {}",
+                        w["_key"].as_str().unwrap_or(""),
+                        w["task"],
+                        w["history"]
+                    ),
+                    &reqs,
+                    "orchestrator",
+                )
+                .await?;
+            let k = cs["_key"].as_str().unwrap_or_default().to_string();
+            self.store
+                .patch_changeset(&k, json!({"work_item": w["_key"], "origin": kind}))
+                .await?;
+            self.engine.plan(&k).await?;
+            k
+        };
+        self.store
+            .patch_changeset(&cs_key, json!({"work_item": w["_key"]}))
+            .await?;
+        let cs = self.store.get_changeset(&cs_key).await?;
+        Ok(match cs["state"].as_str() {
+            Some("merged") => Outcome::Done(json!({"changeset": cs_key, "merged": true,
+                                                     "change_log": cs["activity"]})),
+            Some("planned") => Outcome::Waiting(cs_key),
+            Some(other) => Outcome::Failed(
+                format!(
+                    "changeset {cs_key} ended {other}: {}",
+                    cs["error"].as_str().unwrap_or("")
+                ),
+                json!({"changeset": cs_key, "state": other}),
+            ),
+            None => Outcome::Failed("changeset vanished".into(), json!({})),
+        })
+    }
+
+    /// Any other role: one agent call, then its actions applied through the store.
+    async fn role(&self, w: &Value, agent_type: &str) -> kodehub_agents::Result<Outcome> {
+        let out = self.engine.run_role(agent_type, w).await?;
+        let actions = out.json["actions"].as_array().cloned().unwrap_or_default();
+        let project = w["project"].as_str().unwrap_or_default().to_string();
+        let ctx = kodehub_agents::actions::ApplyCtx {
+            store: &self.store,
+            project: &project,
+            work_item: w,
+            agent_type,
+        };
+        let report = kodehub_agents::actions::apply(&ctx, &actions).await?;
+        if let Some(msg) = report["blocked"].as_str() {
+            return Err(kodehub_agents::AgentError::Blocked(msg.to_string()));
+        }
+        Ok(Outcome::Done(
+            json!({"change_log": out.json["change_log"], "report": report,
+                                 "backend": out.backend, "model": out.model}),
+        ))
+    }
+
+    pub fn spawn(self) {
+        tokio::spawn(async move {
+            loop {
+                match self.tick().await {
+                    Ok(true) => continue,
+                    Ok(false) => tokio::time::sleep(Duration::from_millis(500)).await,
+                    Err(e) => {
+                        tracing::warn!("agent dispatcher: {e:#}");
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
+            }
+        });
+    }
+}
+
+enum Outcome {
+    Done(Value),
+    /// Waiting for a human (a plan under `human_engagement = plans`).
+    Waiting(String),
+    Failed(String, Value),
+}
+
+/// The kickoff chain for a new project (spec §14.2): the architect cleans up the philosophy
+/// (when it came from a transcript) and evaluates the requirements; then one planning agent per
+/// context. Later levels are enqueued by the planning agents themselves.
+pub async fn enqueue_kickoff(
+    store: &Store,
+    project: &str,
+    contexts: &[String],
+    raw_transcript: bool,
+    by: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let mut out = Vec::new();
+    let mut prev: Vec<String> = Vec::new();
+    let mk = |agent: &str, kind: &str, target: &str, deps: Vec<String>| NewWorkItem {
+        project: project.into(),
+        agent_type: agent.into(),
+        kind: kind.into(),
+        target: Some(target.into()),
+        priority: kodehub_store::queue::PRIORITY_NORMAL,
+        task: json!({"kickoff": true}),
+        depends_on: deps,
+        requested_by: Some(by.into()),
+        ..Default::default()
+    };
+    if raw_transcript {
+        let w = store
+            .enqueue(&mk(
+                "architect",
+                "cleanup_philosophy",
+                "philosophy/philosophy",
+                vec![],
+            ))
+            .await?;
+        prev = vec![w["_key"].as_str().unwrap_or_default().to_string()];
+        out.push(w);
+    }
+    let ev = store
+        .enqueue(&mk(
+            "architect",
+            "evaluate_requirements",
+            "philosophy/philosophy",
+            prev,
+        ))
+        .await?;
+    let ev_key = ev["_key"].as_str().unwrap_or_default().to_string();
+    out.push(ev);
+    for c in contexts {
+        out.push(
+            store
+                .enqueue(&mk("planning", "plan_context", c, vec![ev_key.clone()]))
+                .await?,
+        );
+    }
+    Ok(out)
 }

@@ -270,6 +270,25 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
             Some(json!({"state": "live"})),
         )
         .await;
+    // going live first passes an architect's contradiction check (spec §15.3)
+    assert_eq!(uc["state"], "checking");
+    let items = t.ok("GET", "/api/work-items", None).await;
+    assert!(items
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["agent_type"] == "architect" && w["kind"] == "check_use_case"));
+    let uc = t
+        .store
+        .use_case_verdict(
+            "a-user-signs-in",
+            true,
+            json!([]),
+            "no conflicts",
+            "architect",
+        )
+        .await
+        .unwrap();
     assert_eq!(uc["state"], "live");
     assert_eq!(
         t.ok("GET", "/api/use-cases", None)

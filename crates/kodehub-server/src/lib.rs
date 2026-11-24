@@ -32,6 +32,8 @@ pub struct AppState {
     pub origins: Arc<Vec<String>>,
     /// Per-launch secret given only to the UI; required on every human-only route (final #8).
     pub ui_token: Arc<String>,
+    /// Spawn the agent dispatcher when serving (tests drive it by hand).
+    pub dispatch: bool,
     /// One-time prod approvals issued to the UI: id → (release, issued).
     pub approvals:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
@@ -53,6 +55,7 @@ impl AppState {
                 uuid::Uuid::new_v4().simple()
             )),
             approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            dispatch: true,
         }
     }
 }
@@ -223,6 +226,19 @@ pub fn router(state: AppState) -> Router {
 
 /// Serve on an already-bound listener (used by main and tests).
 pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::io::Result<()> {
+    // agent work items are dispatched by this server (spec §4): ephemeral agent tasks, caps
+    // enforced by the claim; `KODEHUB_AGENT_DISPATCH=off` disables it
+    if let Some(engine) = state.engine.clone().filter(|_| state.dispatch) {
+        if std::env::var("KODEHUB_AGENT_DISPATCH").as_deref() != Ok("off") {
+            orchestrator::AgentDispatcher {
+                store: state.store.clone(),
+                engine,
+                owner: format!("agents-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]),
+                events: state.events.clone(),
+            }
+            .spawn();
+        }
+    }
     axum::serve(listener, router(state)).await
 }
 
@@ -257,25 +273,72 @@ pub fn install_agents(state: &mut AppState, server_url: &str, opts: kodehub_agen
 }
 
 impl AppState {
-    /// A requirement was edited by a human: open + plan a changeset in the background.
+    /// A requirement was edited by a human: queue the coding work (spec §4.4). The agent
+    /// dispatcher opens and drives the changeset.
     pub fn requirement_edited(&self, key: &str, by: &str) {
-        if let Some(e) = self.engine.clone() {
-            let (k, b, ev) = (key.to_string(), by.to_string(), self.events.clone());
-            kodehub_store::spawn_scoped(async move {
-                if let Err(err) = e.on_requirement_edited(&k, &b).await {
-                    ev.emit("agent.activity", serde_json::json!({"role": "orchestrator", "error": err.to_string(), "requirement": k}));
-                }
-            });
+        if self.engine.is_none() {
+            return;
         }
+        let Some(project) = kodehub_store::request_project().or_else(|| self.store.project_id())
+        else {
+            return;
+        };
+        let (store, k, b, ev) = (
+            self.store.clone(),
+            key.to_string(),
+            by.to_string(),
+            self.events.clone(),
+        );
+        kodehub_store::spawn_scoped(async move {
+            let w = store
+                .enqueue(&kodehub_store::queue::NewWorkItem {
+                    project,
+                    agent_type: "coding".into(),
+                    kind: "requirement_changed".into(),
+                    target: Some(format!("requirements/{k}")),
+                    priority: kodehub_store::queue::PRIORITY_HIGH,
+                    task: serde_json::json!({"requirement": k, "edited_by": b}),
+                    requested_by: Some(b.clone()),
+                    ..Default::default()
+                })
+                .await;
+            match w {
+                Ok(w) => ev.emit("work.queued", serde_json::json!({"key": w["_key"], "requirement": k})),
+                Err(err) => ev.emit("agent.activity", serde_json::json!({"role": "orchestrator", "error": err.to_string(), "requirement": k})),
+            }
+        });
     }
 
     /// Run (or resume) a changeset's workflow in the background.
     pub fn execute_changeset(&self, key: &str) {
         if let Some(e) = self.engine.clone() {
             let (k, ev) = (key.to_string(), self.events.clone());
+            let store = self.store.clone();
             kodehub_store::spawn_scoped(async move {
-                if let Err(err) = e.execute(&k).await {
-                    ev.emit("agent.activity", serde_json::json!({"role": "orchestrator", "error": err.to_string(), "changeset": k}));
+                match e.execute(&k).await {
+                    Err(err) => {
+                        ev.emit("agent.activity", serde_json::json!({"role": "orchestrator", "error": err.to_string(), "changeset": k}));
+                    }
+                    Ok(_) => {
+                        // a work item parked on this changeset (a human-approved plan) settles now
+                        if let Ok(cs) = store.get_changeset(&k).await {
+                            match cs["state"].as_str() {
+                                Some("merged") => {
+                                    let _ = store.settle_changeset_item(&k, true, "merged").await;
+                                }
+                                Some("rejected") | Some("escalated") => {
+                                    let _ = store
+                                        .settle_changeset_item(
+                                            &k,
+                                            false,
+                                            cs["state"].as_str().unwrap_or(""),
+                                        )
+                                        .await;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
             });
         }

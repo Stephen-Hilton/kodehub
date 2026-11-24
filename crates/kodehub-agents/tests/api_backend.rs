@@ -61,6 +61,8 @@ async fn api_backend_runs_tool_loop_with_correct_headers() {
         model: "claude-opus-5-5".into(),
         changeset: None,
         label: "t".into(),
+        api_token: None,
+        project: None,
     };
     let out = b.run(&task).await.unwrap();
     assert_eq!(out.json["verdict"], "approve");
@@ -107,6 +109,7 @@ fn claude_code_args_disable_builtin_tools_and_restrict_mcp() {
         server_url: "http://s".into(),
         workdir: "/tmp".into(),
         timeout: std::time::Duration::from_secs(1),
+        oauth_token: None,
     };
     let task = AgentTask {
         role: Role::Tester,
@@ -116,6 +119,8 @@ fn claude_code_args_disable_builtin_tools_and_restrict_mcp() {
         model: "m".into(),
         changeset: Some("cs-1".into()),
         label: "l".into(),
+        api_token: None,
+        project: None,
     };
     let a = b.args(&task);
     let pos = |f: &str| a.iter().position(|x| x == f).unwrap();

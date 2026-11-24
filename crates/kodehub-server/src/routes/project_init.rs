@@ -24,16 +24,20 @@ pub async fn initialize(
     by: &Principal,
     project: &str,
     philosophy: Option<&str>,
+    raw_transcript: Option<&str>,
     contexts: &[String],
 ) -> Result<Value, ApiError> {
     let store = s.store.clone();
     let by = by.id();
-    let philosophy = philosophy.map(str::to_string);
+    let raw = raw_transcript.map(str::to_string);
+    let philosophy = philosophy.map(str::to_string).or_else(|| raw.clone());
     let contexts = contexts.to_vec();
     kodehub_store::with_project(project.to_string(), async move {
         let mut made = Vec::new();
         if let Some(text) = philosophy.filter(|t| !t.trim().is_empty()) {
-            store.set_philosophy(&text, &by).await?;
+            store
+                .set_philosophy_with(&text, &by, None, raw.as_deref())
+                .await?;
         }
         for name in contexts {
             let name = name.trim();
@@ -48,11 +52,24 @@ pub async fn initialize(
             let doc = store
                 .insert_node(
                     "contexts",
-                    json!({"_key": kodehub_store::slug(name), "name": name, "description": desc,
-                           "lifecycle": "planned"}),
+                    json!({"_key": kodehub_store::slug(name), "title": name, "name": name,
+                           "description": desc, "lifecycle": "planned"}),
                 )
                 .await?;
-            made.push(doc["_id"].clone());
+            let id = doc["_id"].as_str().unwrap_or_default().to_string();
+            // contexts hang off the project root (the philosophy node)
+            if store.get_philosophy().await?.is_some() {
+                let k = kodehub_store::edge_key("contains", kodehub_store::c4::PHILOSOPHY_ID, &id);
+                store
+                    .db
+                    .insert_ignore(
+                        "contains",
+                        &json!({"_key": k, "_from": kodehub_store::c4::PHILOSOPHY_ID, "_to": id}),
+                        None,
+                    )
+                    .await?;
+            }
+            made.push(json!(id));
         }
         Ok::<_, ApiError>(json!({"contexts": made}))
     })

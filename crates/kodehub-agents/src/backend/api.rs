@@ -74,6 +74,12 @@ impl ApiBackend {
         if let Some(b) = b {
             req = req.json(&b);
         }
+        if let Some(t) = &task.api_token {
+            req = req.bearer_auth(t);
+        }
+        if let Some(p) = &task.project {
+            req = req.header("x-kodehub-project", p);
+        }
         match req.send().await {
             Ok(r) => {
                 let ok = r.status().is_success();
@@ -96,6 +102,7 @@ impl AgentBackend for ApiBackend {
         let tools = self.tools(task);
         let mut messages = vec![json!({"role": "user", "content": task.input})];
         let mut transcript = Vec::new();
+        let (mut tin, mut tout) = (0u64, 0u64);
         for _ in 0..self.max_iterations {
             let mut body = json!({
                 "model": task.model,
@@ -128,6 +135,8 @@ impl AgentBackend for ApiBackend {
                     v["error"]["message"].as_str().unwrap_or(&v.to_string())
                 )));
             }
+            tin += v["usage"]["input_tokens"].as_u64().unwrap_or(0);
+            tout += v["usage"]["output_tokens"].as_u64().unwrap_or(0);
             let stop = v["stop_reason"].as_str().unwrap_or("");
             if stop == "refusal" {
                 return Err(AgentError::Backend(format!(
@@ -172,6 +181,7 @@ impl AgentBackend for ApiBackend {
                 backend: "api".into(),
                 model: task.model.clone(),
                 duration_ms: start.elapsed().as_millis() as u64,
+                usage: json!({"input_tokens": tin, "output_tokens": tout}),
             });
         }
         Err(AgentError::Backend(

@@ -992,9 +992,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "blake3",
  "kodehub-core",
  "kodehub-render",
  "kodehub-runner",
+ "kodehub-storage",
  "kodehub-store",
  "reqwest",
  "serde",
@@ -1083,6 +1085,7 @@ name = "kodehub-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "blake3",
  "clap",
@@ -1157,6 +1160,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "kodehub-agents",
  "kodehub-core",
  "kodehub-runner",
  "kodehub-storage",

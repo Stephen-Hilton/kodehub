@@ -62,6 +62,14 @@ async fn coder_cannot_touch_tests_and_out_of_plan_changes_need_reapproval() {
         st.engine = Some(Arc::new(e.with_backend(b2)));
     })
     .await;
+    // re-approval of out-of-plan changes is part of the human-approves-plans flow
+    let pid = t.store.project_id().unwrap();
+    t.uok(
+        "PUT",
+        &format!("/api/scopes/project:{pid}/settings/human_engagement"),
+        Some(json!({"value": "plans"})),
+    )
+    .await;
     t.ok("POST", "/api/seed", Some(json!({"path": seed_path()})))
         .await;
     t.ok("POST", "/api/tests/run", None).await;

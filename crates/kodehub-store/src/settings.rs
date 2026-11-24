@@ -87,7 +87,8 @@ pub fn registry() -> Vec<SettingDef> {
             default: || json!("contexts"),
             per_actor: false,
             description: "What needs human approval: `contexts` (new contexts and requirement \
-                          changes), `containers` (also new containers), or `none`.",
+                          changes), `containers` (also new containers), `plans` (also every \
+                          changeset plan, the v0.05 flow), or `none`.",
         },
         SettingDef {
             key: "overlap_absorb_threshold",
@@ -152,6 +153,24 @@ pub fn registry() -> Vec<SettingDef> {
             default: || json!(90),
             per_actor: true,
             description: "Longest lifetime of a personal access token.",
+        },
+        SettingDef {
+            key: "kickoff",
+            default: || json!(true),
+            per_actor: false,
+            description: "Creating a project enqueues the kickoff chain (architect → planning → tests → code).",
+        },
+        SettingDef {
+            key: "use_case_check",
+            default: || json!(true),
+            per_actor: false,
+            description: "An architect agent checks a use case against the live ones before it goes live.",
+        },
+        SettingDef {
+            key: "agent_model",
+            default: || json!("claude-sonnet-5-5"),
+            per_actor: false,
+            description: "Model for agents (per-type overrides in agent types).",
         },
         SettingDef {
             key: "open_registration",
@@ -353,6 +372,33 @@ impl Store {
         Ok(())
     }
 
+    /// A setting written by the system itself (the sysadmin agent's caps), not by a person.
+    /// Human hard limits (`agent_caps_hard_limit`) are never written this way.
+    pub async fn set_setting_system(
+        &self,
+        scope: &str,
+        key: &str,
+        value: Value,
+        by: &str,
+    ) -> Result<()> {
+        parse_scope(scope)?;
+        if !matches!(key, "agent_caps") {
+            return Err(StoreError::Invalid(format!(
+                "`{key}` is not a system-managed setting"
+            )));
+        }
+        validate_value(key, &value)?;
+        self.db
+            .db_raw(
+                Method::POST,
+                &format!("/_api/document/{SETTINGS}?overwriteMode=replace"),
+                Some(&json!({"_key": setting_key(scope, key), "scope": scope, "key": key, "value": value,
+                             "set_by": by, "set_at": now_iso(), "system": true})),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Raw values stored at one scope.
     pub async fn scope_settings(&self, scope: &str) -> Result<BTreeMap<String, Value>> {
         parse_scope(scope)?;
@@ -380,7 +426,11 @@ fn validate_value(key: &str, v: &Value) -> Result<()> {
             Some(n) if n >= 0 => Ok(()),
             _ => bad("must be a non-negative integer"),
         },
-        "blind_review" | "parent_ready_requires_children" | "open_registration" => {
+        "blind_review"
+        | "parent_ready_requires_children"
+        | "open_registration"
+        | "kickoff"
+        | "use_case_check" => {
             if v.is_boolean() {
                 Ok(())
             } else {
@@ -396,8 +446,8 @@ fn validate_value(key: &str, v: &Value) -> Result<()> {
             _ => bad("must be a percentage"),
         },
         "human_engagement" => match v.as_str() {
-            Some("contexts" | "containers" | "none") => Ok(()),
-            _ => bad("must be contexts, containers or none"),
+            Some("contexts" | "containers" | "plans" | "none") => Ok(()),
+            _ => bad("must be contexts, containers, plans or none"),
         },
         "agent_backend" => match v.as_str() {
             Some("claude_code" | "api" | "recorded") => Ok(()),

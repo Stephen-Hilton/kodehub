@@ -70,7 +70,9 @@ images() {
   for t in core rust python; do
     DOCKER_BUILDKIT=1 docker build -q -f "$ROOT/deploy/images/test-$t.Dockerfile" -t "kodehub/test-$t:dev" "$ROOT/deploy/images" >/dev/null
   done
-  for img in kodehub/kodehub:dev kodehub/test-rust:dev kodehub/test-python:dev arangodb:3.12; do load_image "$img"; done
+  # the one small agent base image (spec §4.1)
+  DOCKER_BUILDKIT=1 docker build -q -f "$ROOT/deploy/images/agent.Dockerfile" -t kodehub/agent:dev "$ROOT/deploy/images" >/dev/null
+  for img in kodehub/kodehub:dev kodehub/test-rust:dev kodehub/test-python:dev kodehub/agent:dev arangodb:3.12; do load_image "$img"; done
 }
 
 images_browser() {
@@ -148,6 +150,24 @@ assert w["state"]=="done", w["state"]
 assert r.get("runtime")=="kubernetes", r
 assert r.get("tests")==9 and r.get("failed")==0, r
 print("in-cluster: %d tests passed in containers (%d bundles built)" % (r["passed"], r["bundles_built"]))'
+  # an agent task in its own container (recorded backend: no model credential needed)
+  curl -sf -X PUT "${H[@]}" -d '{"value":"recorded"}' "$api/api/scopes/project:$proj/settings/agent_backend" >/dev/null
+  curl -sf -X POST "${H[@]}" -d '{"agent_type":"planning","kind":"smoke","target":"philosophy/philosophy"}' $api/api/work-items >/dev/null
+  for _ in $(seq 1 120); do
+    item=$(curl -sf "${H[@]}" "$api/api/work-items" | python3 -c '
+import sys,json
+items=[w for w in json.load(sys.stdin) if w["kind"]=="smoke"]
+print(json.dumps(items[0]) if items else "")')
+    state=$(echo "$item" | python3 -c 'import sys,json;d=sys.stdin.read().strip();print(json.loads(d)["state"] if d else "")')
+    case "$state" in done|failed|blocked) break ;; esac
+    sleep 2
+  done
+  echo "$item" | python3 -c '
+import sys,json
+w=json.load(sys.stdin)
+assert w["state"]=="done", w
+assert (w.get("result") or {}).get("backend")=="recorded-in-container", w.get("result")
+print("in-cluster: an agent task ran in its own container")'
 }
 
 case "${1:-}" in

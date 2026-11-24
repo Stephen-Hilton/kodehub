@@ -434,6 +434,84 @@ impl Store {
         .await
     }
 
+    /// An external blocker (no credential, revoked key, missing permission): park the item
+    /// without counting an attempt; a human must act first (spec §4.5).
+    pub async fn block_work_item(&self, key: &str, owner: &str, reason: &str) -> Result<Value> {
+        self.owned(key, owner).await?;
+        self.revoke_work_item_tokens(key).await?;
+        self.g_patch(
+            WORK_ITEMS,
+            key,
+            &json!({"state": "blocked", "owner": null, "lease_expires": null, "blocked_reason": reason,
+                    "updated_at": now_iso()}),
+        )
+        .await
+    }
+
+    /// Put blocked items of a project back in the queue (after a human fixed the blocker).
+    pub async fn unblock_work_items(&self, project: &str) -> Result<u64> {
+        let rows = self
+            .g_aql(
+                "FOR w IN @@w FILTER w.project == @p AND w.state == 'blocked'
+                   UPDATE w WITH {state: 'queued', blocked_reason: null, updated_at: @now} IN @@w RETURN 1",
+                json!({"@w": WORK_ITEMS, "p": project, "now": now_iso()}),
+            )
+            .await?;
+        Ok(rows.len() as u64)
+    }
+
+    /// The work waits for a human (a plan to approve): release the claim, keep the link.
+    pub async fn park_work_item(&self, key: &str, owner: &str, changeset: &str) -> Result<Value> {
+        self.owned(key, owner).await?;
+        self.g_patch(
+            WORK_ITEMS,
+            key,
+            &json!({"state": "waiting_human", "owner": null, "lease_expires": null,
+                    "changeset": changeset, "updated_at": now_iso()}),
+        )
+        .await
+    }
+
+    /// Finish the work item linked to a changeset once the changeset ends (merged / rejected).
+    pub async fn settle_changeset_item(
+        &self,
+        changeset: &str,
+        merged: bool,
+        note: &str,
+    ) -> Result<Option<Value>> {
+        let rows = self
+            .g_aql(
+                "FOR w IN @@w FILTER w.changeset == @c AND w.state IN ['waiting_human', 'claimed'] RETURN w",
+                json!({"@w": WORK_ITEMS, "c": changeset}),
+            )
+            .await?;
+        let Some(w) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let key = w["_key"].as_str().unwrap_or_default().to_string();
+        let owner = format!("settle-{changeset}");
+        // take the item over, then finish it like any other
+        self.g_patch(
+            WORK_ITEMS,
+            &key,
+            &json!({"state": "claimed", "owner": owner, "lease_expires": lease_until(300)}),
+        )
+        .await?;
+        let out = if merged {
+            self.complete_work_item(
+                &key,
+                &owner,
+                json!({"changeset": changeset, "note": note}),
+                json!({"merged": true}),
+            )
+            .await?
+        } else {
+            self.fail_work_item(&key, &owner, note, json!({"changeset": changeset}))
+                .await?
+        };
+        Ok(Some(out))
+    }
+
     pub async fn cancel_work_item(&self, key: &str, by: &str) -> Result<Value> {
         let w = self.work_item(key).await?;
         if matches!(w["state"].as_str(), Some("done" | "cancelled" | "absorbed")) {

@@ -154,6 +154,9 @@ pub struct NewProject {
     pub share_org: Option<String>,
     #[serde(default)]
     pub philosophy: Option<String>,
+    /// A raw speech transcript of the philosophy (the architect cleans it up, spec §14.1).
+    #[serde(default)]
+    pub raw_transcript: Option<String>,
     #[serde(default)]
     pub contexts: Vec<String>,
 }
@@ -185,9 +188,42 @@ pub async fn create_project(
             .await?;
     }
     let mut out = created;
-    let init =
-        crate::routes::project_init::initialize(&s, &p, &id, b.philosophy.as_deref(), &b.contexts)
-            .await?;
+    let init = crate::routes::project_init::initialize(
+        &s,
+        &p,
+        &id,
+        b.philosophy.as_deref(),
+        b.raw_transcript.as_deref(),
+        &b.contexts,
+    )
+    .await?;
+    // the kickoff chain (spec §14.2): architect → planning agents → tests → code
+    let contexts: Vec<String> = init["contexts"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !contexts.is_empty()
+        && s.store
+            .setting(&id, "kickoff")
+            .await?
+            .as_bool()
+            .unwrap_or(true)
+    {
+        let chain = crate::orchestrator::enqueue_kickoff(
+            &s.store,
+            &id,
+            &contexts,
+            b.raw_transcript.is_some(),
+            &p.id(),
+        )
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        out["kickoff"] = json!(chain.iter().map(|w| w["_key"].clone()).collect::<Vec<_>>());
+    }
     out["initialized"] = init;
     s.store.set_default_project(&p.user, &id).await?;
     Ok(Json(out))

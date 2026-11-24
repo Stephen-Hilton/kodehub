@@ -103,9 +103,48 @@ impl Engine {
         if let Some(b) = &self.backend_override {
             return Ok(b.clone());
         }
+        // inside the cluster every agent task runs in its own container (spec §4.1)
+        let containers = std::env::var("KODEHUB_RUNTIME").as_deref() == Ok("kubernetes")
+            || std::env::var("KODEHUB_AGENT_CONTAINERS").as_deref() == Ok("always");
+        if containers {
+            return self.container_backend().await;
+        }
         let cfg = self.config.read().await.clone();
-        match cfg.agents.backend.as_str() {
-            "api" => Ok(Arc::new(ApiBackend::from_env(&self.server_url)?)),
+        // the project's `agent_backend` setting wins when someone set it (spec §12.1)
+        let project = kodehub_store::request_project();
+        let mut choice = cfg.agents.backend.clone();
+        if let Some(p) = &project {
+            if let Ok(r) = self.store.resolve_settings(p, None).await {
+                if let Some(v) = r.get("agent_backend").filter(|v| v["source"] != "default") {
+                    if let Some(b) = v["value"].as_str() {
+                        choice = b.to_string();
+                    }
+                }
+            }
+        }
+        match choice.as_str() {
+            "api" => {
+                // only an API key ever reaches the Messages API (never a subscription token)
+                let stored = match &project {
+                    Some(p) => self.store.resolve_model_credential(p, None, "api").await?,
+                    None => None,
+                };
+                match stored {
+                    Some(k) => Ok(Arc::new(ApiBackend::new(
+                        k.expose(),
+                        &self.server_url,
+                        "https://api.anthropic.com",
+                    )?)),
+                    None => ApiBackend::from_env(&self.server_url)
+                        .map(|b| Arc::new(b) as Arc<dyn AgentBackend>)
+                        .map_err(|_| {
+                            AgentError::Blocked(
+                                "no Anthropic API key is configured for this project (set one in Settings → Credentials)"
+                                    .into(),
+                            )
+                        }),
+                }
+            }
             "recorded" => {
                 let path = cfg
                     .agents
@@ -126,14 +165,38 @@ impl Engine {
                 *g = Some((key, b.clone()));
                 Ok(b)
             }
-            _ => Ok(Arc::new(ClaudeCodeBackend {
-                wrapper: self.wrapper.clone(),
-                token_env: cfg.agents.token_env.clone(),
-                kodehub_bin: self.kodehub_bin.clone(),
-                server_url: self.server_url.clone(),
-                workdir: self.runner.home.join("agents"),
-                timeout: Duration::from_secs(cfg.agents.timeout_secs),
-            })),
+            _ => {
+                // a stored subscription token (personal, user-owned projects only), else the
+                // developer's own CLI login on a laptop
+                let oauth = match &project {
+                    Some(p) => self
+                        .store
+                        .resolve_model_credential(p, None, "claude_code")
+                        .await?
+                        .map(|s| s.expose().to_string()),
+                    None => None,
+                };
+                if oauth.is_none()
+                    && std::env::var("KODEHUB_RUNTIME").as_deref() == Ok("kubernetes")
+                {
+                    return Err(AgentError::Blocked(
+                        "no Claude subscription token is configured for this project's owner, and a cluster has no CLI login (set one in Settings → Credentials, or use an API key)".into(),
+                    ));
+                }
+                Ok(Arc::new(ClaudeCodeBackend {
+                    wrapper: self.wrapper.clone(),
+                    token_env: if oauth.is_some() {
+                        String::new()
+                    } else {
+                        cfg.agents.token_env.clone()
+                    },
+                    kodehub_bin: self.kodehub_bin.clone(),
+                    server_url: self.server_url.clone(),
+                    workdir: self.runner.home.join("agents"),
+                    timeout: Duration::from_secs(cfg.agents.timeout_secs),
+                    oauth_token: oauth,
+                }))
+            }
         }
     }
 
@@ -191,14 +254,10 @@ impl Engine {
             model,
             changeset: cs.map(String::from),
             label: label.into(),
+            api_token: None,
+            project: None,
         };
-        self.set_status(role, "working", label, cs);
-        let backend = self.backend().await;
-        let res = match backend {
-            Ok(b) => b.run(&task).await,
-            Err(e) => Err(e),
-        };
-        self.set_status(role, "idle", label, cs);
+        let res = self.run_task(task.clone(), role.as_str()).await;
         if let Some(cs) = cs {
             let entry = match &res {
                 Ok(o) => {
@@ -315,7 +374,20 @@ impl Engine {
             &format!("Plan ready: {}", plan["summary"].as_str().unwrap_or("")),
         )
         .await;
-        if self.opts.auto_approve {
+        // humans approve plans only under `human_engagement = plans` (spec §2: agents do all
+        // coding; humans approve requirement changes, new contexts and prod)
+        let engagement = match kodehub_store::request_project().or_else(|| self.store.project_id())
+        {
+            Some(p) => self
+                .store
+                .setting(&p, "human_engagement")
+                .await
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "contexts".into()),
+            None => "contexts".into(),
+        };
+        if self.opts.auto_approve || engagement != "plans" {
             self.store
                 .transition(
                     cs_key,
@@ -327,6 +399,156 @@ impl Engine {
             Box::pin(self.execute(cs_key)).await?;
         }
         Ok(v)
+    }
+
+    /// The backend inside agent containers: the same choice and credential rules, the
+    /// credential handed to the container for one task only.
+    async fn container_backend(&self) -> Result<Arc<dyn AgentBackend>> {
+        let cfg = self.config.read().await.clone();
+        let project = kodehub_store::request_project();
+        let mut choice = cfg.agents.backend.clone();
+        if let Some(p) = &project {
+            if let Ok(r) = self.store.resolve_settings(p, None).await {
+                if let Some(v) = r.get("agent_backend").filter(|v| v["source"] != "default") {
+                    if let Some(b) = v["value"].as_str() {
+                        choice = b.to_string();
+                    }
+                }
+            }
+        }
+        let credential = match (choice.as_str(), &project) {
+            ("api", Some(p)) => match self.store.resolve_model_credential(p, None, "api").await? {
+                Some(k) => Some(("KODEHUB_ANTHROPIC_API_KEY".to_string(), k.expose().to_string())),
+                None => {
+                    return Err(AgentError::Blocked(
+                        "no Anthropic API key is configured for this project (set one in Settings → Credentials)".into(),
+                    ))
+                }
+            },
+            ("claude_code", Some(p)) => {
+                match self.store.resolve_model_credential(p, None, "claude_code").await? {
+                    Some(t) => Some(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), t.expose().to_string())),
+                    None => {
+                        return Err(AgentError::Blocked(
+                            "no Claude subscription token is configured for this project's owner (subscription tokens are personal; organizations use API keys)".into(),
+                        ))
+                    }
+                }
+            }
+            _ => None,
+        };
+        let storage = kodehub_storage::StorageClient::from_env_or_local(&self.runner.home);
+        Ok(Arc::new(crate::backend::container::ContainerBackend {
+            inner: choice,
+            jobs: kodehub_runner::jobs::JobRuntime::from_env(),
+            storage,
+            credential,
+            server_url: std::env::var("KODEHUB_INTERNAL_URL")
+                .unwrap_or_else(|_| self.server_url.clone()),
+            timeout: Duration::from_secs(cfg.agents.timeout_secs.max(120)),
+        }))
+    }
+
+    /// Run one agent task: a fresh session on the project's backend, with a short-lived,
+    /// read-only Kodehub token for its graph tools, metered per project (spec §12.2).
+    pub async fn run_task(&self, mut task: AgentTask, agent_type: &str) -> Result<AgentOutput> {
+        let project = kodehub_store::request_project();
+        let work_item = crate::current_work_item();
+        if let Some(p) = &project {
+            let bind = work_item
+                .clone()
+                .or_else(|| task.changeset.clone())
+                .unwrap_or_else(|| "adhoc".into());
+            task.api_token = Some(
+                self.store
+                    .issue_internal_token(
+                        agent_type,
+                        p,
+                        &bind,
+                        kodehub_store::Permission::Read,
+                        1800,
+                    )
+                    .await?,
+            );
+            task.project = Some(p.clone());
+        }
+        let cs = task.changeset.clone();
+        self.set_status(task.role, "working", &task.label, cs.as_deref());
+        let res = match self.backend().await {
+            Ok(b) => b.run(&task).await,
+            Err(e) => Err(e),
+        };
+        self.set_status(task.role, "idle", &task.label, cs.as_deref());
+        if let (Some(p), Ok(o)) = (&project, &res) {
+            let _ = self
+                .store
+                .record_usage(
+                    p,
+                    work_item.as_deref(),
+                    agent_type,
+                    &o.model,
+                    o.usage["input_tokens"].as_u64().unwrap_or(0),
+                    o.usage["output_tokens"].as_u64().unwrap_or(0),
+                )
+                .await;
+        }
+        res
+    }
+
+    /// A non-coding role (planning, architect, test author, design, sysadmin, import, custom)
+    /// for one work item: build its input from the graph, run it, return the change log and
+    /// actions.
+    pub async fn run_role(&self, agent_type: &str, w: &Value) -> Result<AgentOutput> {
+        let doc = crate::roles::agent_type(&self.store, agent_type).await?;
+        let target = w["target"]
+            .as_str()
+            .unwrap_or("philosophy/philosophy")
+            .to_string();
+        let ctx = self
+            .store
+            .requirements_for(&target)
+            .await
+            .unwrap_or_else(|_| json!({"requirements": [], "chain": []}));
+        let node = if target.contains('/') {
+            self.store.get_node(&target).await.unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        let children = self
+            .store
+            .aql(
+                "FOR v IN 1..1 OUTBOUND @n @@contains RETURN {id: v._id, name: v.title || v.name || v.display_name, lifecycle: v.lifecycle}",
+                json!({"n": target}),
+            )
+            .await
+            .unwrap_or_default();
+        let input = format!(
+            "## Philosophy (tiebreaker)\n{}\n\n## Work item\n- type: {agent_type}\n- kind: {}\n- target: {target}\n- task: {}\n- failing tests: {}\n\n## History of earlier attempts\n{}\n\n## Target node\n{}\n\n## Its children\n{}\n\n## Merged requirements (own and inherited, nearest first)\n{}\n\n## Answer\nReturn JSON with `change_log` and `actions` only.",
+            ctx["philosophy"].as_str().unwrap_or("(none)"),
+            w["kind"].as_str().unwrap_or(""),
+            w["task"],
+            w["failing_tests"],
+            serde_json::to_string_pretty(&w["history"]).unwrap_or_default(),
+            serde_json::to_string_pretty(&node).unwrap_or_default(),
+            serde_json::to_string_pretty(&children).unwrap_or_default(),
+            serde_json::to_string_pretty(&ctx["requirements"]).unwrap_or_default(),
+        );
+        let model = doc["model"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| "claude-sonnet-5-5".to_string());
+        let task = AgentTask {
+            role: crate::roles::tool_role(&doc),
+            system: crate::roles::system_for(&doc),
+            input,
+            schema: crate::roles::actions_schema(),
+            model,
+            changeset: None,
+            label: format!("{agent_type}: {}", w["kind"].as_str().unwrap_or("")),
+            api_token: None,
+            project: None,
+        };
+        self.run_task(task, agent_type).await
     }
 
     async fn decisions_md(&self, symbols: &BTreeSet<String>) -> Result<String> {

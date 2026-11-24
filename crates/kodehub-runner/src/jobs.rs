@@ -27,9 +27,13 @@ pub struct JobSpec {
     pub input_key: String,
     pub output_key: String,
     pub timeout: Duration,
-    /// Extra environment (e.g. a Git credential, passed for this job only).
+    /// Extra environment for this job.
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Secret environment (a model or Git credential): in Kubernetes a Secret that exists only
+    /// while the job runs; never logged, never written to the graph (spec §12.1).
+    #[serde(default, skip_serializing)]
+    pub secret_env: Vec<(String, String)>,
     /// Name hint (work item key).
     pub name: String,
 }
@@ -115,7 +119,11 @@ async fn run_local(
         .arg("--output")
         .arg(&spec.output_key)
         .kill_on_drop(true);
-    for (k, v) in env.iter().chain(spec.env.iter()) {
+    for (k, v) in env
+        .iter()
+        .chain(spec.env.iter())
+        .chain(spec.secret_env.iter())
+    {
         c.env(k, v);
     }
     let out = tokio::time::timeout(spec.timeout, c.output())
@@ -153,6 +161,8 @@ pub struct Kubernetes {
     pub build_image: String,
     /// Test image per container type.
     pub test_image_prefix: String,
+    /// The tiny agent base image (spec §4.1).
+    pub agent_image: String,
 }
 
 const SA: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
@@ -182,12 +192,15 @@ impl Kubernetes {
                 .unwrap_or_else(|_| "kodehub/kodehub:dev".into()),
             test_image_prefix: std::env::var("KODEHUB_TEST_IMAGE_PREFIX")
                 .unwrap_or_else(|_| "kodehub/test-".into()),
+            agent_image: std::env::var("KODEHUB_AGENT_IMAGE")
+                .unwrap_or_else(|_| "kodehub/agent:dev".into()),
         })
     }
 
     fn image_for(&self, spec: &JobSpec) -> String {
         match (spec.kind.as_str(), spec.container_type.as_deref()) {
             ("test", Some(t)) => format!("{}{t}:dev", self.test_image_prefix),
+            ("agent", _) => self.agent_image.clone(),
             _ => self.build_image.clone(),
         }
     }
@@ -215,6 +228,10 @@ impl Kubernetes {
     }
 
     pub fn job_manifest(&self, name: &str, spec: &JobSpec) -> Value {
+        self.job_manifest_with_secret(name, spec, None)
+    }
+
+    fn job_manifest_with_secret(&self, name: &str, spec: &JobSpec, secret: Option<&str>) -> Value {
         let mut env = vec![
             json!({"name": "KODEHUB_STORAGE_URL", "value": std::env::var("KODEHUB_STORAGE_URL").unwrap_or_else(|_| "http://storage:9000".into())}),
             json!({"name": "KODEHUB_STORAGE_TOKEN", "valueFrom": {"secretKeyRef": {"name": "kodehub-secrets", "key": "storage-token"}}}),
@@ -224,6 +241,13 @@ impl Kubernetes {
         ];
         for (k, v) in &spec.env {
             env.push(json!({"name": k, "value": v}));
+        }
+        if let Some(sec) = secret {
+            for (k, _) in &spec.secret_env {
+                env.push(
+                    json!({"name": k, "valueFrom": {"secretKeyRef": {"name": sec, "key": k}}}),
+                );
+            }
         }
         json!({
             "apiVersion": "batch/v1", "kind": "Job",
@@ -269,12 +293,46 @@ impl Kubernetes {
             &uuid_hex()[..6]
         );
         let ns = &self.namespace;
-        self.call(
-            reqwest::Method::POST,
-            &format!("/apis/batch/v1/namespaces/{ns}/jobs"),
-            Some(&self.job_manifest(&name, spec)),
-        )
-        .await?;
+        // credentials live in a Secret only while the job runs
+        let secret = if spec.secret_env.is_empty() {
+            None
+        } else {
+            let sname = format!("{name}-cred");
+            let data: serde_json::Map<String, Value> = spec
+                .secret_env
+                .iter()
+                .map(|(k, v)| (k.clone(), json!(v)))
+                .collect();
+            self.call(
+                reqwest::Method::POST,
+                &format!("/api/v1/namespaces/{ns}/secrets"),
+                Some(
+                    &json!({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": sname},
+                             "type": "Opaque", "stringData": data}),
+                ),
+            )
+            .await?;
+            Some(sname)
+        };
+        let created = self
+            .call(
+                reqwest::Method::POST,
+                &format!("/apis/batch/v1/namespaces/{ns}/jobs"),
+                Some(&self.job_manifest_with_secret(&name, spec, secret.as_deref())),
+            )
+            .await;
+        if let Err(e) = created {
+            if let Some(sn) = &secret {
+                let _ = self
+                    .call(
+                        reqwest::Method::DELETE,
+                        &format!("/api/v1/namespaces/{ns}/secrets/{sn}"),
+                        None,
+                    )
+                    .await;
+            }
+            return Err(e);
+        }
         let deadline = Instant::now() + spec.timeout + Duration::from_secs(60);
         let ok = loop {
             let j = self
@@ -323,6 +381,15 @@ impl Kubernetes {
                 None,
             )
             .await;
+        if let Some(sn) = &secret {
+            let _ = self
+                .call(
+                    reqwest::Method::DELETE,
+                    &format!("/api/v1/namespaces/{ns}/secrets/{sn}"),
+                    None,
+                )
+                .await;
+        }
         Ok(JobOutcome {
             ok,
             exit_code: if ok { Some(0) } else { None },

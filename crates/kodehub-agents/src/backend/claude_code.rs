@@ -20,6 +20,9 @@ pub struct ClaudeCodeBackend {
     pub server_url: String,
     pub workdir: PathBuf,
     pub timeout: Duration,
+    /// A stored subscription token (spec §12.1), handed to this one `claude` process only as
+    /// `CLAUDE_CODE_OAUTH_TOKEN`. `None` = the developer's own CLI login (laptop).
+    pub oauth_token: Option<String>,
 }
 
 pub const WRAPPER_SCRIPT: &str = include_str!("../../../../scripts/claude-as.sh");
@@ -104,10 +107,21 @@ impl AgentBackend for ClaudeCodeBackend {
             .args(self.args(task))
             .current_dir(&self.workdir)
             .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        if let Some(t) = &self.oauth_token {
+            cmd.env("CLAUDE_CODE_OAUTH_TOKEN", t);
+        }
+        // the graph tools (kodehub mcp) authenticate with a short-lived, project-scoped token
+        if let Some(t) = &task.api_token {
+            cmd.env("KODEHUB_TOKEN", t);
+        }
+        if let Some(p) = &task.project {
+            cmd.env("KODEHUB_PROJECT", p);
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| AgentError::Backend(format!("cannot start claude: {e}")))?;
@@ -204,6 +218,8 @@ impl AgentBackend for ClaudeCodeBackend {
             backend: "claude_code".into(),
             model: task.model.clone(),
             duration_ms: start.elapsed().as_millis() as u64,
+            usage: json!({"input_tokens": res["usage"]["input_tokens"], "output_tokens": res["usage"]["output_tokens"],
+                          "cost_usd": res["total_cost_usd"]}),
         })
     }
 }

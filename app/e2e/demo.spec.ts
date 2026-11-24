@@ -18,6 +18,9 @@ test.describe.configure({ mode: "serial" });
 test("doc 08 demo, entirely in the desktop UI", async ({ page, request }) => {
   // 0. seed the project (setup, as a fresh install would ship it)
   const headers = await signIn(page, request);
+  // the doc 08 demo keeps a human approval of each plan (v0.1 default: agents proceed)
+  const projects = await (await request.get("/api/projects", { headers })).json();
+  await request.put(`/api/scopes/project:${projects[0].id}/settings/human_engagement`, { headers, data: { value: "plans" } });
   const seeded = await request.post("/api/seed", { headers, data: { path: path.join(repo, "examples/auth-poc") } });
   expect(seeded.ok()).toBeTruthy();
 

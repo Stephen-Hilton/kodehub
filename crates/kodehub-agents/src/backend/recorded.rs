@@ -85,6 +85,7 @@ impl AgentBackend for RecordedBackend {
             backend: "recorded".into(),
             model: format!("recorded:{}", self.scenario),
             duration_ms: 0,
+            usage: json!({"input_tokens": 0, "output_tokens": 0}),
         })
     }
 }

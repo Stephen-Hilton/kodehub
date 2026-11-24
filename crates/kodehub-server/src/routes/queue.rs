@@ -203,3 +203,123 @@ pub async fn spend(
 ) -> ApiResult<Value> {
     Ok(Json(s.store.project_spend(&p.id).await?))
 }
+
+// ---------------------------------------------------------------------- approvals & notifications
+
+#[derive(Deserialize, Default)]
+pub struct StateQ {
+    pub state: Option<String>,
+}
+
+pub async fn approvals(State(s): State<AppState>, Query(q): Query<StateQ>) -> ApiResult<Value> {
+    Ok(Json(json!(
+        s.store.list_approvals(q.state.as_deref()).await?
+    )))
+}
+
+#[derive(Deserialize)]
+pub struct Decide {
+    pub approve: bool,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// Requirement changes and new contexts are a human's call (spec §4.5, §7.3).
+pub async fn decide(
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Extension(who): Extension<Principal>,
+    Path(k): Path<String>,
+    Json(b): Json<Decide>,
+) -> ApiResult<Value> {
+    crate::require_ui(&s, &headers)?;
+    let v = s
+        .store
+        .decide_approval(&k, b.approve, &who.id(), &b.note)
+        .await?;
+    s.events
+        .emit("approval.decided", json!({"key": k, "approve": b.approve}));
+    Ok(Json(v))
+}
+
+#[derive(Deserialize, Default)]
+pub struct NotifQ {
+    #[serde(default)]
+    pub unread: bool,
+}
+
+pub async fn notifications(
+    State(s): State<AppState>,
+    Extension(p): Extension<ProjectCtx>,
+    Query(q): Query<NotifQ>,
+) -> ApiResult<Value> {
+    Ok(Json(json!(
+        s.store.notifications(Some(&p.id), q.unread).await?
+    )))
+}
+
+pub async fn read_notification(
+    State(s): State<AppState>,
+    Path(k): Path<String>,
+) -> ApiResult<Value> {
+    s.store.mark_notification_read(&k).await?;
+    Ok(Json(json!({"read": k})))
+}
+
+/// After a human cleared an external blocker (e.g. added a credential), requeue blocked work.
+pub async fn unblock(
+    State(s): State<AppState>,
+    Extension(p): Extension<ProjectCtx>,
+) -> ApiResult<Value> {
+    Ok(Json(
+        json!({"requeued": s.store.unblock_work_items(&p.id).await?}),
+    ))
+}
+
+// ---------------------------------------------------------------------- agent types
+
+pub async fn agent_types(State(s): State<AppState>) -> ApiResult<Value> {
+    kodehub_agents::roles::ensure_agent_types(&s.store)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(json!(
+        s.store
+            .aql("FOR t IN @@agent_types SORT t._key RETURN t", json!({}))
+            .await?
+    )))
+}
+
+#[derive(Deserialize)]
+pub struct CustomAgent {
+    pub instructions: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// A custom agent type (spec §4.1), e.g. a policy agent: the same base agent with a role
+/// definition stored in the graph.
+pub async fn put_agent_type(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(b): Json<CustomAgent>,
+) -> ApiResult<Value> {
+    let slug = kodehub_store::slug(name.trim_start_matches("custom:"));
+    if slug.is_empty() || b.instructions.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "a custom agent needs a name and instructions",
+        ));
+    }
+    let key = format!("custom-{slug}");
+    s.store
+        .db
+        .upsert(
+            "agent_types",
+            &json!({"_key": key, "builtin": false, "prompt": "custom", "tool_role": "orchestrator",
+                    "instructions": b.instructions, "description": b.description, "model": b.model}),
+            None,
+        )
+        .await?;
+    Ok(Json(s.store.db.get("agent_types", &key, None).await?))
+}

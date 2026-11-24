@@ -37,6 +37,10 @@ async fn main() -> anyhow::Result<()> {
             let input = kodehub_worker::read_json(&s, &a.input).await?;
             kodehub_worker::test(&s, &runner, &input).await
         }
+        "agent" => {
+            let input: serde_json::Value = kodehub_worker::read_json(&s, &a.input).await?;
+            kodehub_worker::agent(&runner, &input).await
+        }
         "git-import" => {
             let input = kodehub_worker::read_json(&s, &a.input).await?;
             kodehub_worker::git::import(&input).await
