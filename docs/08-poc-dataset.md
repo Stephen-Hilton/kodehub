@@ -1,5 +1,8 @@
 # 08 — Proof-of-concept dataset and demo
 
+> **v0.05 design document.** Superseded wherever it conflicts with
+> `docs/Kodehub v0.1 Requirements Layered Spec for Claude Code.md` (see D-041).
+
 Seed lives in `examples/auth-poc/` as YAML files (one per collection, plus `edges.yaml`). Write
 the actual code bodies yourself; keep them small and idiomatic.
 

@@ -4,6 +4,52 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-042 Releases select versions; patch releases; clone downward only
+- **Context:** The author wants several releases per environment, fixes for bugs found after DEV
+  without restarting from DEV, cloning, and releases that pick code by rule. Editing a release
+  after it is cut would break hard rule 4.
+- **Decision:**
+  - There is no separate "live line" that changes land on. Every change is a new numbered version
+    node. Version state on its node is candidate / **stable** / retired (renamed from "live" so it
+    is not confused with environments or the node lifecycle "live"). Release membership is only the
+    release's `supports` edges.
+  - A release picks versions by a recorded selection rule: newest, stable, as of a timestamp (read
+    from the SCD intervals), or explicit, with per-node pins. Open while in DEV, cut (immutable)
+    when first promoted out of DEV.
+  - Clone into the same or a lower environment only (DEV < TEST < QA < PRE-PROD < PROD).
+  - A bug found after DEV: a normal changeset makes and tests the fix; the orchestrator makes a
+    patch release (`r456` → `r456.1`, cloned at the same environment, with one `supports` edge
+    swapped) and runs only that environment's gate. The original is retired and unchanged. This is
+    also the PROD hotfix path.
+  - `max_releases` per environment: unlimited for DEV/TEST/QA, 1 for PRE-PROD/PROD.
+- **Consequence:** Hard rules 1, 4 and 5 reworded. Changesets name the open releases they join.
+  Spec 5.2, 5.8, 14.4 and 16 updated.
+
+## D-041 v0.1 spec adopted; review answers folded into it
+- **Context:** The v0.1 layered spec replaces the v0.05 pilot rules in several places (multi-user
+  auth, Kubernetes, stored credentials, per-node versions). A review raised conflicts and gaps;
+  the author answered them on 2026-11-23.
+- **Decision:** The v0.1 spec governs; `CLAUDE.md` was rewritten to match and docs 00–08 carry a
+  "superseded where it conflicts" banner. Folded into the spec:
+  - Versions at every C4 level use type 2 SCD edges (`validFrom`/`validTo`); artifacts are separate
+    nodes keyed by `closure_hash` (spec 5.2).
+  - Changesets group candidates and promote all-or-nothing (5.8). Blind review stays as a review
+    agent behind the `blind_review` project setting, on by default (5.6).
+  - Test container types are per-project graph nodes built as layers on one core image (5.4.1).
+  - Git import = deterministic parse container + import agent that proposes the C4 mapping (13.1).
+  - Releases are immutable sets of `supports` edges to versions; a release is in one environment
+    at a time; no release branches (16).
+  - Org projects fall through to app defaults, not contributing users; per-actor settings come
+    from the acting user (11.2). Subscription tokens: user level on user-owned projects only.
+  - Overlap = Jaccard, absorb ≥ 0.6, 3 negotiation rounds. Daily full run is outside the test
+    budget. Speech: audio upload + local Whisper container. Auth: local accounts + sessions + PATs
+    first, MCP OAuth last.
+  - The architect agent only makes higher-level decisions; the test author agent reviews test
+    quality.
+  - No v0.05 data migration; the seed project is re-created.
+- **Consequence:** `make check` will require a Kind cluster from rollout step 3. Docs 01–08 stay as
+  background until the audit (`docs/09-v0.1-audit-and-plan.md`) rewrites what is still needed.
+
 ## D-040 Project renamed from "Lattice" to "Kodehub"
 - **Context:** The project and its root folder were renamed.
 - **Decision:** Every identifier, crate (`kodehub-*`), env var (`KODEHUB_*`), MCP server name,

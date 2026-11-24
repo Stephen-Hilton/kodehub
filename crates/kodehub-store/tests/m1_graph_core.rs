@@ -48,7 +48,7 @@ async fn changing_one_body_creates_one_version_and_flips_edges() {
     let before_versions = count(&s, "versions").await;
     let old = s
         .aql(
-            "FOR e IN @@current_version FILTER e._to == 'symbols/verify_credentials' RETURN e._from",
+            "FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/verify_credentials') RETURN e._from",
             json!({}),
         )
         .await
@@ -67,7 +67,7 @@ async fn changing_one_body_creates_one_version_and_flips_edges() {
     assert_eq!(count(&s, "versions").await, before_versions + 1);
     let cur = s
         .aql(
-            "FOR e IN @@current_version FILTER e._to == 'symbols/verify_credentials' RETURN e._from",
+            "FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/verify_credentials') RETURN e._from",
             json!({}),
         )
         .await
@@ -75,7 +75,7 @@ async fn changing_one_body_creates_one_version_and_flips_edges() {
     assert_eq!(cur, vec![json!(format!("versions/{}", out.version))]);
     let prev = s
         .aql(
-            "FOR e IN @@previous_version FILTER e._to == 'symbols/verify_credentials' RETURN e",
+            "FOR e IN @@previous_version FILTER e._to == CONCAT(@pfx, 'symbols/verify_credentials') RETURN e",
             json!({}),
         )
         .await
@@ -122,7 +122,7 @@ async fn changing_a_dependency_changes_exactly_the_dependents_closure_hashes() {
     assert!(expected.contains("test_unknown_user_is_invalid"));
     assert!(!expected.contains("verify_credentials"));
 
-    let doc = s.aql("FOR e IN @@current_version FILTER e._to == 'symbols/hash_password' RETURN DOCUMENT(e._from)", json!({})).await.unwrap();
+    let doc = s.aql("FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/hash_password') RETURN DOCUMENT(e._from)", json!({})).await.unwrap();
     let mut content = version_content_from_doc(&doc[0]).unwrap();
     content.body.push_str("\n// changed");
     s.write_version("hash_password", &content, "test")
@@ -142,7 +142,7 @@ async fn changing_a_dependency_changes_exactly_the_dependents_closure_hashes() {
 #[tokio::test]
 async fn a_second_current_version_edge_is_rejected() {
     let s = seeded("invariant").await;
-    let v = s.aql("FOR e IN @@current_version FILTER e._to == 'symbols/hash_password' RETURN PARSE_IDENTIFIER(e._from).key", json!({})).await.unwrap();
+    let v = s.aql("FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/hash_password') RETURN PARSE_IDENTIFIER(e._from).key", json!({})).await.unwrap();
     // even pointing the *same* version at it again is refused
     let err = s
         .force_add_current_version(v[0].as_str().unwrap(), "hash_password")

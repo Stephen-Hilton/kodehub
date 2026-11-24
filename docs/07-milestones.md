@@ -1,5 +1,8 @@
 # 07 — Milestones and acceptance criteria
 
+> **v0.05 design document.** Superseded wherever it conflicts with
+> `docs/Kodehub v0.1 Requirements Layered Spec for Claude Code.md` (see D-041).
+
 Build in order. Each milestone is done only when every criterion passes and `make check` is green.
 Write automated tests for each criterion where possible.
 

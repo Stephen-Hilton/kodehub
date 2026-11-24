@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::{Result, Store};
 
 /// Edges along which "beneath" / reachability is computed.
-pub const REACH_EDGES: &str = "contains, calls, depends_on, member_of";
+pub const REACH_EDGES: &str = "@@contains, @@calls, @@depends_on, @@member_of";
 
 /// Test result lookup at the test symbol's *current* closure hash.
 const TEST_STATUS_FN: &str = "
@@ -257,7 +257,7 @@ impl Store {
         self.db.aql(
             &format!(
                 "LET starts = UNIQUE(APPEND((FOR e IN @@satisfies RETURN e._from), (FOR e IN @@verifies RETURN e._from)))
-                 LET reached = UNIQUE(FOR s IN starts FOR v IN 0..30 OUTBOUND s {REACH_EDGES}, tested_by, binds_to
+                 LET reached = UNIQUE(FOR s IN starts FOR v IN 0..30 OUTBOUND s {REACH_EDGES}, @@tested_by, @@binds_to
                                         OPTIONS {{uniqueVertices: 'global', order: 'bfs'}} RETURN v._id)
                  FOR s IN @@symbols FILTER s._id NOT IN reached SORT s.display_name
                  RETURN {{id: s._id, key: s._key, display_name: s.display_name, kind: s.kind, language: s.language}}"
@@ -371,7 +371,7 @@ impl Store {
     pub async fn node_health(&self) -> Result<BTreeMap<String, Value>> {
         let q = format!(
             "LET starts = UNIQUE(APPEND((FOR e IN @@satisfies RETURN e._from), (FOR e IN @@verifies RETURN e._from)))
-             LET reached = UNIQUE(FOR s IN starts FOR v IN 0..30 OUTBOUND s {REACH_EDGES}, tested_by, binds_to
+             LET reached = UNIQUE(FOR s IN starts FOR v IN 0..30 OUTBOUND s {REACH_EDGES}, @@tested_by, @@binds_to
                                     OPTIONS {{uniqueVertices: 'global', order: 'bfs'}} RETURN v._id)
              LET risky_roots = UNIQUE(FOR r IN @@requirements FILTER r.at_risk == true
                                       FOR e IN @@satisfies FILTER e._to == r._id RETURN e._from)

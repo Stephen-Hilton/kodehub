@@ -129,7 +129,7 @@ async fn python_login_calls_rust_through_generated_extension() {
     assert_eq!(before["symbols/py-login"]["health"], "pass");
 
     // changing the Rust signature marks the Python wrapper (and R1) at risk
-    let doc = s.aql("FOR e IN @@current_version FILTER e._to == 'symbols/verify_credentials' RETURN DOCUMENT(e._from)", json!({})).await.unwrap();
+    let doc = s.aql("FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/verify_credentials') RETURN DOCUMENT(e._from)", json!({})).await.unwrap();
     let mut c = version_content_from_doc(&doc[0]).unwrap();
     c.signature =
         "(store: &UserStore, username: &str, password: &str, _audit: Option<String>) -> AuthResult"

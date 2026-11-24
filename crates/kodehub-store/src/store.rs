@@ -192,7 +192,11 @@ impl Store {
         let over = if edges.is_empty() {
             "GRAPH @kodehub_graph".to_string()
         } else {
-            edges.join(", ")
+            edges
+                .iter()
+                .map(|e| self.db.phys(e))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         let depth = depth.clamp(1, 20);
         let q = format!(

@@ -1,5 +1,8 @@
 # 03 — Render, build, test and run
 
+> **v0.05 design document.** Superseded wherever it conflicts with
+> `docs/Kodehub v0.1 Requirements Layered Spec for Claude Code.md` (see D-041).
+
 Toolchains need files. The renderer (the "pre-compiler") creates them on demand in a temp
 directory, and throws them away afterwards. Files are never the source of truth.
 

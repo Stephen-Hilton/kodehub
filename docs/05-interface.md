@@ -1,5 +1,8 @@
 # 05 — Desktop interface
 
+> **v0.05 design document.** Superseded wherever it conflicts with
+> `docs/Kodehub v0.1 Requirements Layered Spec for Claude Code.md` (see D-041).
+
 No file tree, no text editor at the centre. The interface is a **map** of the system plus a
 **conversation** with the orchestrator.
 

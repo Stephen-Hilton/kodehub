@@ -1,5 +1,8 @@
 # 02 — Data model (ontology)
 
+> **v0.05 design document.** Superseded wherever it conflicts with
+> `docs/Kodehub v0.1 Requirements Layered Spec for Claude Code.md` (see D-041).
+
 Two layers:
 
 - **Core layer** — AI-native. Everything identified by hash or stable ID; names are labels.

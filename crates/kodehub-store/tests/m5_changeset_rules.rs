@@ -34,7 +34,7 @@ async fn requirement_edits_need_a_verifying_test_and_an_attested_review() {
     s.transition(&k, ChangesetState::Building, "orchestrator", "")
         .await
         .unwrap();
-    let cur = s.aql("FOR e IN @@current_version FILTER e._to == 'symbols/verify_credentials' RETURN DOCUMENT(e._from)", json!({})).await.unwrap();
+    let cur = s.aql("FOR e IN @@current_version FILTER e._to == CONCAT(@pfx, 'symbols/verify_credentials') RETURN DOCUMENT(e._from)", json!({})).await.unwrap();
     s.propose_version(
         &k,
         &ProposeVersion {

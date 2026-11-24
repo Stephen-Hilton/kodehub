@@ -1,5 +1,8 @@
 # 06 — Releases and environments
 
+> **v0.05 design document.** Superseded wherever it conflicts with
+> `docs/Kodehub v0.1 Requirements Layered Spec for Claude Code.md` (see D-041).
+
 ## Environments
 
 | Environment | Purpose | Pilot implementation |
