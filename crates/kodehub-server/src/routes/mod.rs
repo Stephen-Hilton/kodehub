@@ -4,13 +4,15 @@
 pub mod agents;
 pub mod changesets;
 pub mod graph;
+pub mod identity;
+pub mod project_init;
 pub mod releases;
 pub mod requirements;
 pub mod runs;
 pub mod settings;
 pub mod terminal;
 
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 
 use crate::AppState;
@@ -19,6 +21,63 @@ pub fn api() -> Router<AppState> {
     Router::new()
         .route("/health", get(graph::health))
         .route("/api/health", get(graph::health))
+        // accounts, orgs, projects, agent users, tokens, settings, credentials, audit
+        .route("/api/auth/status", get(identity::status))
+        .route("/api/auth/register", post(identity::register))
+        .route("/api/auth/login", post(identity::login))
+        .route("/api/auth/logout", post(identity::logout))
+        .route("/api/me", get(identity::me))
+        .route("/api/users", get(identity::users))
+        .route(
+            "/api/projects",
+            get(identity::list_projects).post(identity::create_project),
+        )
+        .route("/api/projects/contexts", get(graph::common_contexts))
+        .route(
+            "/api/projects/{id}",
+            patch(identity::patch_project).delete(identity::delete_project),
+        )
+        .route("/api/projects/{id}/open", post(identity::open_project))
+        .route(
+            "/api/projects/{id}/shares",
+            get(identity::shares).put(identity::put_share),
+        )
+        .route(
+            "/api/orgs",
+            get(identity::list_orgs).post(identity::create_org),
+        )
+        .route("/api/orgs/{o}/members", get(identity::org_members))
+        .route(
+            "/api/orgs/{o}/members/{u}",
+            put(identity::put_member).delete(identity::delete_member),
+        )
+        .route(
+            "/api/agent-users",
+            get(identity::list_agent_users).post(identity::create_agent_user),
+        )
+        .route(
+            "/api/agent-users/{key}/disable",
+            post(identity::disable_agent_user),
+        )
+        .route(
+            "/api/tokens",
+            get(identity::list_tokens).post(identity::create_token),
+        )
+        .route("/api/tokens/{id}", delete(identity::revoke_token))
+        .route(
+            "/api/scopes/{scope}/settings",
+            get(identity::scope_settings),
+        )
+        .route(
+            "/api/scopes/{scope}/settings/{key}",
+            put(identity::put_setting).delete(identity::delete_setting),
+        )
+        .route(
+            "/api/credentials",
+            get(identity::list_credentials).post(identity::put_credential),
+        )
+        .route("/api/credentials/{id}", delete(identity::delete_credential))
+        .route("/api/audit", get(identity::audit))
         .route("/api/events", get(crate::events::ws_events))
         // generic graph access
         .route("/api/node", get(graph::get_node))

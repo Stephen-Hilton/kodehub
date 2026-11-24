@@ -2,6 +2,7 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { signIn } from "./auth";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(__dirname, "../..");
@@ -21,7 +22,8 @@ async function drag(page: Page, handle: Locator, dx: number, dy: number) {
 }
 
 test("panes resize by dragging, clamp, persist and reset", async ({ page, request }) => {
-  const seeded = await request.post("/api/seed", { data: { path: path.join(repo, "examples/auth-poc") } });
+  const headers = await signIn(page, request);
+  const seeded = await request.post("/api/seed", { headers, data: { path: path.join(repo, "examples/auth-poc") } });
   expect(seeded.ok()).toBeTruthy();
   await page.goto("/");
   await page.evaluate(() => localStorage.removeItem("kodehub.layout.v1"));
@@ -91,7 +93,8 @@ test("panes resize by dragging, clamp, persist and reset", async ({ page, reques
   await expect.poll(() => width(left)).toBeCloseTo(left0, 0);
 });
 
-test("laptop width: inspecting a node hides the requirements column and its handle", async ({ page }) => {
+test("laptop width: inspecting a node hides the requirements column and its handle", async ({ page, request }) => {
+  await signIn(page, request);
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.goto("/");
   await page.evaluate(() => localStorage.removeItem("kodehub.layout.v1"));

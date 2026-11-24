@@ -14,7 +14,8 @@ import { TerminalDock } from "./components/TerminalDock";
 import { MainSplitters, TerminalSplitter, usePaneLayout } from "./components/Panes";
 import { TimeSlider } from "./components/TimeSlider";
 import { ToastProvider, useToast } from "./components/Toasts";
-import { api, type Json, type MapNode } from "./lib/api";
+import { SignIn } from "./components/SignIn";
+import { api, session, type Json, type MapNode } from "./lib/api";
 import { relTime } from "./lib/health";
 import { useKodehub } from "./lib/useKodehub";
 
@@ -170,10 +171,36 @@ function ReqHighlight({ k, set }: { k: string; set: (k: string) => void }) {
   return null;
 }
 
+/** Shows the sign-in screen until a valid session exists, then the app. */
+function AuthGate() {
+  const [state, setState] = useState<"checking" | "signed-out" | "ready">("checking");
+  const check = useCallback(() => {
+    if (!session.token()) { setState("signed-out"); return; }
+    api.me()
+      .then(async () => {
+        if (!session.project()) {
+          const ps = await api.projects().catch(() => []);
+          if (ps.length) session.setProject(ps[0].id);
+        }
+        setState("ready");
+      })
+      .catch(() => setState("signed-out"));
+  }, []);
+  useEffect(() => {
+    check();
+    const out = () => setState("signed-out");
+    window.addEventListener("kodehub:signed-out", out);
+    return () => window.removeEventListener("kodehub:signed-out", out);
+  }, [check]);
+  if (state === "checking") return null;
+  if (state === "signed-out") return <SignIn onSignedIn={check} />;
+  return <Shell />;
+}
+
 export function App() {
   return (
     <ToastProvider>
-      <Shell />
+      <AuthGate />
     </ToastProvider>
   );
 }

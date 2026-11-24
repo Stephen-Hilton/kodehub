@@ -8,6 +8,10 @@ use serde_json::Value;
 pub struct Client {
     pub base: String,
     http: reqwest::Client,
+    /// Bearer token (`KODEHUB_TOKEN`): an agent user's personal access token.
+    pub token: Option<String>,
+    /// Project to work in (`KODEHUB_PROJECT`); the token's default otherwise.
+    pub project: Option<String>,
 }
 
 impl Client {
@@ -15,7 +19,20 @@ impl Client {
         Client {
             base: base.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
+            token: std::env::var("KODEHUB_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty()),
+            project: std::env::var("KODEHUB_PROJECT")
+                .ok()
+                .filter(|t| !t.is_empty()),
         }
+    }
+
+    pub fn with_token(mut self, token: Option<String>) -> Self {
+        if token.is_some() {
+            self.token = token;
+        }
+        self
     }
 
     pub async fn call(
@@ -26,6 +43,12 @@ impl Client {
     ) -> anyhow::Result<Value> {
         let m = reqwest::Method::from_bytes(method.as_bytes())?;
         let mut req = self.http.request(m, format!("{}{}", self.base, path));
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        if let Some(p) = &self.project {
+            req = req.header("x-kodehub-project", p);
+        }
         if let Some(b) = body {
             req = req.json(b);
         }

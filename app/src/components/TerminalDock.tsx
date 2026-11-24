@@ -2,7 +2,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { api, uiTokenQuery, wsUrl } from "../lib/api";
+import { api, wsUrl } from "../lib/api";
 import { Link, TerminalIcon, X } from "./icons";
 import { useToast } from "./Toasts";
 
@@ -27,7 +27,7 @@ export function TerminalDock({ onClose, resizer }: { onClose: () => void; resize
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host.current!);
-    const socket = new WebSocket(wsUrl("/api/terminal" + uiTokenQuery()));
+    const socket = new WebSocket(wsUrl("/api/terminal"));
     ws.current = socket;
     const sendResize = () => {
       try { fit.fit(); } catch { /* not visible */ }

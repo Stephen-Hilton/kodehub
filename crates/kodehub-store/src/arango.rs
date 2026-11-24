@@ -29,6 +29,35 @@ pub const GRAPH_NAME: &str = "kodehub";
 /// Separator between the project id and the logical collection name.
 pub const SEP: &str = "__";
 
+tokio::task_local! {
+    /// Project selected for the current request (set by the server's auth layer). It takes
+    /// precedence over the handle's shared project, so concurrent requests for different
+    /// projects never see each other's data.
+    pub static REQUEST_PROJECT: String;
+}
+
+/// Run `fut` with `project` as the request-scoped project.
+pub async fn with_project<F: std::future::Future>(project: String, fut: F) -> F::Output {
+    REQUEST_PROJECT.scope(project, fut).await
+}
+
+/// The request-scoped project, if any.
+pub fn request_project() -> Option<String> {
+    REQUEST_PROJECT.try_with(|p| p.clone()).ok()
+}
+
+/// Spawn a task that keeps the caller's request-scoped project.
+pub fn spawn_scoped<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match request_project() {
+        Some(p) => tokio::spawn(REQUEST_PROJECT.scope(p, fut)),
+        None => tokio::spawn(fut),
+    }
+}
+
 /// True for a project-scoped (logical) collection name.
 pub fn is_project_collection(c: &str) -> bool {
     DOCUMENT_COLLECTIONS.contains(&c) || EDGE_COLLECTIONS.contains(&c)
@@ -149,6 +178,8 @@ pub struct Arango {
     pub cfg: ArangoConfig,
     /// Active project id, shared by every clone of this handle (server, runner, agents).
     project: Arc<RwLock<Option<String>>>,
+    /// A handle made by `scoped()` is pinned to its project and ignores the request scope.
+    pub(crate) pinned: bool,
 }
 
 impl Arango {
@@ -157,12 +188,16 @@ impl Arango {
             http: reqwest::Client::new(),
             cfg,
             project: Arc::new(RwLock::new(None)),
+            pinned: false,
         }
     }
 
     /// The active project id, if one is selected.
     pub fn project(&self) -> Option<String> {
-        self.project.read().unwrap().clone()
+        if self.pinned {
+            return self.project.read().unwrap().clone();
+        }
+        request_project().or_else(|| self.project.read().unwrap().clone())
     }
 
     /// Select the active project for every clone of this handle.

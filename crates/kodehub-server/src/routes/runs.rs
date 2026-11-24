@@ -96,7 +96,7 @@ pub async fn run_now(State(s): State<AppState>, Json(b): Json<RunBody>) -> ApiRe
     let ev = s.events.clone();
     let token = b.token.clone();
     let sym = key.clone();
-    let fwd = tokio::spawn(async move {
+    let fwd = kodehub_store::spawn_scoped(async move {
         while let Some(l) = rx.recv().await {
             if l.line.starts_with(kodehub_runner::run::RESULT_MARKER) {
                 continue;

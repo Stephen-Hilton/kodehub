@@ -2,6 +2,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { signIn } from "./auth";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,7 +17,8 @@ test.describe.configure({ mode: "serial" });
 
 test("doc 08 demo, entirely in the desktop UI", async ({ page, request }) => {
   // 0. seed the project (setup, as a fresh install would ship it)
-  const seeded = await request.post("/api/seed", { data: { path: path.join(repo, "examples/auth-poc") } });
+  const headers = await signIn(page, request);
+  const seeded = await request.post("/api/seed", { headers, data: { path: path.join(repo, "examples/auth-poc") } });
   expect(seeded.ok()).toBeTruthy();
 
   await page.goto("/");

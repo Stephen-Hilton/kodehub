@@ -51,8 +51,9 @@ fn validate_name(name: &str) -> Result<String> {
 impl Arango {
     /// An independent handle bound to `project` (does not affect the shared active project).
     pub fn scoped(&self, project: &str) -> Arango {
-        let a = Arango::new(self.cfg.clone());
+        let mut a = Arango::new(self.cfg.clone());
         a.set_project(Some(project.to_string()));
+        a.pinned = true;
         a
     }
 

@@ -109,29 +109,38 @@ export function apiBase(): string {
   return "";
 }
 
-export function wsUrl(path: string): string {
-  const base = apiBase();
-  if (base) return base.replace(/^http/, "ws") + path;
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}${path}`;
+function store(key: string): string | null {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+function storeSet(key: string, v: string | null) {
+  try { if (v === null) localStorage.removeItem(key); else localStorage.setItem(key, v); } catch { /* private mode */ }
 }
 
-/** Per-launch UI secret (human-only actions). Injected as a meta tag by the server / Vite, or
- * fetched from the Tauri shell. Never sent anywhere but the Kodehub server. */
-let uiToken: string | null = null;
-export async function initUiToken(): Promise<void> {
-  const meta = document.querySelector('meta[name="kodehub-ui-token"]')?.getAttribute("content");
-  if (meta) { uiToken = meta; return; }
-  const w = window as Json;
-  if (w.__TAURI_INTERNALS__) {
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      uiToken = await invoke<string>("ui_token");
-    } catch { /* not available */ }
-  }
+/** Session token of the signed-in human (never sent anywhere but the Kodehub server). */
+export const session = {
+  token: (): string | null => store("kodehub.session"),
+  set: (t: string | null) => storeSet("kodehub.session", t),
+  project: (): string | null => store("kodehub.project"),
+  setProject: (p: string | null) => storeSet("kodehub.project", p),
+};
+
+/** Query string carrying the session and project, for WebSockets (they cannot set headers). */
+export function authQuery(): string {
+  const q = new URLSearchParams();
+  const t = session.token();
+  const p = session.project();
+  if (t) q.set("token", t);
+  if (p) q.set("project", p);
+  const s = q.toString();
+  return s ? `?${s}` : "";
 }
-export function uiTokenQuery(): string {
-  return uiToken ? `?ui=${encodeURIComponent(uiToken)}` : "";
+
+export function wsUrl(path: string): string {
+  const base = apiBase();
+  const full = path + (path.includes("?") ? authQuery().replace("?", "&") : authQuery());
+  if (base) return base.replace(/^http/, "ws") + full;
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}${full}`;
 }
 
 export class ApiError extends Error {
@@ -143,7 +152,10 @@ export class ApiError extends Error {
 async function call<T = Json>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {};
   if (body !== undefined) headers["content-type"] = "application/json";
-  if (uiToken) headers["x-kodehub-ui"] = uiToken;
+  const token = session.token();
+  if (token) headers["authorization"] = `Bearer ${token}`;
+  const project = session.project();
+  if (project) headers["x-kodehub-project"] = project;
   const res = await fetch(apiBase() + path, {
     method,
     headers,
@@ -156,12 +168,26 @@ async function call<T = Json>(method: string, path: string, body?: unknown): Pro
   } catch {
     data = text;
   }
+  if (res.status === 401 && !path.startsWith("/api/auth/")) {
+    session.set(null);
+    window.dispatchEvent(new Event("kodehub:signed-out"));
+  }
   if (!res.ok) throw new ApiError(res.status, (data && data.error) || String(data) || res.statusText);
   return data as T;
 }
 
 export const api = {
   health: () => call("GET", "/health"),
+  authStatus: () => call<{ has_users: boolean; open_registration: boolean }>("GET", "/api/auth/status"),
+  login: (username: string, password: string) => call<{ token: string; user: Json }>("POST", "/api/auth/login", { username, password }),
+  register: (username: string, password: string, display_name: string) =>
+    call<{ token: string; user: Json }>("POST", "/api/auth/register", { username, password, display_name }),
+  logout: () => call("POST", "/api/auth/logout"),
+  me: () => call<Json>("GET", "/api/me"),
+  projects: () => call<Json[]>("GET", "/api/projects"),
+  createProject: (b: Json) => call<Json>("POST", "/api/projects", b),
+  openProject: (id: string) => call<Json>("POST", `/api/projects/${id}/open`),
+  commonContexts: () => call<{ name: string; description: string }[]>("GET", "/api/projects/contexts"),
   seed: (path: string) => call("POST", "/api/seed", { path }),
   map: (at?: string | null) => call<MapData>("GET", "/api/map" + (at ? `?at=${encodeURIComponent(at)}` : "")),
   requirements: () => call<{ requirements: Requirement[]; groups: Group[]; summary: Record<string, number> }>("GET", "/api/requirements"),

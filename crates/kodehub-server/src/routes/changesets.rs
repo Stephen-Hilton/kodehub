@@ -344,7 +344,7 @@ pub async fn replan(State(s): State<AppState>, Path(k): Path<String>) -> ApiResu
         .clone()
         .ok_or_else(|| ApiError::bad_request("agents are not configured"))?;
     let kk = k.clone();
-    tokio::spawn(async move {
+    kodehub_store::spawn_scoped(async move {
         let _ = e.plan(&kk).await;
     });
     Ok(Json(json!({"started": true, "changeset": k})))

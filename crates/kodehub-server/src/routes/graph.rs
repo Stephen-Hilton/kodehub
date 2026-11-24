@@ -43,7 +43,7 @@ pub async fn list_nodes(
     let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(500);
     let filter: Map<String, Value> = q
         .into_iter()
-        .filter(|(k, _)| k != "limit")
+        .filter(|(k, _)| !matches!(k.as_str(), "limit" | "project" | "token"))
         .map(|(k, v)| (k, json!(v)))
         .collect();
     Ok(Json(s.store.query_nodes(&c, &filter, limit).await?))
@@ -508,4 +508,12 @@ fn guard_api_edge(collection: &str) -> Result<(), ApiError> {
         )));
     }
     Ok(())
+}
+
+/// Common contexts offered when creating a project.
+pub async fn common_contexts() -> ApiResult<Value> {
+    Ok(Json(json!(crate::routes::project_init::COMMON_CONTEXTS
+        .iter()
+        .map(|(n, d)| json!({"name": n, "description": d}))
+        .collect::<Vec<_>>())))
 }

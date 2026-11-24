@@ -28,7 +28,7 @@ async fn full_seed_scenario_over_http() {
     assert_eq!(h["db"]["connected"], true);
 
     // events socket
-    let ws_url = t.url.replace("http://", "ws://") + "/api/events";
+    let ws_url = t.url.replace("http://", "ws://") + "/api/events?token=" + &t.pat;
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
     let hello = ws.next().await.unwrap().unwrap();
     assert!(hello.to_string().contains("hello"));
@@ -328,13 +328,23 @@ async fn full_seed_scenario_over_http() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
-    // a forged browser Origin is not enough for human-only actions: the UI secret is required
+    // no token: 401
+    let (s, _) = t.req_as(None, "GET", "/api/requirements", None).await;
+    assert_eq!(s, 401);
+    let (s, _) = t
+        .req_as(Some("khp_forged"), "GET", "/api/requirements", None)
+        .await;
+    assert_eq!(s, 401);
+    // an agent's token plus a forged Origin and a forged UI header is not enough for
+    // human-only actions: only a human's session is
     let forged = reqwest::Client::new()
         .post(format!(
             "{}/api/requirements/r2-hashed-storage/edge_cases",
             t.url
         ))
         .header("Origin", "http://localhost:1420")
+        .header("x-kodehub-ui", t.state.ui_token.as_str())
+        .bearer_auth(&t.pat)
         .json(&json!({"description": "agent sneaks in an edge case", "input": {}, "expected": "x"}))
         .send()
         .await
@@ -343,6 +353,8 @@ async fn full_seed_scenario_over_http() {
     let forged = reqwest::Client::new()
         .post(format!("{}/api/environments/prod/approvals", t.url))
         .header("Origin", "http://localhost:1420")
+        .header("x-kodehub-ui", t.state.ui_token.as_str())
+        .bearer_auth(&t.pat)
         .json(&json!({"release": "x"}))
         .send()
         .await
@@ -382,6 +394,7 @@ async fn mcp_stdio_lists_requirements_and_runs_coverage() {
     assert!(bin.exists(), "build the CLI first (cargo build --bins)");
     let mut child = tokio::process::Command::new(&bin)
         .args(["--server", &t.url, "mcp"])
+        .env("KODEHUB_TOKEN", &t.pat)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()

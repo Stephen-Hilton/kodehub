@@ -29,6 +29,10 @@ pub struct TestServer {
     pub store: Store,
     pub state: AppState,
     http: reqwest::Client,
+    /// Session token of the signed-in human (`tester`, the system admin).
+    pub session: String,
+    /// Personal access token of an external agent user acting for `tester`.
+    pub pat: String,
 }
 
 impl TestServer {
@@ -46,17 +50,63 @@ impl TestServer {
         f(&mut state, &url);
         let st = state.clone();
         tokio::spawn(async move { kodehub_server::serve(listener, st).await.unwrap() });
+        let http = reqwest::Client::new();
+        let reg: Value = http
+            .post(format!("{url}/api/auth/register"))
+            .json(&serde_json::json!({"username": "tester", "password": "password123"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let session = reg["token"].as_str().expect("registered").to_string();
+        let agent: Value = http
+            .post(format!("{url}/api/agent-users"))
+            .bearer_auth(&session)
+            .json(&serde_json::json!({"name": "mcp"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let tok: Value = http
+            .post(format!("{url}/api/tokens"))
+            .bearer_auth(&session)
+            .json(
+                &serde_json::json!({"agent": agent["key"], "name": "tests", "permission": "write"}),
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let pat = tok["token"].as_str().expect("token issued").to_string();
         TestServer {
             url,
             store,
             state,
-            http: reqwest::Client::new(),
+            http,
+            session,
+            pat,
         }
     }
 
-    pub async fn req(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    /// Request with an explicit bearer token (or none).
+    pub async fn req_as(
+        &self,
+        token: Option<&str>,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
         let mut r = self.http.request(m, format!("{}{}", self.url, path));
+        if let Some(t) = token {
+            r = r.bearer_auth(t);
+        }
         if let Some(b) = body {
             r = r.json(&b);
         }
@@ -69,14 +119,33 @@ impl TestServer {
         )
     }
 
-    /// Request as the desktop UI (allowed browser Origin) — needed for human-only actions.
+    /// Request as an external agent (MCP / CLI): authenticated, but never human-only.
+    pub async fn req(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut r = self
+            .http
+            .request(m, format!("{}{}", self.url, path))
+            .bearer_auth(&self.pat);
+        if let Some(b) = body {
+            r = r.json(&b);
+        }
+        let resp = r.send().await.unwrap();
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        )
+    }
+
+    /// Request as the signed-in human in the app — needed for human-only actions.
     pub async fn ui(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
         let mut r = self
             .http
             .request(m, format!("{}{}", self.url, path))
             .header("Origin", "http://localhost:1420")
-            .header("x-kodehub-ui", self.state.ui_token.as_str());
+            .bearer_auth(&self.session);
         if let Some(b) = body {
             r = r.json(&b);
         }

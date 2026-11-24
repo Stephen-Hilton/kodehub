@@ -1,5 +1,6 @@
 //! Kodehub HTTP server: the graph API over HTTP + WebSocket events (doc 01, doc 04).
 
+pub mod auth;
 pub mod error;
 pub mod events;
 pub mod routes;
@@ -112,15 +113,6 @@ pub fn from_ui(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
     constant_eq(presented.as_bytes(), state.ui_token.as_bytes())
 }
 
-pub fn from_ui_query(state: &AppState, query: Option<&str>) -> bool {
-    let tok = query
-        .unwrap_or("")
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("ui="))
-        .unwrap_or("");
-    constant_eq(tok.as_bytes(), state.ui_token.as_bytes())
-}
-
 fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -138,7 +130,7 @@ pub fn require_ui(state: &AppState, headers: &axum::http::HeaderMap) -> Result<(
     }
 }
 
-/// Serve index.html with the UI secret injected (`<meta name="kodehub-ui-token">`).
+/// Serve index.html (sign-in happens in the UI; no secret is injected).
 async fn index_with_token(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> axum::response::Response {
@@ -147,14 +139,7 @@ async fn index_with_token(
         return axum::http::StatusCode::NOT_FOUND.into_response();
     };
     match std::fs::read_to_string(dir.join("index.html")) {
-        Ok(html) => {
-            let meta = format!(
-                "<meta name=\"kodehub-ui-token\" content=\"{}\" />",
-                state.ui_token
-            );
-            axum::response::Html(html.replacen("</head>", &format!("{meta}</head>"), 1))
-                .into_response()
-        }
+        Ok(html) => axum::response::Html(html).into_response(),
         Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -201,6 +186,10 @@ pub fn router(state: AppState) -> Router {
         .allow_headers(Any);
     let mut r = routes::api()
         .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_guard,
+        ))
         .layer(cors)
         .layer(axum::middleware::from_fn_with_state(state, origin_guard));
     if let Some(dir) = static_dir {
@@ -253,7 +242,7 @@ impl AppState {
     pub fn requirement_edited(&self, key: &str, by: &str) {
         if let Some(e) = self.engine.clone() {
             let (k, b, ev) = (key.to_string(), by.to_string(), self.events.clone());
-            tokio::spawn(async move {
+            kodehub_store::spawn_scoped(async move {
                 if let Err(err) = e.on_requirement_edited(&k, &b).await {
                     ev.emit("agent.activity", serde_json::json!({"role": "orchestrator", "error": err.to_string(), "requirement": k}));
                 }
@@ -265,7 +254,7 @@ impl AppState {
     pub fn execute_changeset(&self, key: &str) {
         if let Some(e) = self.engine.clone() {
             let (k, ev) = (key.to_string(), self.events.clone());
-            tokio::spawn(async move {
+            kodehub_store::spawn_scoped(async move {
                 if let Err(err) = e.execute(&k).await {
                     ev.emit("agent.activity", serde_json::json!({"role": "orchestrator", "error": err.to_string(), "changeset": k}));
                 }

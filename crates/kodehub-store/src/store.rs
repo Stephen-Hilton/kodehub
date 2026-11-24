@@ -922,3 +922,16 @@ fn validate_name(s: &str) -> Result<()> {
     }
     Ok(())
 }
+
+impl Store {
+    /// Set the project's philosophy document (spec §7.1): one per project, kept as a mission
+    /// node so the v0.05 mission banner keeps working until S3 replaces it.
+    pub async fn set_philosophy(&self, text: &str, by: &str) -> Result<Value> {
+        let doc = json!({
+            "_key": "philosophy", "title": "Philosophy", "statement": text.trim(),
+            "scope": "program", "kind": "philosophy", "updated_by": by, "updated_at": now_iso(),
+        });
+        self.db.upsert("missions", &doc, None).await?;
+        self.db.get("missions", "philosophy", None).await
+    }
+}

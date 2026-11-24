@@ -399,3 +399,12 @@ body.resizing-row, body.resizing-row * { cursor: row-resize !important; user-sel
 /* no slide-in replay or iframe-style pointer stealing while dragging */
 body.resizing-col .node-panel, body.resizing-row .node-panel { animation: none; }
 body.resizing-col canvas, body.resizing-row canvas, body.resizing-row .xterm { pointer-events: none; }
+
+/* ---------------------------------------------------------------- sign-in (v0.1) */
+.signin { height: 100%; display: grid; place-items: center; background: var(--bg-grad), var(--bg); padding: 16px; }
+.signin-card { width: min(380px, 100%); display: flex; flex-direction: column; gap: 14px; padding: 28px; border-radius: var(--radius); }
+.signin-brand { display: flex; align-items: center; gap: 8px; font-weight: 650; color: var(--accent); }
+.signin-title { margin: 4px 0 0; font-size: 20px; font-weight: 650; }
+.signin-note { margin: -6px 0 0; font-size: 12.5px; }
+.signin-error { color: var(--fail); font-size: 12.5px; }
+.signin-card .btn { justify-content: center; }

@@ -47,11 +47,48 @@ async fn create_collection(db: &Arango, name: &str, edge: bool) -> Result<()> {
     }
 }
 
-/// Create the database and the global registry collections.
+/// Global (cross-project) document collections beyond the registry.
+pub fn global_document_collections() -> Vec<&'static str> {
+    let mut v = vec![
+        PROJECTS,
+        META,
+        crate::settings::SETTINGS,
+        crate::credentials::CREDENTIALS,
+        crate::audit::AUDIT,
+    ];
+    v.extend(crate::identity::IDENTITY_DOCS);
+    v
+}
+
+/// (collection, fields, unique, sparse) for global collections.
+const GLOBAL_INDEXES: &[(&str, &[&str], bool, bool)] = &[
+    ("kodehub_settings", &["scope", "key"], true, false),
+    ("kodehub_audit", &["project", "at"], false, false),
+    ("kodehub_audit", &["actor", "at"], false, false),
+    ("kodehub_member_of", &["_from", "_to"], true, false),
+    ("kodehub_acts_for", &["_from"], true, false),
+    ("kodehub_tokens", &["user"], false, false),
+];
+
+/// Create the database and the global collections (registry, identity, settings, audit).
 pub async fn bootstrap_registry(db: &Arango) -> Result<()> {
     db.ensure_database().await?;
-    create_collection(db, PROJECTS, false).await?;
-    create_collection(db, META, false).await?;
+    for c in global_document_collections() {
+        create_collection(db, c, false).await?;
+    }
+    for c in crate::identity::IDENTITY_EDGES {
+        create_collection(db, c, true).await?;
+    }
+    for (coll, fields, unique, sparse) in GLOBAL_INDEXES {
+        let body =
+            json!({"type": "persistent", "fields": fields, "unique": unique, "sparse": sparse});
+        db.db_raw(
+            Method::POST,
+            &format!("/_api/index?collection={coll}"),
+            Some(&body),
+        )
+        .await?;
+    }
     Ok(())
 }
 

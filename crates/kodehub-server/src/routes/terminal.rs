@@ -37,11 +37,11 @@ pub async fn mcp_command(State(s): State<AppState>) -> ApiResult<Value> {
 pub async fn ws(
     ws: WebSocketUpgrade,
     State(s): State<AppState>,
-    axum::extract::RawQuery(q): axum::extract::RawQuery,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     use axum::response::IntoResponse;
-    // a shell only for the app itself: the per-launch UI secret is required (final review #8)
-    if !crate::from_ui_query(&s, q.as_deref()) {
+    // a shell only for a signed-in human (the auth layer marks those requests)
+    if !crate::from_ui(&s, &headers) {
         return (
             axum::http::StatusCode::FORBIDDEN,
             "terminal is only available from the Kodehub app",

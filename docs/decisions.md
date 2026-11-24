@@ -4,6 +4,36 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-043 S2: tenancy, identity and the auth layer
+- **Context:** v0.05 had one server-wide "active project" and a per-launch UI secret. v0.1 needs
+  users, orgs, sharing and per-call permissions (spec §6, §11, §13A).
+- **Decision:**
+  - Per-project collection sets are kept (they already make "every node belongs to one project"
+    structural). The project is chosen **per request** (`x-kodehub-project` header or `?project=`,
+    else the caller's default) and applied through a tokio task-local that the Arango handle reads
+    before its shared project. `spawn_scoped` carries it into background tasks; WebSocket events
+    are tagged with their project and delivered only to subscribers of that project.
+  - Identity, settings, credentials and audit are global collections (`kodehub_*`). Ownership and
+    permissions are edges: `kodehub_member_of`, `kodehub_access`, `kodehub_acts_for`. Org roles map
+    to project permissions: admin → admin, member → write.
+  - Passwords: argon2. Sessions (`khs_`), PATs (`khp_`) and internal agent tokens (`khi_`) are
+    random 256-bit tokens stored only as BLAKE3 hashes. PATs are issued only to **agent users**
+    (spec §13A.1: an external assistant never acts as the human); humans use sessions.
+  - Human-only actions keep their v0.05 handler checks: the auth layer strips any client
+    `x-kodehub-ui` header and sets it only for a human session. The UI secret file, meta tag and
+    Tauri command are gone.
+  - The first registered human is the system admin and inherits ownerless projects (the project a
+    fresh database starts with). Registration is open by default (`open_registration`, app scope).
+  - Credentials: ChaCha20-Poly1305 with `KODEHUB_SECRET_KEY` or `$KODEHUB_HOME/secret.key`. The
+    `claude_code` backend may use only a subscription token of the owner of a user-owned project;
+    the `api` backend only API keys. Format checks refuse an API key stored as a subscription
+    token and vice versa.
+  - Every non-GET API call is audited (method + path, actor, actor class, on-behalf-of, project,
+    status). Request bodies are not recorded; detail values are scrubbed of secrets.
+- **Consequence:** All HTTP tests authenticate: `req()` is an external agent with a PAT, `ui()` is
+  a human session. The CLI/MCP read `KODEHUB_TOKEN` / `KODEHUB_PROJECT`. Fixed on the way: list
+  filters no longer treat `?project=`/`?token=` as field filters.
+
 ## D-042 Releases select versions; patch releases; clone downward only
 - **Context:** The author wants several releases per environment, fixes for bugs found after DEV
   without restarting from DEV, cloning, and releases that pick code by rule. Editing a release
