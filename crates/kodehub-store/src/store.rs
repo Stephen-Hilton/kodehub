@@ -18,10 +18,7 @@ pub const PROTECTED_EDGES: &[&str] = &[
     "has_version",
     "supports",
     "in_environment",
-    "included_in",
-    "deployed_to",
-    "currently_running",
-    "previously_ran",
+    "cloned_from",
     "proposes",
 ];
 
@@ -863,17 +860,29 @@ impl Store {
                 r["n"], r["a"], r["b"]
             ));
         }
+        // invariant 5: a release is in at most one environment; single-slot environments hold one
         let rows = self
             .aql(
-                "FOR env IN @@environments LET n = LENGTH(FOR e IN @@currently_running FILTER e._from == env._id RETURN 1)
-                   FILTER n > 1 RETURN {env: env._key, n}",
+                "FOR e IN @@in_environment FILTER e.validTo == null COLLECT r = e._from WITH COUNT INTO n
+                   FILTER n > 1 RETURN {r, n}",
+                json!({}),
+            )
+            .await?;
+        for r in rows {
+            problems.push(format!("release {} is in {} environments", r["r"], r["n"]));
+        }
+        let rows = self
+            .aql(
+                "FOR env IN @@environments FILTER env.max_releases != null
+                   LET n = LENGTH(FOR e IN @@in_environment FILTER e._to == env._id AND e.validTo == null RETURN 1)
+                   FILTER n > env.max_releases RETURN {env: env._key, n, max: env.max_releases}",
                 json!({}),
             )
             .await?;
         for r in rows {
             problems.push(format!(
-                "environment {} has {} currently_running edges (expected at most 1)",
-                r["env"], r["n"]
+                "environment {} holds {} releases (max {})",
+                r["env"], r["n"], r["max"]
             ));
         }
         Ok(problems)

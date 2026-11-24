@@ -210,7 +210,7 @@ export const api = {
   resolve: (key: string, choice: string, rationale: string, to: "building" | "testing") =>
     call("POST", `/api/changesets/${key}/resolve`, { choice, rationale, to }),
   applyChat: (key: string, apply: boolean) => call("POST", `/api/chat/${key}/apply`, { apply }),
-  approveProd: (release: string) => call<{ approval: string }>("POST", "/api/environments/prod/approvals", { release }),
+  approveProd: (release: string, env = "prod") => call<{ approval: string }>("POST", `/api/environments/${env}/approvals`, { release }),
   plan: (key: string, plan: Json) => call("POST", `/api/changesets/${key}/plan`, { plan, by: "human" }),
   approve: (key: string) => call("POST", `/api/changesets/${key}/approve`, { by: "human" }),
   reject: (key: string, reason: string) => call("POST", `/api/changesets/${key}/reject`, { by: "human", reason }),
@@ -230,11 +230,14 @@ export const api = {
   settings: () => call<Json>("GET", "/api/settings"),
   patchAgents: (p: Json) => call<Json>("PATCH", "/api/settings/agents", p),
   releases: () => call<Json[]>("GET", "/api/releases"),
-  cutRelease: (name: string, notes: string) => call<Json>("POST", "/api/releases", { name, notes }),
+  cutRelease: (name: string, notes: string, rule?: Json) => call<Json>("POST", "/api/releases", { name, notes, rule }),
   diff: (a: string, b: string) => call<Json>("GET", `/api/releases/${a}/diff/${b}`),
   environments: () => call<Json[]>("GET", "/api/environments"),
   promote: (env: string, release: string, approval?: string) =>
     call<Json>("POST", `/api/environments/${env}/promote`, { release, approval }),
-  rollback: (env: string) => call<Json>("POST", `/api/environments/${env}/rollback`),
+  rollback: (env: string, approval?: string) => call<Json>("POST", `/api/environments/${env}/rollback`, { approval }),
+  cloneRelease: (key: string, environment: string) => call<Json>("POST", `/api/releases/${key}/clone`, { environment }),
+  patchRelease: (key: string, swaps: { symbol: string; version: string }[], approval?: string) =>
+    call<Json>("POST", `/api/releases/${key}/patch`, { swaps, approval }),
   mcpCommand: () => call<{ command: string }>("GET", "/api/terminal/mcp-command"),
 };

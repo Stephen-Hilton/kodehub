@@ -1,18 +1,21 @@
 //! Environment agents (doc 06): deploy releases and gate promotion. Gates are deterministic
 //! checks (decisions.md D-027); results are recorded on the `deployed_to` edge.
 //!
-//! - → test: the release builds for every target (Rust lib + Python package).
-//! - → qa:   every test in the release passes; no requirement fails; no orphans.
-//! - → prod: the QA smoke run (all release tests executed in the qa environment) passes, and a
-//!   human approved (`approved_by: human`).
+//! - → test:    the release builds for every target (Rust lib + Python package).
+//! - → qa:      every release test passes; no requirement fails; no orphans; the tests of
+//!   live use cases are in the release.
+//! - → preprod: smoke run (every release test re-executed).
+//! - → prod:    smoke run, and a human approved (a one-time approval issued to the app).
 //!
-//! Promotion is ordered: a release must already have been deployed to the previous environment.
+//! Promotion is ordered (one environment up at a time); patch releases and rollbacks run the
+//! gate of the environment they enter.
 
 use std::collections::BTreeMap;
 
-use kodehub_core::model::{now_iso, Kind, Language, ENVIRONMENTS};
+use kodehub_core::model::{now_iso, Kind, Language};
 use kodehub_core::CodeGraph;
 use kodehub_runner::{BuildTarget, Runner};
+use kodehub_store::releases::{EnvDef, Selected, SelectionRule};
 use kodehub_store::Store;
 use serde_json::{json, Value};
 
@@ -32,17 +35,33 @@ fn roots(g: &CodeGraph, lang: Language) -> Vec<String> {
 }
 
 impl EnvironmentAgent<'_> {
-    /// Cut a release and record it as running in `dev`.
+    /// Create a release (default: the stable graph) in the lowest environment.
     pub async fn cut(&self, name: Option<&str>, notes: &str, by: &str) -> Result<Value> {
+        self.create(name, notes, &SelectionRule::default(), by)
+            .await
+    }
+
+    pub async fn create(
+        &self,
+        name: Option<&str>,
+        notes: &str,
+        rule: &SelectionRule,
+        by: &str,
+    ) -> Result<Value> {
         let rel = self
             .store
-            .cut_release(name, notes, by, &["rust-lib".into(), "python-pkg".into()])
+            .create_release(
+                name,
+                notes,
+                rule,
+                by,
+                &["rust-lib".into(), "python-pkg".into()],
+            )
             .await?;
         let key = rel["_key"].as_str().unwrap_or_default().to_string();
-        self.store
-            .deploy(&key, "dev", by, json!({"cut": true}))
-            .await?;
-        self.write_env_config("dev", &key)?;
+        if let Some(env) = self.store.release_environment(&key).await? {
+            self.write_env_config(&env, &key)?;
+        }
         Ok(rel)
     }
 
@@ -83,7 +102,7 @@ impl EnvironmentAgent<'_> {
         Ok(json!({"ok": ok, "checks": checks}))
     }
 
-    /// `force` re-executes every test (the QA smoke run) instead of trusting cached passes.
+    /// `force` re-executes every test (the smoke run) instead of trusting cached passes.
     async fn tests_gate(&self, g: &CodeGraph, label: &str, force: bool) -> Result<(bool, Value)> {
         let tests: Vec<String> = g
             .symbols
@@ -106,41 +125,59 @@ impl EnvironmentAgent<'_> {
         ))
     }
 
-    /// Check the gate for promoting `release` into `env`.
-    /// `approved`: a human approval was redeemed for this promotion (prod only).
-    pub async fn gate(&self, release: &str, env: &str, approved: bool) -> Result<Value> {
-        let idx = ENVIRONMENTS
-            .iter()
-            .position(|e| *e == env)
-            .ok_or_else(|| AgentError::Workflow(format!("unknown environment {env}")))?;
-        if idx == 0 {
-            return Err(AgentError::Workflow(
-                "releases enter dev when they are cut".into(),
-            ));
+    /// Gate kind of an environment, by name (custom environments get the tests gate).
+    fn gate_kind(env: &EnvDef) -> &'static str {
+        match env.name.as_str() {
+            "test" => "build",
+            "qa" => "tests",
+            "preprod" => "smoke",
+            "prod" => "approval",
+            _ if env.order == 0 => "none",
+            _ if env.requires_human_approval => "approval",
+            _ => "tests",
         }
-        let prev = ENVIRONMENTS[idx - 1];
-        let deployed_prev = self
-            .store
-            .aql("FOR e IN @@deployed_to FILTER e._from == CONCAT(@pfx, 'releases/', @r) AND e._to == CONCAT(@pfx, 'environments/', @p) LIMIT 1 RETURN 1",
-                 json!({"r": release, "p": prev}))
-            .await?;
-        let mut checks = vec![
-            json!({"check": format!("deployed to {prev} first"), "ok": !deployed_prev.is_empty()}),
-        ];
+    }
+
+    /// The checks for `release` entering `env` (spec §16.3). `approved`: a human approval was
+    /// redeemed for this promotion. `ordered`: the release must be in the environment just below.
+    pub async fn gate_checks(
+        &self,
+        release: &str,
+        env: &str,
+        approved: bool,
+        ordered: bool,
+    ) -> Result<Value> {
+        let envs = self.store.env_defs().await?;
+        let def = envs
+            .iter()
+            .find(|e| e.name == env)
+            .cloned()
+            .ok_or_else(|| AgentError::Workflow(format!("unknown environment {env}")))?;
+        let mut checks = Vec::new();
+        if ordered {
+            if def.order == 0 {
+                return Err(AgentError::Workflow(format!(
+                    "releases enter {env} when they are created or cloned"
+                )));
+            }
+            let prev = &envs[def.order - 1].name;
+            let here = self.store.release_environment(release).await?;
+            checks.push(json!({"check": format!("currently in {prev}"), "ok": here.as_deref() == Some(prev.as_str()),
+                               "in": here}));
+        }
         let g = self.store.release_graph(release).await?;
-        match env {
-            "test" => {
+        match Self::gate_kind(&def) {
+            "build" => {
                 let b = self.build_gate(&g).await?;
                 checks.extend(b["checks"].as_array().cloned().unwrap_or_default());
             }
-            "qa" => {
+            "tests" => {
                 let (_, t) = self.tests_gate(&g, "all release tests pass", false).await?;
                 checks.push(t);
-                // evaluated on the release's own snapshot, not the working graph (review M6 #6)
+                // evaluated on the release's own snapshot, not the working graph
                 let rep = self.store.release_trace_report(release).await?;
                 let failing = rep["failing_requirements"].clone();
                 let orphans = rep["orphans"].clone();
-                // requirements at risk (edited, not yet covered) or unverified at cut block qa (final #10)
                 let snapshot_risk: Vec<Value> = self.store.get_release(release).await?["trace"]
                     ["requirements"]
                     .as_array()
@@ -158,12 +195,16 @@ impl EnvironmentAgent<'_> {
                 checks.push(json!({"check": "no requirement at risk or unverified", "ok": risky.is_empty(), "requirements": risky}));
                 checks.push(json!({"check": "no failing requirements", "ok": failing.as_array().map(|a| a.is_empty()).unwrap_or(false), "failing": failing}));
                 checks.push(json!({"check": "no orphans", "ok": orphans.as_array().map(|a| a.is_empty()).unwrap_or(false), "orphans": orphans}));
+                // live use cases' expected-outcome tests must be in the release (spec §16.3)
+                let missing = self.live_use_case_tests_missing(&g).await?;
+                checks.push(json!({"check": "live use cases are covered by the release", "ok": missing.is_empty(), "missing": missing}));
             }
-            "prod" => {
-                // a real smoke run: every release test re-executed (review M6 #7)
-                let (_, t) = self
-                    .tests_gate(&g, "QA smoke run (re-executed)", true)
-                    .await?;
+            "smoke" => {
+                let (_, t) = self.tests_gate(&g, "smoke run (re-executed)", true).await?;
+                checks.push(t);
+            }
+            "approval" => {
+                let (_, t) = self.tests_gate(&g, "smoke run (re-executed)", true).await?;
                 checks.push(t);
                 checks.push(json!({"check": "human approval", "ok": approved, "approved_by": if approved { "human" } else { "" }}));
             }
@@ -175,7 +216,29 @@ impl EnvironmentAgent<'_> {
         )
     }
 
-    /// Gate, then deploy. Returns the gate report (and deployment when it passed).
+    /// v0.05 signature: ordered promotion gate.
+    pub async fn gate(&self, release: &str, env: &str, approved: bool) -> Result<Value> {
+        self.gate_checks(release, env, approved, true).await
+    }
+
+    async fn live_use_case_tests_missing(&self, g: &CodeGraph) -> Result<Vec<String>> {
+        let rows = self
+            .store
+            .aql(
+                "FOR u IN @@use_cases FILTER u.state == 'live'
+                   FOR e IN @@expected_by FILTER e._from == u._id RETURN PARSE_IDENTIFIER(e._to).key",
+                json!({}),
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|k| !g.symbols.contains_key(*k))
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Gate, then move the release up one environment.
     pub async fn promote(
         &self,
         release: &str,
@@ -183,13 +246,91 @@ impl EnvironmentAgent<'_> {
         approved: bool,
         by: &str,
     ) -> Result<Value> {
-        let gate = self.gate(release, env, approved).await?;
+        let gate = self.gate_checks(release, env, approved, true).await?;
         if gate["ok"] != json!(true) {
             return Ok(json!({"promoted": false, "gate": gate}));
         }
-        let d = self.store.deploy(release, env, by, gate.clone()).await?;
+        let d = self
+            .store
+            .enter_environment(release, env, by, gate.clone(), "promoted")
+            .await?;
         self.write_env_config(env, release)?;
         Ok(json!({"promoted": true, "gate": gate, "deployment": d}))
+    }
+
+    /// Patch release (spec §16.2): clone `release` at its current environment with `swaps`,
+    /// run that environment's gate on the clone, and on success replace the original there.
+    pub async fn patch(
+        &self,
+        release: &str,
+        swaps: &[Selected],
+        approved: bool,
+        by: &str,
+    ) -> Result<Value> {
+        let env = self
+            .store
+            .release_environment(release)
+            .await?
+            .ok_or_else(|| AgentError::Workflow(format!("{release} is in no environment")))?;
+        let clone = self
+            .store
+            .clone_release(release, &env, swaps, None, by)
+            .await?;
+        let key = clone["_key"].as_str().unwrap_or_default().to_string();
+        let lowest =
+            self.store.env_defs().await?.first().map(|e| e.name.clone()) == Some(env.clone());
+        if lowest {
+            // an open DEV clone: nothing to gate
+            return Ok(
+                json!({"patched": true, "release": key, "environment": env, "gate": Value::Null}),
+            );
+        }
+        let gate = self.gate_checks(&key, &env, approved, false).await?;
+        if gate["ok"] != json!(true) {
+            return Ok(json!({"patched": false, "release": key, "environment": env, "gate": gate}));
+        }
+        let d = self
+            .store
+            .enter_environment(&key, &env, by, gate.clone(), "patch")
+            .await?;
+        self.write_env_config(&env, &key)?;
+        Ok(
+            json!({"patched": true, "release": key, "environment": env, "gate": gate, "deployment": d}),
+        )
+    }
+
+    /// Rollback (spec §16.3): promote the most recently retired release back into `env`,
+    /// through the same gate.
+    pub async fn rollback(&self, env: &str, approved: bool, by: &str) -> Result<Value> {
+        let Some(target) = self.store.rollback_target(env).await? else {
+            return Err(AgentError::Workflow(format!(
+                "{env} has no earlier release to roll back to"
+            )));
+        };
+        let current: Vec<String> = self
+            .store
+            .releases_in(env)
+            .await?
+            .iter()
+            .filter_map(|r| r["release"].as_str().map(str::to_string))
+            .collect();
+        let gate = self.gate_checks(&target, env, approved, false).await?;
+        if gate["ok"] != json!(true) {
+            return Ok(json!({"rolled_back": false, "target": target, "gate": gate}));
+        }
+        let d = self
+            .store
+            .enter_environment(&target, env, by, gate.clone(), "rollback")
+            .await?;
+        self.store.mark_rolled_back_from(env, &target).await?;
+        for c in current {
+            // the release rolled away from is not a rollback target any more
+            self.store.mark_rolled_back_from(env, &c).await?;
+        }
+        self.write_env_config(env, &target)?;
+        Ok(
+            json!({"rolled_back": true, "rolled_back_to": target, "release": target, "gate": gate, "deployment": d}),
+        )
     }
 
     /// Simulated environments: a directory + config file per environment (doc 06).

@@ -4,8 +4,6 @@ import { relTime } from "../lib/health";
 import { Check, Chevron, Diamond, Rocket, Undo, X } from "./icons";
 import { useToast } from "./Toasts";
 
-const ENVS = ["dev", "test", "qa", "prod"];
-
 export function ReleasesDrawer({ releases, environments, onClose }: { releases: Json[]; environments: Json[]; onClose: () => void }) {
   const toast = useToast();
   const [name, setName] = useState("");
@@ -14,12 +12,15 @@ export function ReleasesDrawer({ releases, environments, onClose }: { releases: 
   const [sel, setSel] = useState<string[]>([]);
   const [diff, setDiff] = useState<Json>(null);
   const envBy = new Map(environments.map((e) => [e._key, e]));
+  // environments come from the project's settings (spec §16.1), lowest first
+  const ENVS: string[] = [...environments].sort((a, b) => (a.order ?? 0) - (b.order ?? 0)).map((e) => e._key);
+  const needsHuman = (env: string) => !!envBy.get(env)?.requires_human_approval;
 
   const cut = async () => {
     setBusy("cut");
     try {
       const r = await api.cutRelease(name, "");
-      toast("success", `Cut ${r.name} — running in dev`);
+      toast("success", `Created ${r.name} — open in ${r.environment ?? ENVS[0]}`);
       setName("");
     } catch (e) { toast("error", String((e as Error).message)); } finally { setBusy(null); }
   };
@@ -27,9 +28,9 @@ export function ReleasesDrawer({ releases, environments, onClose }: { releases: 
     setBusy(env);
     try {
       let approval: string | undefined;
-      if (env === "prod") {
-        if (!window.confirm(`Promote ${release} to PROD? This is your human sign-off.`)) { setBusy(null); return; }
-        approval = (await api.approveProd(release)).approval;
+      if (needsHuman(env)) {
+        if (!window.confirm(`Promote ${release} to ${env.toUpperCase()}? This is your human sign-off.`)) { setBusy(null); return; }
+        approval = (await api.approveProd(release, env)).approval;
       }
       const r = await api.promote(env, release, approval);
       setGate(r.gate);
@@ -39,8 +40,22 @@ export function ReleasesDrawer({ releases, environments, onClose }: { releases: 
   const rollback = async (env: string) => {
     setBusy(env);
     try {
-      const r = await api.rollback(env);
-      toast("success", `${env} rolled back to ${r.rolled_back_to}`);
+      let approval: string | undefined;
+      const target = envBy.get(env)?.history?.[0]?.release;
+      if (needsHuman(env) && target) {
+        if (!window.confirm(`Roll ${env.toUpperCase()} back to ${target}? This is your human sign-off.`)) { setBusy(null); return; }
+        approval = (await api.approveProd(target, env)).approval;
+      }
+      const r = await api.rollback(env, approval);
+      toast(r.rolled_back ? "success" : "error", r.rolled_back ? `${env} rolled back to ${r.rolled_back_to}` : `Gate for ${env} failed`);
+      if (r.gate) setGate(r.gate);
+    } catch (e) { toast("error", String((e as Error).message)); } finally { setBusy(null); }
+  };
+  const cloneToDev = async (k: string) => {
+    setBusy(`clone-${k}`);
+    try {
+      const r = await api.cloneRelease(k, ENVS[0]);
+      toast("success", `Cloned ${k} → ${r._key} in ${ENVS[0]}`);
     } catch (e) { toast("error", String((e as Error).message)); } finally { setBusy(null); }
   };
   const toggle = async (k: string) => {
@@ -61,7 +76,7 @@ export function ReleasesDrawer({ releases, environments, onClose }: { releases: 
           <Rocket size={18} />
           <div style={{ flex: 1 }}>
             <div className="drawer-title">Releases & environments</div>
-            <div className="faint" style={{ fontSize: 12 }}>Immutable manifests, promoted through gated environments. Prod needs your sign-off.</div>
+            <div className="faint" style={{ fontSize: 12 }}>Open in {ENVS[0] ?? "dev"}, immutable once promoted, moved through gated environments. {ENVS.filter(needsHuman).join(", ") || "prod"} needs your sign-off.</div>
           </div>
           <button className="btn icon ghost-btn" aria-label="Close" onClick={onClose}><X size={15} /></button>
         </div>
@@ -87,7 +102,8 @@ export function ReleasesDrawer({ releases, environments, onClose }: { releases: 
                       <button className="btn sm" disabled={!!busy} onClick={() => rollback(env)} data-testid={`rollback-${env}`}><Undo size={11} /> Rollback</button>
                     )}
                   </div>
-                  {i < 3 && <span className="arrow"><Chevron size={14} /></span>}
+                  {e?.releases?.length > 1 && <div className="faint" style={{ fontSize: 11 }}>+{e.releases.length - 1} more</div>}
+                  {i < ENVS.length - 1 && <span className="arrow"><Chevron size={14} /></span>}
                 </div>
               );
             })}
@@ -123,10 +139,12 @@ export function ReleasesDrawer({ releases, environments, onClose }: { releases: 
                 <input type="checkbox" checked={sel.includes(r._key)} onChange={() => toggle(r._key)} aria-label={`select ${r.name}`} />
                 <div>
                   <div style={{ fontWeight: 600 }}>{r.name}</div>
-                  <div className="faint" style={{ fontSize: 11.5 }}>{r.symbols} symbols · {relTime(r.created_at)} · <span className="mono">{r._key}</span></div>
+                  <div className="faint" style={{ fontSize: 11.5 }}>{r.symbols} symbols · {relTime(r.created_at)} · <span className="mono">{r._key}</span>{r.cloned_from ? <> · from <span className="mono">{r.cloned_from}</span></> : null}</div>
                 </div>
                 <div className="row" style={{ gap: 4 }}>
+                  <span className={`badge ${r.state === "retired" ? "" : r.state === "open" ? "risk" : "pass"}`} data-testid={`release-state-${r._key}`}>{r.state}</span>
                   {r.running_in?.map((e: string) => <span className="badge pass" key={e}>{e}</span>)}
+                  <button className="btn sm ghost-btn" disabled={!!busy} onClick={() => cloneToDev(r._key)} title={`Clone into ${ENVS[0]}`} data-testid={`clone-${r._key}`}>Clone</button>
                 </div>
               </div>
             ))}

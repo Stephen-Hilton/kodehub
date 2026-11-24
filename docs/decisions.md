@@ -4,6 +4,38 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-045 S4: releases select versions and move through environments
+- **Context:** Spec §16 (as amended in D-042): releases support versions at every level, select
+  them by rule, are open in DEV and immutable once cut, move one environment at a time, can be
+  cloned downward, and get patch releases for bugs found after DEV.
+- **Decision:**
+  - `supports` edges (version → release, `{node}`; unique per release and node) replace
+    `included_in`. The release document still keeps a graph + trace snapshot so gates, runs and
+    bisect are reproducible; `manifest_hash` identifies the content.
+  - Selection rule (stored on the release): `stable` (default) | `newest` | `as_of` | `explicit`,
+    with `filter` (`tags_any`, `tags_all`, `attributes` matched on the node, then the version,
+    `levels`, `nodes`) and `pins`. Filtering code keeps its build closure
+    (`include_dependencies`, default true). Edges of a selected version that differs from the
+    working graph are re-inferred from its own code.
+  - Release keys: `r<N>` (per project). Patch releases: `<source>.<n>` (`r456.1`).
+  - States: `open` (in the lowest environment; reselect / swap / changesets naming it) → `cut`
+    when it first enters a higher environment → `retired` when replaced. A clone into a higher
+    environment is `staged` until it passes that environment's gate.
+  - Environments come from the project's `environments` setting (default dev, test, qa,
+    preprod, prod; preprod and prod `max_releases: 1`, prod needs a human). `in_environment`
+    edges (release → environment, `validFrom`/`validTo`) replace `currently_running`,
+    `previously_ran` and `deployed_to`. Sparse unique indexes on `current_release` and `slot`
+    enforce hard rule 5 in the database; a full environment retires its longest-standing
+    occupant on entry.
+  - Gates by environment: test = build; qa = all tests, trace report, live use cases covered;
+    preprod = smoke run; prod = smoke run + one-time human approval (only humans get one).
+    Promotion is ordered; patch releases and rollback run the gate of the environment they enter.
+  - Patch approvals are bound to the release being patched (the patch does not exist yet).
+  - Rollback re-enters the most recently retired release through the gate and marks both sides
+    so a second rollback walks further back instead of bouncing.
+- **Consequence:** The v0.05 `deploy`/`rollback` store calls are gone; the environment agent owns
+  gating. The UI derives the pipeline from the environments list.
+
 ## D-044 S3: SCD versions at every level, philosophy root, lifecycle
 - **Context:** Spec §5.2 wants node → version edges with `validFrom`/`validTo` at every C4 level,
   candidates that never disturb the live version, plus requirement kinds, inheritance, a

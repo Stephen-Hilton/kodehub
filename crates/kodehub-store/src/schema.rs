@@ -21,8 +21,12 @@ const INDEXES: &[(&str, &[&str], bool, bool)] = &[
     ("has_version", &["stable_of"], true, true),
     ("has_version", &["_from", "seq"], false, false),
     ("has_version", &["changeset"], false, true),
-    // Invariant 5: an environment has at most one currently_running edge.
-    ("currently_running", &["_from"], true, false),
+    // Invariant 5: a release is in at most one environment (`current_release` is set only on
+    // the open edge), and a single-slot environment holds one release (`slot`).
+    ("in_environment", &["current_release"], true, true),
+    ("in_environment", &["slot"], true, true),
+    ("in_environment", &["_to", "validTo"], false, false),
+    ("supports", &["_to", "node"], true, false),
     // Display names are unique per language within a project (pilot simplification).
     ("symbols", &["language", "display_name"], true, false),
     ("test_runs", &["test_version", "closure_hash"], false, false),

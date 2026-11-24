@@ -196,10 +196,9 @@ pub const EDGE_COLLECTIONS: &[&str] = &[
     "compiles_to",
     "exposes",
     "proposes",
-    "included_in",
-    "deployed_to",
-    "currently_running",
-    "previously_ran",
+    "supports",
+    "in_environment",
+    "cloned_from",
     "relates_to",
     "expected_by",
     "built_from",
@@ -209,7 +208,8 @@ pub const EDGE_COLLECTIONS: &[&str] = &[
 pub const IMMUTABLE_COLLECTIONS: &[&str] =
     &["versions", "c4_versions", "releases", "test_runs", "runs"];
 
-pub const ENVIRONMENTS: &[&str] = &["dev", "test", "qa", "prod"];
+/// Default environments, lowest first (the `environments` setting may change them).
+pub const ENVIRONMENTS: &[&str] = &["dev", "test", "qa", "preprod", "prod"];
 
 /// Changeset states (doc 04).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

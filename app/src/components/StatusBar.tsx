@@ -14,7 +14,7 @@ export function StatusBar({ environment, setEnvironment, environments, settings,
         <select className="select" value={environment} onChange={(e) => setEnvironment(e.target.value)} data-testid="env-select">
           {(environments.length ? environments : [{ _key: "dev" }]).map((e: Json) => (
             <option key={e._key} value={e._key}>
-              {e._key}{e._key === "dev" ? " · working state" : e.currently_running ? ` · ${e.currently_running.name}` : " · nothing deployed"}
+              {e._key}{e.order === 0 ? " · working state" : e.currently_running ? ` · ${e.currently_running.name}` : " · nothing deployed"}
             </option>
           ))}
         </select>

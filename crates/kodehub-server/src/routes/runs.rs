@@ -72,12 +72,14 @@ pub struct RunBody {
     pub token: Option<String>,
 }
 
-/// The code graph an environment runs: dev = current working state; others = their release.
+/// The code graph an environment runs: the lowest environment (dev) = the stable working
+/// graph; others = their most recently entered release.
 pub async fn graph_for_env(
     s: &AppState,
     env: &str,
 ) -> Result<(CodeGraph, Option<String>), ApiError> {
-    if env == "dev" {
+    let lowest = s.store.env_defs().await?.first().map(|e| e.name.clone());
+    if lowest.as_deref() == Some(env) || env == "dev" {
         return Ok((s.store.load_code_graph().await?, None));
     }
     match s.store.release_graph_for_env(env).await? {

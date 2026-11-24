@@ -994,6 +994,18 @@ impl Store {
         match finish {
             Ok(()) => {
                 self.db.commit(&trx).await?;
+                // named open releases move to the promoted versions (spec §5.8)
+                let swaps: Vec<crate::releases::Selected> = merged
+                    .iter()
+                    .map(|(k, v)| crate::releases::code_swap(k, v))
+                    .collect();
+                for r in cs["releases"].as_array().cloned().unwrap_or_default() {
+                    if let Some(r) = r.as_str() {
+                        if let Err(e) = self.swap_release_versions(r, &swaps, by).await {
+                            tracing::warn!("changeset {key}: release {r} not updated: {e}");
+                        }
+                    }
+                }
                 Ok(checks)
             }
             Err(e) => {

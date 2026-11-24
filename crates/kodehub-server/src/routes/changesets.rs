@@ -31,6 +31,9 @@ pub struct OpenBody {
     pub requirements: Vec<String>,
     #[serde(default)]
     pub by: Option<String>,
+    /// Open releases whose versions this changeset should move on merge (spec §5.8).
+    #[serde(default)]
+    pub releases: Vec<String>,
 }
 
 pub async fn open(State(s): State<AppState>, Json(b): Json<OpenBody>) -> ApiResult<Value> {
@@ -46,6 +49,25 @@ pub async fn open(State(s): State<AppState>, Json(b): Json<OpenBody>) -> ApiResu
             b.by.as_deref().unwrap_or("human"),
         )
         .await?;
+    let cs = if b.releases.is_empty() {
+        cs
+    } else {
+        for r in &b.releases {
+            let rel = s.store.get_release(r).await?;
+            if rel["state"] != "open" {
+                return Err(ApiError::bad_request(format!(
+                    "release {r} is {}; a changeset can only target open releases",
+                    rel["state"].as_str().unwrap_or("cut")
+                )));
+            }
+        }
+        s.store
+            .patch_changeset(
+                cs["_key"].as_str().unwrap_or_default(),
+                json!({"releases": b.releases}),
+            )
+            .await?
+    };
     s.events.emit(
         "changeset.updated",
         json!({"key": cs["_key"], "state": "draft"}),
