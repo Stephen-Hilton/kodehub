@@ -7,6 +7,7 @@ pub mod changesets;
 pub mod graph;
 pub mod identity;
 pub mod project_init;
+pub mod queue;
 pub mod releases;
 pub mod requirements;
 pub mod runs;
@@ -79,6 +80,23 @@ pub fn api() -> Router<AppState> {
         )
         .route("/api/credentials/{id}", delete(identity::delete_credential))
         .route("/api/audit", get(identity::audit))
+        // work queue, schedules, triggers, intents, spend
+        .route("/api/work-items", get(queue::list).post(queue::create))
+        .route("/api/work-items/{key}", get(queue::get))
+        .route("/api/work-items/{key}/cancel", post(queue::cancel))
+        .route("/api/queue/stats", get(queue::stats))
+        .route(
+            "/api/schedules",
+            get(queue::schedules).post(queue::create_schedule),
+        )
+        .route("/api/schedules/replan", post(queue::replan))
+        .route(
+            "/api/schedules/{key}/enabled",
+            post(queue::schedule_enabled),
+        )
+        .route("/api/test-now", post(queue::test_now))
+        .route("/api/intents", get(queue::intents))
+        .route("/api/spend", get(queue::spend))
         .route("/api/events", get(crate::events::ws_events))
         // generic graph access
         .route("/api/node", get(graph::get_node))

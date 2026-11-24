@@ -1006,6 +1006,17 @@ impl Store {
                         }
                     }
                 }
+                // code tests run as soon as a version lands (spec §11.3)
+                if let Some(project) = self.project_id() {
+                    for sym in merged.keys() {
+                        if let Err(e) = self
+                            .trigger(&project, "version_landed", &format!("symbols/{sym}"), by)
+                            .await
+                        {
+                            tracing::warn!("changeset {key}: no test trigger for {sym}: {e}");
+                        }
+                    }
+                }
                 Ok(checks)
             }
             Err(e) => {

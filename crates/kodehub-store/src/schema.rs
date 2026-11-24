@@ -61,6 +61,10 @@ pub fn global_document_collections() -> Vec<&'static str> {
         crate::settings::SETTINGS,
         crate::credentials::CREDENTIALS,
         crate::audit::AUDIT,
+        crate::queue::WORK_ITEMS,
+        crate::schedules::SCHEDULES,
+        crate::schedules::TRIGGERS,
+        crate::metering::USAGE,
     ];
     v.extend(crate::identity::IDENTITY_DOCS);
     v
@@ -74,6 +78,12 @@ const GLOBAL_INDEXES: &[(&str, &[&str], bool, bool)] = &[
     ("kodehub_member_of", &["_from", "_to"], true, false),
     ("kodehub_acts_for", &["_from"], true, false),
     ("kodehub_tokens", &["user"], false, false),
+    ("kodehub_work_items", &["state", "priority"], false, false),
+    ("kodehub_work_items", &["project", "state"], false, false),
+    ("kodehub_schedules", &["enabled", "next_due"], false, false),
+    ("kodehub_schedules", &["project"], false, false),
+    ("kodehub_triggers", &["state"], false, false),
+    ("kodehub_usage", &["project"], false, false),
 ];
 
 /// Create the database and the global collections (registry, identity, settings, audit).

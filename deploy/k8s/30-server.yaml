@@ -1,0 +1,76 @@
+# API + orchestrator (spec §3.1). Stateless apart from the build cache volume; every state
+# change is written to ArangoDB.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: kodehub-orchestrator, namespace: kodehub }
+---
+# The orchestrator creates build / test / agent / git Jobs (S7, S8).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: kodehub-orchestrator, namespace: kodehub }
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: kodehub-orchestrator, namespace: kodehub }
+subjects: [{ kind: ServiceAccount, name: kodehub-orchestrator, namespace: kodehub }]
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: kodehub-orchestrator }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: kodehub-server, namespace: kodehub }
+spec:
+  type: NodePort
+  selector: { app: kodehub-server }
+  ports: [{ name: http, port: 7878, targetPort: 7878, nodePort: 30878 }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: server-data, namespace: kodehub }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 10Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: kodehub-server, namespace: kodehub }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: kodehub-server } }
+  template:
+    metadata: { labels: { app: kodehub-server } }
+    spec:
+      serviceAccountName: kodehub-orchestrator
+      securityContext: { fsGroup: 10001 }
+      containers:
+        - name: server
+          image: kodehub/kodehub:dev
+          imagePullPolicy: Never
+          env:
+            - { name: KODEHUB_ARANGO_URL, value: "http://arangodb:8529" }
+            - name: KODEHUB_ARANGO_PASSWORD
+              valueFrom: { secretKeyRef: { name: kodehub-secrets, key: arango-password } }
+            - name: KODEHUB_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: kodehub-secrets, key: secret-key } }
+            - { name: KODEHUB_STORAGE_URL, value: "http://storage:9000" }
+            - name: KODEHUB_STORAGE_TOKEN
+              valueFrom: { secretKeyRef: { name: kodehub-secrets, key: storage-token } }
+            - { name: KODEHUB_ALLOWED_HOSTS, value: "kodehub-server,kodehub-server.kodehub,kodehub-server.kodehub.svc" }
+            - { name: KODEHUB_UI_ORIGINS, value: "http://127.0.0.1:17878,http://localhost:17878" }
+            - { name: KODEHUB_RUNTIME, value: kubernetes }
+            - { name: KODEHUB_NAMESPACE, value: kodehub }
+          ports: [{ containerPort: 7878 }]
+          readinessProbe: { httpGet: { path: /health, port: 7878 }, periodSeconds: 2, failureThreshold: 60 }
+          resources: { requests: { cpu: 100m, memory: 256Mi } }
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes: [{ name: data, persistentVolumeClaim: { claimName: server-data } }]

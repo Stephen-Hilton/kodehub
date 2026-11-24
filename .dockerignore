@@ -1,0 +1,7 @@
+target
+.kode
+.git
+app/node_modules
+app/src-tauri/target
+app/test-results
+**/*.tmp.mjs

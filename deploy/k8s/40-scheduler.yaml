@@ -1,0 +1,26 @@
+# Scheduler (spec §3.3): a thin container, two replicas; the claim-and-lease protocol makes
+# every due run fire once.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: kodehub-scheduler, namespace: kodehub }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: kodehub-scheduler } }
+  template:
+    metadata: { labels: { app: kodehub-scheduler } }
+    spec:
+      containers:
+        - name: scheduler
+          image: kodehub/kodehub:dev
+          imagePullPolicy: Never
+          command: ["kodehub-scheduler"]
+          env:
+            - { name: KODEHUB_ARANGO_URL, value: "http://arangodb:8529" }
+            - name: KODEHUB_ARANGO_PASSWORD
+              valueFrom: { secretKeyRef: { name: kodehub-secrets, key: arango-password } }
+            - { name: KODEHUB_SCHEDULER_TICK_SECS, value: "15" }
+          ports: [{ containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /health, port: 8080 }, periodSeconds: 5 }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 128Mi }

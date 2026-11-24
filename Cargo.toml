@@ -14,6 +14,7 @@ kodehub-store = { path = "crates/kodehub-store" }
 kodehub-render = { path = "crates/kodehub-render" }
 kodehub-runner = { path = "crates/kodehub-runner" }
 kodehub-agents = { path = "crates/kodehub-agents" }
+kodehub-storage = { path = "crates/kodehub-storage" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -40,6 +41,10 @@ libc = "0.2"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 rand = "0.8"
+tar = "0.4"
+rusty-s3 = "0.7"
+bytes = "1"
+url = "2"
 
 [profile.dev.package."*"]
 opt-level = 1

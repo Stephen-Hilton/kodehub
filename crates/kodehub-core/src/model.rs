@@ -177,6 +177,9 @@ pub const DOCUMENT_COLLECTIONS: &[&str] = &[
     "use_cases",
     "c4_versions",
     "change_logs",
+    "intents",
+    "negotiations",
+    "test_container_types",
 ];
 
 /// All edge collections (doc 02).

@@ -4,6 +4,63 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-047 S6: one claim-and-lease protocol, work queue, scheduler, intents
+- **Context:** Spec §3.3, §4.4, §4.5, §5.7, §10, §11.3, §12.2.
+- **Decision:**
+  - The claim step is a single AQL `UPDATE … OPTIONS {ignoreRevs: false}` filtered on the
+    document's `_rev` and claimability; a competing replica gets a revision conflict (1200) and
+    skips. Leases expire (`lease_expires`); expired claims are claimable again. The same protocol
+    claims work items, schedules and triggers.
+  - Work items, schedules, triggers and usage are **global** collections with a `project` field,
+    so one query serves every project and every replica. Intents and negotiations live in the
+    project's own collections.
+  - Caps: per project and agent type from `agent_caps`, plus an optional
+    `agent_caps_hard_limit`; container work (`build`, `test_run`, `git_*`) is uncapped. A project
+    at its `budget_usd` claims nothing new; running items finish.
+  - Failure: the item is closed and a fresh high-priority item carries the full history. When
+    `retry_count` reaches `retry_limit` (default 3) the follow-up is an architect item
+    (`resolve_hard_failure`). Combined (absorbed) items follow the retry and count once.
+  - Overlap = Jaccard over intent nodes; ≥ `overlap_absorb_threshold` absorbs into the older
+    item, smaller overlap re-queues the newer item behind the older (`depends_on`), and a
+    shared-end-state intent opens a negotiation; after `negotiation_rounds` per side without
+    agreement an architect item decides.
+  - `kodehub-scheduler` is its own crate and container (two replicas, 16 MiB request). Each tick
+    it rebuilds the default cadence from `test_cadence` and node lifecycles (only ready-for-test
+    or live nodes; the daily project run always, and it cannot be disabled), then fires due
+    schedules and triggers as `test_run` work items. Offsets per node spread runs over the
+    interval; `next_due` = actual run + interval. A merge records a `version_landed` trigger per
+    promoted symbol; *Test now* records a `test_now` trigger.
+- **Consequence:** `test_run` items queue up until S7's orchestrator worker runs them in test
+  containers.
+
+## D-046 S5: Kind, one server-side image, the storage service
+- **Context:** Spec §3: everything on Kubernetes (Kind on a laptop), including the test
+  framework; a storage service with local / cloud / hybrid modes and per-project backups.
+- **Decision:**
+  - Kind cluster `kodehub` (`deploy/kind/cluster.yaml`), host ports 18529 (ArangoDB), 17878
+    (server + UI), 19000 (storage) — 8529/7878 are often taken on a developer machine. The
+    developer's current kubectl context is restored after cluster creation.
+  - Images are built locally and imported into the node with `ctr images import` (`kind load`
+    fails on single-platform pulls of multi-arch images). Pilot: **one** server-side image
+    `kodehub/kodehub:dev` holds every binary (server, scheduler, storage, worker, CLI) plus the
+    Rust and Python toolchains; the agent image (S8) and the test images (S7) are separate.
+  - Secrets (ArangoDB password, `KODEHUB_SECRET_KEY`, storage token) are generated once into
+    `.kode/k8s-secrets.env` (git-ignored) and applied as the `kodehub-secrets` Secret.
+  - `make check` now runs integration tests against ArangoDB **in Kind** and ends with
+    `k8s-check` (image build, deploy, smoke: health, a storage round trip, UI served, API
+    requires a token, scheduler ready). `make dev` keeps a host server against the Kind DB for a
+    fast loop; `make up` runs everything in the cluster.
+  - The MinIO images are not pullable here, so `kodehub-storage` serves S3 path-style objects
+    itself (PUT/GET/HEAD/DELETE, ListObjectsV2 XML) with a bearer token instead of SigV4.
+    `cloud` and `hybrid` use an upstream that is real S3 (SigV4 presigned requests via
+    `rusty-s3`) or another `kodehub-storage` (bearer). Backups: per project (objects under
+    `projects/<p>/`), first a full tar bundle, then incremental bundles with deletions;
+    restore applies from the last full bundle and touches only that project.
+  - `/health` is exempt from the Host check (kubelet probes by pod IP); in-cluster service names
+    are allowed through `KODEHUB_ALLOWED_HOSTS`.
+- **Consequence:** `docker-compose.yml` is obsolete but still in the tree (a tool safety check
+  blocked its removal; delete it by hand). The ArangoDB database's own off-site backup is S9.
+
 ## D-045 S4: releases select versions and move through environments
 - **Context:** Spec §16 (as amended in D-042): releases support versions at every level, select
   them by rule, are open in DEV and immutable once cut, move one environment at a time, can be

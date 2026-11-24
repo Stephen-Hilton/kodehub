@@ -88,7 +88,22 @@ pub fn origin_allowed(allowed: &[String], origin: &str) -> bool {
     allowed.iter().any(|a| a == o)
 }
 
-/// Only loopback Host headers are served (defeats DNS rebinding).
+/// Extra Host names to serve (`KODEHUB_ALLOWED_HOSTS`, comma-separated): in-cluster service
+/// names such as `kodehub-server`.
+fn extra_hosts() -> &'static Vec<String> {
+    static H: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        std::env::var("KODEHUB_ALLOWED_HOSTS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+/// Only loopback Host headers (and configured service names) are served (defeats DNS
+/// rebinding).
 pub fn host_allowed(host: &str) -> bool {
     let h = if host.starts_with('[') {
         host.split(']')
@@ -99,6 +114,7 @@ pub fn host_allowed(host: &str) -> bool {
         host.split(':').next().unwrap_or("").to_string()
     };
     matches!(h.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+        || extra_hosts().iter().any(|x| *x == h.to_ascii_lowercase())
 }
 
 /// True when the request carries the per-launch UI secret (`x-kodehub-ui` header, or `ui=`
@@ -150,12 +166,14 @@ async fn origin_guard(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    // liveness/readiness probes come by pod IP; health reveals nothing and changes nothing
+    let probe = req.method() == axum::http::Method::GET && req.uri().path() == "/health";
     if let Some(h) = req
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
     {
-        if !host_allowed(h) {
+        if !probe && !host_allowed(h) {
             return (axum::http::StatusCode::FORBIDDEN, "host not allowed").into_response();
         }
     }
