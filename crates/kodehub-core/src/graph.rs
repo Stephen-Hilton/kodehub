@@ -87,7 +87,7 @@ impl CodeGraph {
 
     /// Build closure of `roots`: every symbol reachable over build-dependency edges, each resolved
     /// to its current version or the version pinned by the edge that reached it. When
-    /// `include_tests` is set, `tested_by` edges are followed too (test builds).
+    /// `include_tests` is set, `tested_with` edges are followed too (test builds).
     pub fn closure(
         &self,
         roots: &[String],
@@ -115,7 +115,7 @@ impl CodeGraph {
             resolved.insert(id.clone(), version);
             for e in self.out_edges(&id) {
                 let follow = e.kind.is_build_dependency()
-                    || (include_tests && e.kind == CodeEdgeKind::TestedBy);
+                    || (include_tests && e.kind == CodeEdgeKind::TestedWith);
                 if follow {
                     queue.push_back((e.to.clone(), e.pinned_version.clone()));
                 }
@@ -239,7 +239,7 @@ impl CodeGraph {
         seen
     }
 
-    /// Tests affected by a change to `id`: test-kind dependents, `tested_by` targets, and `id`
+    /// Tests affected by a change to `id`: test-kind dependents, `tested_with` targets, and `id`
     /// itself if it is a test.
     pub fn tests_reaching(&self, id: &str) -> BTreeSet<String> {
         let mut out: BTreeSet<String> = self
@@ -253,7 +253,7 @@ impl CodeGraph {
             })
             .collect();
         for e in self.out_edges(id) {
-            if e.kind == CodeEdgeKind::TestedBy {
+            if e.kind == CodeEdgeKind::TestedWith {
                 out.insert(e.to.clone());
             }
         }

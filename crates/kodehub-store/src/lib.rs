@@ -1,11 +1,12 @@
 //! ArangoDB-backed graph store. The only crate that talks to the database.
 
+pub mod agents;
 pub mod arango;
 pub mod audit;
 pub mod backups;
 pub mod c4;
-pub mod changesets;
 pub mod credentials;
+pub mod deploy;
 pub mod governance;
 pub mod identity;
 pub mod import;
@@ -13,9 +14,9 @@ pub mod intents;
 pub mod metering;
 pub mod oauth;
 pub mod projects;
+pub mod proposals;
 pub mod queries;
 pub mod queue;
-pub mod releases;
 pub mod schedules;
 pub mod schema;
 pub mod seed;
@@ -23,6 +24,7 @@ pub mod settings;
 pub mod store;
 pub mod test_types;
 pub mod testutil;
+pub mod tree;
 
 pub use arango::{request_project, spawn_scoped, with_project, Arango, ArangoConfig};
 pub use identity::{Owner, Permission, Principal};

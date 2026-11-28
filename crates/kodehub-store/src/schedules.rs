@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use crate::queue::{NewWorkItem, PRIORITY_HIGH, PRIORITY_NORMAL};
 use crate::{Result, Store, StoreError};
 
-pub const SCHEDULES: &str = "kodehub_schedules";
-pub const TRIGGERS: &str = "kodehub_triggers";
+pub const SCHEDULES: &str = "schedules";
+pub const TRIGGERS: &str = "schedule_triggers";
 
 fn ts(t: chrono::DateTime<chrono::Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -39,8 +39,12 @@ pub fn spread_offset(key: &str, interval_secs: i64) -> i64 {
     (n % interval_secs as u64) as i64
 }
 
+/// Schedules are project-scoped (docs/ontology.md): `<project>.<hash of the target>`.
 fn schedule_key(project: &str, target: &str) -> String {
-    blake3::hash(format!("{project}|{target}").as_bytes()).to_hex()[..24].to_string()
+    crate::arango::qualify(
+        project,
+        &blake3::hash(format!("{project}|{target}").as_bytes()).to_hex()[..24],
+    )
 }
 
 impl Store {
@@ -104,14 +108,25 @@ impl Store {
             "always": level == "project", "action": action, "task": task,
             "updated_at": now_iso(),
         });
-        self.db
-            .db_raw(
-                reqwest::Method::POST,
-                &format!("/_api/document/{SCHEDULES}?overwriteMode=replace&returnNew=true"),
-                Some(&doc),
+        let ps = self.for_project(project);
+        ps.db.upsert(SCHEDULES, &doc, None).await?;
+        // what the schedule acts on (`targets`), and the project owns it
+        let sid = format!("{SCHEDULES}/{key}");
+        let target_id = if target.contains('/') {
+            ps.db.qid(target)?
+        } else {
+            crate::c4::project_node_of(project)
+        };
+        ps.own(&sid).await?;
+        ps.db
+            .insert_ignore(
+                "targets",
+                &json!({"_key": crate::edge_key("targets", &sid, &target_id),
+                        "_from": sid, "_to": target_id}),
+                None,
             )
-            .await
-            .map(|v| v["new"].clone())
+            .await?;
+        ps.db.get(SCHEDULES, &key, None).await
     }
 
     pub async fn list_schedules(&self, project: &str) -> Result<Vec<Value>> {
@@ -262,7 +277,7 @@ impl Store {
         let ps = self.for_project(project);
         let cost = ps
             .aql(
-                "RETURN AVG(FOR r IN @@test_runs FILTER r.formal == true SORT r.ran_at DESC LIMIT 200 RETURN r.duration_ms)",
+                "RETURN AVG(FOR r IN @@test_logs FILTER r.formal == true AND r.kind != 'run' SORT r.ran_at DESC LIMIT 200 RETURN r.duration_ms)",
                 json!({}),
             )
             .await?
@@ -272,7 +287,9 @@ impl Store {
             .unwrap_or(60.0);
         let counts = ps
             .aql(
-                "RETURN {components: LENGTH(@@components), containers: LENGTH(@@containers), contexts: LENGTH(@@contexts)}",
+                "RETURN {components: COUNT(FOR x IN @@components RETURN 1),
+                         containers: COUNT(FOR x IN @@containers RETURN 1),
+                         contexts: COUNT(FOR x IN @@contexts RETURN 1)}",
                 json!({}),
             )
             .await?

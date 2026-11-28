@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 const VC_BODY: &str = "match store.find_user(username) {\n    Some(user) if verify_password(password, &user.password_hash) => {\n        AuthResult::Authenticated {\n            username: user.username,\n        }\n    }\n    _ => AuthResult::InvalidCredentials,\n}";
 
 async fn state_of(t: &TestServer, k: &str) -> Value {
-    t.ok("GET", &format!("/api/changesets/{k}"), None).await
+    t.ok("GET", &format!("/api/work-items/{k}/proposal"), None)
+        .await
 }
 
 async fn wait(t: &TestServer, k: &str, want: &str) -> Value {
@@ -77,7 +78,7 @@ async fn coder_cannot_touch_tests_and_out_of_plan_changes_need_reapproval() {
     let mut k = String::new();
     for _ in 0..80 {
         if let Some(c) = t
-            .ok("GET", "/api/changesets?open=true", None)
+            .ok("GET", "/api/proposals?open=true", None)
             .await
             .as_array()
             .unwrap()
@@ -90,8 +91,12 @@ async fn coder_cannot_touch_tests_and_out_of_plan_changes_need_reapproval() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     assert!(!k.is_empty());
-    t.uok("POST", &format!("/api/changesets/{k}/approve"), None)
-        .await;
+    t.uok(
+        "POST",
+        &format!("/api/work-items/{k}/proposal/approve"),
+        None,
+    )
+    .await;
 
     // the coder touched hash_password outside the plan → back to planned for re-approval
     for _ in 0..120 {
@@ -110,19 +115,25 @@ async fn coder_cannot_touch_tests_and_out_of_plan_changes_need_reapproval() {
         .any(|c| c["out_of_plan"] == true && c["display_name"] == "hash_password"));
     // the test rewrite was refused: no proposal touches the existing test
     assert!(cs["proposals"]
-        .get("test_wrong_password_is_invalid")
+        .get(t.q("test_wrong_password_is_invalid"))
         .is_none());
     assert!(cs["activity"]
         .to_string()
         .contains("Refused coder changes to tests"));
 
-    // human re-approves → straight to review (proposals unchanged) → tests → merge
-    t.uok("POST", &format!("/api/changesets/{k}/approve"), None)
-        .await;
-    let done = wait(&t, &k, "merged").await;
-    assert!(done["merged_versions"].get("hash_password").is_some());
+    // human re-approves → straight to review (proposals unchanged) → tests → acceptance
+    t.uok(
+        "POST",
+        &format!("/api/work-items/{k}/proposal/approve"),
+        None,
+    )
+    .await;
+    let done = wait(&t, &k, "accepted").await;
+    assert!(done["accepted_versions"]
+        .get(t.q("hash_password"))
+        .is_some());
     assert_eq!(backend.remaining(), 0);
-    // R1's new edge case is covered by the merged test → green
+    // R1's new edge case is covered by the accepted test → green
     let cov = t
         .ok("GET", "/api/coverage?requirement=r1-generic-failure", None)
         .await;

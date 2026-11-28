@@ -160,7 +160,7 @@ async fn import_maps_functions_export_round_trips_backups_restore() {
     fixture_repo(src.path());
     let url = format!("file://{}", src.path().display());
 
-    // import: the container parses, the import agent maps, the changeset promotes
+    // import: the container parses, the import agent maps, its work item's proposal is accepted
     t.ok("POST", "/api/git/import", Some(json!({"repo_url": url})))
         .await;
     assert!(o.tick().await.unwrap());
@@ -189,7 +189,8 @@ async fn import_maps_functions_export_round_trips_backups_restore() {
     let syms: Vec<String> = t
         .store
         .aql(
-            "FOR s IN @@symbols SORT s.display_name RETURN s.display_name",
+            "FOR s IN UNION((FOR x IN @@code RETURN x), (FOR x IN @@tests RETURN x))
+               SORT s.display_name RETURN s.display_name",
             json!({}),
         )
         .await
@@ -217,12 +218,11 @@ async fn import_maps_functions_export_round_trips_backups_restore() {
             .any(|s| s.ends_with(".rs") || s.ends_with(".py")),
         "{syms:?}"
     );
-    let d_body = t
-        .store
-        .aql("FOR s IN @@symbols FILTER s.display_name == 'double' FOR e IN @@has_version FILTER e._from == s._id AND e.state == 'stable' RETURN DOCUMENT(e._to).body", json!({}))
-        .await
-        .unwrap();
-    assert_eq!(d_body[0], "helper(x) * 2");
+    // the imported code is in the current project version
+    let dbl = t.ok("GET", "/api/symbols/double", None).await;
+    assert_eq!(dbl["version"]["body"], "helper(x) * 2");
+    let tree = t.store.tree(None).await.unwrap();
+    assert!(tree.version(dbl["node"].as_str().unwrap()).is_some());
     // the C4 mapping, a generated requirement per component, no orphans, opaque JS kept aside
     for n in [
         "contexts/demo",
@@ -236,7 +236,7 @@ async fn import_maps_functions_export_round_trips_backups_restore() {
     let opaque = t
         .store
         .aql(
-            "FOR u IN @@import_units FILTER u.state == 'opaque' RETURN u.file",
+            "FOR u IN @@import_staging FILTER u.state == 'opaque' RETURN u.file",
             json!({}),
         )
         .await
@@ -245,7 +245,7 @@ async fn import_maps_functions_export_round_trips_backups_restore() {
     assert!(t.ok("GET", "/api/invariants", None).await["ok"] == true);
     // importing the same repository again is a reverse sync: refused
     let (s, _) = t
-        .req("POST", "/api/git/import", Some(json!({"repo_url": url})))
+        .ui("POST", "/api/git/import", Some(json!({"repo_url": url})))
         .await;
     assert_eq!(s, 409);
 
@@ -327,7 +327,7 @@ async fn import_maps_functions_export_round_trips_backups_restore() {
     let staged = t
         .store
         .for_project(&p3)
-        .aql("FOR u IN @@import_units RETURN u.name", json!({}))
+        .aql("FOR u IN @@import_staging RETURN u.name", json!({}))
         .await
         .unwrap();
     assert!(
@@ -356,7 +356,16 @@ async fn import_maps_functions_export_round_trips_backups_restore() {
     let p4 = r["project"].as_str().unwrap().to_string();
     let count = |p: &str| {
         let s = t.store.for_project(p);
-        async move { s.aql("RETURN LENGTH(@@symbols)", json!({})).await.unwrap()[0].clone() }
+        async move {
+            s.aql(
+                "RETURN [COUNT(FOR x IN @@code RETURN 1), COUNT(FOR x IN @@tests RETURN 1),
+                         COUNT(FOR x IN @@code_versions RETURN 1), COUNT(FOR x IN @@contains RETURN 1)]",
+                json!({}),
+            )
+                .await
+                .unwrap()[0]
+                .clone()
+        }
     };
     assert_eq!(count(&p4).await, count(&p2).await);
     assert!(t

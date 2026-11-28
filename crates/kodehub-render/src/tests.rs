@@ -122,7 +122,7 @@ fn sample() -> CodeGraph {
     edge(&mut g, "Counter-bump", "Counter", CodeEdgeKind::MemberOf);
     edge(&mut g, "quad", "double", CodeEdgeKind::Calls);
     edge(&mut g, "test_quad", "quad", CodeEdgeKind::Calls);
-    edge(&mut g, "quad", "test_quad", CodeEdgeKind::TestedBy);
+    edge(&mut g, "quad", "test_quad", CodeEdgeKind::TestedWith);
     edge(&mut g, "py-test_greet", "py-greet", CodeEdgeKind::Calls);
     g
 }

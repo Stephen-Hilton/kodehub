@@ -73,27 +73,41 @@ async fn containers_build_once_test_many_and_rework_new_failures() {
     assert_eq!(r1["failed"], 0, "{r1}");
     assert_eq!(r1["bundles_built"], 2);
     assert_eq!(r1["runtime"], "local");
-    // the bundles are in storage, keyed by closure; artifact nodes link to the test versions
+    // the bundles are in storage, keyed by closure; build nodes link (`build_of`) to the
+    // versions they were built from: every test and everything in the tests' closures
     let arts = t
         .store
         .aql(
-            "FOR a IN @@artifacts FILTER a.storage_key != null RETURN a",
+            "FOR a IN @@builds FILTER a.storage_key != null RETURN a",
             json!({}),
         )
         .await
         .unwrap();
     assert_eq!(arts.len(), 2);
+    assert!(arts.iter().all(|a| a["closure_hash"].is_string()));
     let links = t
         .store
-        .aql("RETURN LENGTH(@@built_from)", json!({}))
+        .aql(
+            "RETURN COUNT(FOR x IN @@build_of FILTER STARTS_WITH(x._to, 'test_versions/') RETURN 1)",
+            json!({}),
+        )
         .await
         .unwrap();
     assert_eq!(links[0], 9);
+    let code_links = t
+        .store
+        .aql(
+            "RETURN COUNT(FOR x IN @@build_of FILTER STARTS_WITH(x._to, 'code_versions/') RETURN 1)",
+            json!({}),
+        )
+        .await
+        .unwrap();
+    assert!(code_links[0].as_u64().unwrap() > 0);
     // formal runs are recorded
     let formal = t
         .store
         .aql(
-            "FOR r IN @@test_runs FILTER r.formal == true RETURN r",
+            "FOR r IN @@test_logs FILTER r.formal == true AND r.kind == 'test' RETURN r",
             json!({}),
         )
         .await
@@ -148,24 +162,24 @@ async fn containers_build_once_test_many_and_rework_new_failures() {
         "already failing: not new"
     );
 
-    // baseline: a changeset that does not fix the helper is not blamed for its failures
+    // baseline: a proposal that does not fix the helper is not blamed for its failures
     let cs = t
         .ok(
             "POST",
-            "/api/changesets",
+            "/api/proposals",
             Some(json!({"title": "tweak", "intent": "x"})),
         )
         .await;
     let k = cs["_key"].as_str().unwrap().to_string();
     let vc = t.ok("GET", "/api/symbols/verify_credentials", None).await;
-    t.ok("POST", &format!("/api/changesets/{k}/versions"), Some(json!({
+    t.ok("POST", &format!("/api/work-items/{k}/proposal/versions"), Some(json!({
         "symbol": "verify_credentials",
         "signature": vc["version"]["signature"], "body": format!("// tweak\n{}", vc["version"]["body"].as_str().unwrap()),
     }))).await;
-    t.ok("POST", &format!("/api/changesets/{k}/test"), None)
+    t.ok("POST", &format!("/api/work-items/{k}/proposal/test"), None)
         .await;
     let checks = t
-        .ok("GET", &format!("/api/changesets/{k}/checks"), None)
+        .ok("GET", &format!("/api/work-items/{k}/proposal/checks"), None)
         .await["checks"]
         .clone();
     let pre = checks["preexisting_failures"].as_array().unwrap();

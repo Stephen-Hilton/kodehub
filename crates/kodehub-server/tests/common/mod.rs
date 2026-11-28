@@ -36,6 +36,16 @@ pub struct TestServer {
 }
 
 impl TestServer {
+    /// A key or id qualified for the store's active project (`x` → `<project>.x`,
+    /// `symbols/x` → `symbols/<project>.x`).
+    pub fn q(&self, x: &str) -> String {
+        if x.contains('/') {
+            self.store.db.qid(x).unwrap()
+        } else {
+            self.store.db.pkey(x).unwrap()
+        }
+    }
+
     pub async fn start(prefix: &str) -> TestServer {
         Self::start_with(prefix, |_, _| {}).await
     }
@@ -165,7 +175,13 @@ impl TestServer {
         v
     }
 
+    /// A call that must succeed, made by the remote agent when it may (D-061), otherwise by the
+    /// signed-in human (code, builds and deploys are never a remote agent's).
     pub async fn ok(&self, method: &str, path: &str, body: Option<Value>) -> Value {
+        let bare = path.split('?').next().unwrap_or(path);
+        if method != "GET" && !kodehub_server::auth::remote_agent_may_write(bare) {
+            return self.uok(method, path, body).await;
+        }
         let (s, v) = self.req(method, path, body).await;
         assert!((200..300).contains(&s), "{method} {path} → {s}: {v}");
         v

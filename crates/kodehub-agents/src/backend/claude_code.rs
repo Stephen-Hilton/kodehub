@@ -51,8 +51,8 @@ impl ClaudeCodeBackend {
             "--tools".into(),
             task.role.tools().join(","),
         ];
-        if let Some(cs) = &task.changeset {
-            mcp_args.push("--changeset".into());
+        if let Some(cs) = &task.work_item {
+            mcp_args.push("--work-item".into());
             mcp_args.push(cs.clone());
         }
         let mcp =

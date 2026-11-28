@@ -48,7 +48,7 @@ pub struct RenderRequest<'a> {
     pub graph: &'a CodeGraph,
     pub roots: Vec<String>,
     pub language: Language,
-    /// Follow `tested_by` edges from roots (test builds of code roots).
+    /// Follow `tested_with` edges from roots (test builds of code roots).
     pub include_tests: bool,
     pub namespaces: Vec<NamespaceSpec>,
     pub harness: Option<HarnessSpec>,

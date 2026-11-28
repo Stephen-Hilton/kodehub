@@ -1,0 +1,120 @@
+# Test nodes (docs/ontology.md `tests`), same shape as code.yaml.
+
+
+# ------------------------------------------------------------------ Rust tests (from requirements)
+- key: test_unknown_user_is_invalid
+  display_name: test_unknown_user_is_invalid
+  kind: test
+  language: rust
+  description: "R1 example: unknown user → invalid_credentials"
+  signature: ""
+  body: |
+    let mut store = UserStore::new();
+    store.add_user("alice", "correct horse");
+    assert_eq!(
+        verify_credentials(&store, "bob", "correct horse"),
+        AuthResult::InvalidCredentials
+    );
+
+
+- key: test_wrong_password_is_invalid
+  display_name: test_wrong_password_is_invalid
+  kind: test
+  language: rust
+  description: "R1 example: wrong password → invalid_credentials"
+  signature: ""
+  body: |
+    let mut store = UserStore::new();
+    store.add_user("alice", "correct horse");
+    assert_eq!(
+        verify_credentials(&store, "alice", "wrong"),
+        AuthResult::InvalidCredentials
+    );
+
+
+- key: test_empty_username_is_invalid
+  display_name: test_empty_username_is_invalid
+  kind: test
+  language: rust
+  description: "R1 edge case: empty username → invalid_credentials"
+  signature: ""
+  body: |
+    let mut store = UserStore::new();
+    store.add_user("alice", "correct horse");
+    assert_eq!(
+        verify_credentials(&store, "", "anything"),
+        AuthResult::InvalidCredentials
+    );
+
+
+- key: test_valid_login_succeeds
+  display_name: test_valid_login_succeeds
+  kind: test
+  language: rust
+  description: "R1 constraint: the generic error is only for failures; valid credentials authenticate"
+  signature: ""
+  body: |
+    let mut store = UserStore::new();
+    store.add_user("alice", "correct horse");
+    assert_eq!(
+        verify_credentials(&store, "alice", "correct horse"),
+        AuthResult::Authenticated {
+            username: "alice".to_string()
+        }
+    );
+
+
+- key: test_hashes_are_salted_argon2id
+  display_name: test_hashes_are_salted_argon2id
+  kind: test
+  language: rust
+  description: "R2 example: same password hashed twice → different Argon2id hashes, both verify"
+  signature: ""
+  body: |
+    let a = hash_password("hunter2");
+    let b = hash_password("hunter2");
+    assert_ne!(a, b);
+    assert!(a.starts_with("$argon2id$"));
+    assert!(verify_password("hunter2", &a));
+    assert!(verify_password("hunter2", &b));
+    assert!(!verify_password("hunter3", &a));
+
+
+- key: py-test_login_unknown_user
+  display_name: test_login_unknown_user
+  kind: test
+  language: python
+  description: "R1 example: unknown user → invalid_credentials"
+  signature: ""
+  body: |
+    assert login("mallory", "wonderland") == {"ok": False, "error": "invalid_credentials"}
+
+
+- key: py-test_login_wrong_password
+  display_name: test_login_wrong_password
+  kind: test
+  language: python
+  description: "R1 example: wrong password → invalid_credentials"
+  signature: ""
+  body: |
+    assert login("alice", "nope") == {"ok": False, "error": "invalid_credentials"}
+
+
+- key: py-test_login_empty_username
+  display_name: test_login_empty_username
+  kind: test
+  language: python
+  description: "R1 edge case: empty username → invalid_credentials"
+  signature: ""
+  body: |
+    assert login("", "wonderland") == {"ok": False, "error": "invalid_credentials"}
+
+
+- key: py-test_login_success
+  display_name: test_login_success
+  kind: test
+  language: python
+  description: Valid credentials authenticate.
+  signature: ""
+  body: |
+    assert login("alice", "wonderland") == {"ok": True, "username": "alice"}

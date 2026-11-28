@@ -21,7 +21,7 @@ export function worst(statuses: string[]): string {
   return statuses.length ? best : "uncovered";
 }
 
-export const STATE_ORDER = ["draft", "planned", "approved", "building", "reviewing", "testing", "ready", "merged"];
+export const STATE_ORDER = ["draft", "planned", "approved", "building", "reviewing", "testing", "ready", "accepted"];
 
 export function stateIndex(state: string): number {
   return STATE_ORDER.indexOf(state);

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Json, type Requirement } from "../lib/api";
+import { api, localKey, type Json, type Requirement } from "../lib/api";
 import { defaultArgs } from "../lib/form";
 import { healthOf, relTime } from "../lib/health";
 import { onKodehubEvent } from "../lib/useKodehub";
@@ -89,7 +89,7 @@ export function NodePanel({ symbolKey, environment, onClose, onNavigate, onOpenR
     }
   };
 
-  // Manual text edit → a changeset that still goes through blind review and tests.
+  // Manual text edit → a work item proposal that still goes through blind review and tests.
   const submitEdit = async () => {
     setSubmitting(true);
     try {
@@ -177,7 +177,7 @@ export function NodePanel({ symbolKey, environment, onClose, onNavigate, onOpenR
                     <span className="spacer" />
                     {result && (
                       <span data-testid="run-meta">
-                        {result.cache_hit ? "⚡ cache hit" : "compiled"} · {result.duration_ms} ms{result.release ? ` · ${result.release}` : ""}
+                        {result.cache_hit ? "⚡ cache hit" : "compiled"} · {result.duration_ms} ms{result.project_version ? ` · ${localKey(result.project_version)}` : ""}
                       </span>
                     )}
                   </div>
@@ -226,13 +226,18 @@ export function NodePanel({ symbolKey, environment, onClose, onNavigate, onOpenR
         <div className="np-section">
           <div className="section-title"><span>Requirements served</span></div>
           <div className="link-list">
-            {[...(d.groups ?? []), ...(d.requirements ?? [])].map((r: Json) => (
-              <div className="link-item" key={r.id} onClick={() => r.id.startsWith("requirements/") && onOpenRequirement(r.id.split("/")[1])}>
+            {(d.requirements ?? []).map((r: Json) => (
+              <div className="link-item" key={r.id} onClick={() => onOpenRequirement(r.id.split("/")[1])}>
                 <Diamond size={12} /> <span style={{ flex: 1 }}>{r.title}</span>
-                <span className="faint" style={{ fontSize: 11 }}>{r.id.startsWith("requirement_groups") ? "group" : "requirement"}</span>
+                <span className="faint" style={{ fontSize: 11 }}>requirement</span>
               </div>
             ))}
-            {!(d.requirements?.length || d.groups?.length) && <div className="faint">No requirement reaches this symbol — it is an orphan.</div>}
+            {(d.tags ?? []).length > 0 && (
+              <div className="row" style={{ gap: 4, flexWrap: "wrap", marginTop: 4 }}>
+                {d.tags.map((t: string) => <span className="chip" key={t}>#{t}</span>)}
+              </div>
+            )}
+            {!d.requirements?.length && <div className="faint">No requirement reaches this code — it is an orphan.</div>}
           </div>
         </div>
 
@@ -240,12 +245,12 @@ export function NodePanel({ symbolKey, environment, onClose, onNavigate, onOpenR
           <div className="section-title"><span>Dependencies</span><span className="faint">{d.dependencies.length} out · {d.dependents.length} in</span></div>
           <div className="link-list">
             {d.dependencies.map((x: Json) => (
-              <div className="link-item" key={"o" + x.id} onClick={() => onNavigate(`symbols/${x.id}`)}>
+              <div className="link-item" key={"o" + x.id} onClick={() => onNavigate(x.id)}>
                 <Link size={12} /> <span className="mono" style={{ flex: 1 }}>{x.display_name}</span><span className="faint">{x.edge}</span>
               </div>
             ))}
             {d.dependents.map((x: Json) => (
-              <div className="link-item" key={"i" + x.id} onClick={() => onNavigate(`symbols/${x.id}`)}>
+              <div className="link-item" key={"i" + x.id} onClick={() => onNavigate(x.id)}>
                 <Branch size={12} /> <span className="mono" style={{ flex: 1 }}>{x.display_name}</span><span className="faint">used by · {x.edge}</span>
               </div>
             ))}
@@ -256,11 +261,11 @@ export function NodePanel({ symbolKey, environment, onClose, onNavigate, onOpenR
           <div className="section-title"><span>Tests</span><span className="faint">{d.tests.filter((t: Json) => t.status === "pass").length}/{d.tests.length} passing</span></div>
           <div className="link-list">
             {d.tests.map((t: Json) => (
-              <div className="link-item" key={t.id} onClick={() => onNavigate(`symbols/${t.id}`)} title={t.output ?? ""}>
+              <div className="link-item" key={t.id} onClick={() => onNavigate(t.node)} title={t.output ?? ""}>
                 <Beaker size={12} /> <span className="mono" style={{ flex: 1 }}>{t.name}</span><StatusBadge status={t.status} />
               </div>
             ))}
-            {d.tests.length === 0 && <div className="faint">No tests reach this symbol.</div>}
+            {d.tests.length === 0 && <div className="faint">No tests reach this code.</div>}
           </div>
         </div>
 
@@ -270,7 +275,7 @@ export function NodePanel({ symbolKey, environment, onClose, onNavigate, onOpenR
             {d.decisions.map((x: Json) => (
               <div className="card" key={x._key} style={{ padding: 10, marginBottom: 6 }} data-testid="decision">
                 <div className="row"><Scale size={13} /><b style={{ flex: 1 }}>{x.title}</b><span className="faint" style={{ fontSize: 11 }}>{x.made_by}</span></div>
-                <div style={{ marginTop: 4, fontSize: 12 }}>{x.choice}</div>
+                <div style={{ marginTop: 4, fontSize: 12 }}>{x.choice ?? x.statement}</div>
                 <div className="faint" style={{ marginTop: 4, fontSize: 11.5 }}>{x.rationale}</div>
               </div>
             ))}
@@ -283,8 +288,9 @@ export function NodePanel({ symbolKey, environment, onClose, onNavigate, onOpenR
             <div className={`history-item ${i > 0 ? "old" : ""}`} key={v._key + i}>
               <span className="tl" />
               <div>
-                <span className="mono">{v._key.slice(0, 12)}</span> {v.current && <span className="badge pass" style={{ marginLeft: 4 }}>current</span>}
-                <div className="faint" style={{ fontSize: 11.5 }}>by {v.created_by}</div>
+                <span className="mono">{localKey(v._key).slice(0, 12)}</span> {v.current && <span className="badge pass" style={{ marginLeft: 4 }}>current</span>}
+                {v.state === "candidate" && <span className="badge ghost" style={{ marginLeft: 4 }}>proposed</span>}
+                <div className="faint" style={{ fontSize: 11.5 }}>by {v.created_by}{v.project_versions?.length ? ` · in ${v.project_versions.join(", ")}` : ""}</div>
               </div>
               <span className="faint" style={{ fontSize: 11.5 }}><Clock size={11} /> {relTime(v.since ?? v.created_at)}</span>
             </div>
@@ -310,7 +316,7 @@ export function NodePanel({ symbolKey, environment, onClose, onNavigate, onOpenR
           ) : (
             <pre className="code-block">{d.version.body}</pre>
           )}
-          {editing && <div className="faint" style={{ fontSize: 11.5, marginTop: 6 }}>Saving opens a changeset: the blind reviewer and every affected test run before it can merge.</div>}
+          {editing && <div className="faint" style={{ fontSize: 11.5, marginTop: 6 }}>Saving opens a proposal: the blind reviewer and every affected test run before it is accepted.</div>}
         </div>
       </div>
     </div>

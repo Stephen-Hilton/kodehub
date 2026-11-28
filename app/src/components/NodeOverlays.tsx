@@ -2,7 +2,7 @@
 // panel. Tests (runs, history, Test now), requirements (own + inherited, with the cascade),
 // lifecycle (state, versions) and the work on the node.
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { api, type Json, type MapNode } from "../lib/api";
+import { api, localKey, type Json, type MapNode } from "../lib/api";
 import { relTime } from "../lib/health";
 import { X } from "./icons";
 import { LIFECYCLE_LABEL, type BadgeKind } from "./NodeBadges";
@@ -104,7 +104,7 @@ function RequirementsBody({ node, onOpenRequirement }: { node: MapNode; onOpenRe
           if (!here.length) return null;
           return (
             <div key={lvl} className="cascade-level">
-              <div className="cascade-label">{lvl === node.id ? "On this node" : `Inherited from ${lvl}`}</div>
+              <div className="cascade-label">{lvl === node.id ? "On this node" : lvl.startsWith("projects/") ? "Inherited from the project" : `Inherited from ${lvl}`}</div>
               {here.map((r: Json) => (
                 <button key={r.id} className="pop-row-main" onClick={() => onOpenRequirement(r.key)}>
                   <span className={`chip kind-${r.kind}`}>{r.kind === "business" ? "B" : r.kind === "technical" ? "T" : r.kind}</span>
@@ -143,9 +143,9 @@ function LifecycleBody({ node }: { node: MapNode }) {
         {versions?.length === 0 && <div className="faint">No versions yet.</div>}
         {versions?.slice(0, 8).map((v) => (
           <div key={`${v.seq}-${v.version}`} className="pop-row-main static">
-            <span className={`badge ${v.state === "stable" ? "pass" : v.state === "candidate" ? "risk" : ""}`}>{v.state}</span>
-            <span className="mono">v{v.seq} · {String(v.version).slice(0, 10)}</span>
-            <span className="faint">{v.validFrom ? relTime(v.validFrom) : "not yet valid"}</span>
+            <span className={`badge ${v.current ? "pass" : v.state === "candidate" ? "risk" : ""}`}>{v.current ? "current" : v.state === "accepted" ? "earlier" : v.state}</span>
+            <span className="mono">v{v.seq ?? "?"} · {localKey(String(v.version)).slice(0, 10)}</span>
+            <span className="faint">{v.project_versions?.length ? v.project_versions.map((p: Json) => p.name).join(", ") : relTime(v.created_at)}</span>
           </div>
         ))}
         {work.length > 0 && <div className="cascade-label">Work on this node</div>}

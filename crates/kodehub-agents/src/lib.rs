@@ -87,7 +87,8 @@ pub struct AgentTask {
     /// JSON schema the final answer must match.
     pub schema: Value,
     pub model: String,
-    pub changeset: Option<String>,
+    /// The work item whose proposal this task works on (scopes the MCP session).
+    pub work_item: Option<String>,
     /// Label for logs, e.g. "plan", "review round 1".
     pub label: String,
     /// Short-lived Kodehub token for the agent's read-only graph tools (MCP / HTTP), scoped to

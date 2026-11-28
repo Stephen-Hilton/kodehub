@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kodehub_core::config::Config;
-use kodehub_core::model::{now_iso, ChangesetState, Kind, Language};
+use kodehub_core::model::{now_iso, Kind, Language, ProposalState};
 use kodehub_runner::{BuildTarget, Runner};
-use kodehub_store::changesets::ProposeVersion;
+use kodehub_store::proposals::ProposeVersion;
 use kodehub_store::{key_of, Store};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
@@ -55,14 +55,27 @@ pub struct Engine {
     pub emit: Emitter,
     pub opts: EngineOptions,
     backend_override: Option<Arc<dyn AgentBackend>>,
-    recorded: Mutex<Option<(String, Arc<RecordedBackend>)>>,
+    /// Loaded recordings, one per (recording, project): a recording scripts one project's demo,
+    /// so each project replays it from the start.
+    recorded: Mutex<BTreeMap<(String, String), Arc<RecordedBackend>>>,
     status: Mutex<BTreeMap<Role, Value>>,
     running: Mutex<BTreeSet<String>>,
 }
 
 /// Default recording shipped with the repo (the doc 08 demo).
+/// The demo recording: `KODEHUB_RECORDING`, else the source tree's copy (development), else
+/// the image's `/app/recordings` (agent containers and the server use the same file).
 pub fn default_recording() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("recordings/demo-locked-account.json")
+    if let Ok(p) = std::env::var("KODEHUB_RECORDING") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("recordings/demo-locked-account.json");
+    if src.exists() {
+        return src;
+    }
+    PathBuf::from("/app/recordings/demo-locked-account.json")
 }
 
 impl Engine {
@@ -87,7 +100,7 @@ impl Engine {
             emit,
             opts,
             backend_override: None,
-            recorded: Mutex::new(None),
+            recorded: Mutex::new(BTreeMap::new()),
             status: Mutex::new(BTreeMap::new()),
             running: Mutex::new(BTreeSet::new()),
         }
@@ -145,26 +158,7 @@ impl Engine {
                         }),
                 }
             }
-            "recorded" => {
-                let path = cfg
-                    .agents
-                    .recording
-                    .clone()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(default_recording);
-                let key = path.to_string_lossy().to_string();
-                let mut g = self.recorded.lock().unwrap();
-                // an exhausted recording fails loudly instead of silently replaying (review M6 #15);
-                // re-selecting the recorded backend in settings resets it
-                if let Some((k, b)) = g.as_ref() {
-                    if *k == key {
-                        return Ok(b.clone());
-                    }
-                }
-                let b = Arc::new(RecordedBackend::from_file(&path)?);
-                *g = Some((key, b.clone()));
-                Ok(b)
-            }
+            "recorded" => Ok(self.shared_recording(&cfg)?),
             _ => {
                 // a stored subscription token (personal, user-owned projects only), else the
                 // developer's own CLI login on a laptop
@@ -200,9 +194,9 @@ impl Engine {
         }
     }
 
-    /// Forget the loaded recording (next task reloads it from the start).
+    /// Forget the loaded recordings (the next task reloads its project's from the start).
     pub fn reset_recording(&self) {
-        *self.recorded.lock().unwrap() = None;
+        self.recorded.lock().unwrap().clear();
     }
 
     pub fn agent_status(&self) -> Value {
@@ -233,7 +227,7 @@ impl Engine {
             "agent.activity",
             json!({"role": role, "changeset": cs, "message": message}),
         );
-        (self.emit)("changeset.updated", json!({"key": cs}));
+        (self.emit)("proposal.updated", json!({"key": cs}));
     }
 
     /// Run one agent task and keep its transcript on the changeset.
@@ -252,7 +246,7 @@ impl Engine {
             input,
             schema,
             model,
-            changeset: cs.map(String::from),
+            work_item: cs.map(String::from),
             label: label.into(),
             api_token: None,
             project: None,
@@ -269,7 +263,7 @@ impl Engine {
                 }
             };
             let _ = self.store.log_activity(cs, json!({"role": role.as_str(), "message": format!("{label}: {}", if res.is_ok() { "done" } else { "failed" })}), Some(entry)).await;
-            (self.emit)("changeset.updated", json!({"key": cs}));
+            (self.emit)("proposal.updated", json!({"key": cs}));
         }
         res
     }
@@ -277,10 +271,17 @@ impl Engine {
     // ------------------------------------------------------------------ planning
 
     /// A human edited a requirement: mark at risk (already done by the store), open (or reuse)
-    /// a changeset and plan it.
-    pub async fn on_requirement_edited(&self, req: &str, by: &str) -> Result<String> {
+    /// a proposal on `work_item` and plan it. Returns the work item whose proposal addresses the
+    /// edit (an open one that already does, else `work_item`).
+    pub async fn on_requirement_edited(
+        &self,
+        req: &str,
+        by: &str,
+        work_item: &str,
+    ) -> Result<String> {
+        let req = &self.store.db.pkey(key_of(req))?;
         let r = self.store.db.get("requirements", req, None).await?;
-        let open = self.store.list_changesets(true).await?;
+        let open = self.store.list_proposals(true).await?;
         let existing = open.iter().find(|c| {
             matches!(c["state"].as_str(), Some("draft") | Some("planned"))
                 && c["requirements"]
@@ -293,10 +294,11 @@ impl Engine {
             None => {
                 let cs = self
                     .store
-                    .open_changeset(
+                    .open_proposal(
+                        work_item,
                         &format!("Address {} (rev {})", r["title"].as_str().unwrap_or(req), r["revision"]),
                         &format!("Requirement `{req}` was edited by {by}; bring code and tests in line with revision {}.", r["revision"]),
-                        &[req.to_string()],
+                        std::slice::from_ref(req),
                         "orchestrator",
                     )
                     .await?;
@@ -304,9 +306,9 @@ impl Engine {
             }
         };
         self.store
-            .patch_changeset(&key, json!({"origin": "requirement_edit"}))
+            .patch_proposal(&key, json!({"origin": "requirement_edit"}))
             .await?;
-        (self.emit)("changeset.updated", json!({"key": key, "state": "draft"}));
+        (self.emit)("proposal.updated", json!({"key": key, "state": "draft"}));
         self.activity(
             &key,
             "orchestrator",
@@ -318,7 +320,7 @@ impl Engine {
     }
 
     pub async fn plan(&self, cs_key: &str) -> Result<Value> {
-        let cs = self.store.get_changeset(cs_key).await?;
+        let cs = self.store.get_proposal(cs_key).await?;
         let reqs: Vec<String> = str_list(&cs["requirements"]);
         let g = self.store.load_code_graph().await?;
         let relevant = relevant_symbols(&self.store, &g, &reqs).await?;
@@ -354,13 +356,19 @@ impl Engine {
         if let Some(changes) = plan["changes"].as_array_mut() {
             for c in changes.iter_mut() {
                 let sym = c["symbol"].as_str().unwrap_or("").to_string();
-                if sym.is_empty() || !g.symbols.contains_key(key_of(&sym)) {
+                // agents may answer with local keys: qualify for the project (D-055)
+                let key = if sym.is_empty() {
+                    String::new()
+                } else {
+                    self.store.db.pkey(key_of(&sym))?
+                };
+                if sym.is_empty() || !g.symbols.contains_key(&key) {
                     c["symbol"] = Value::Null;
                     if c["action"] == "modify" && !sym.is_empty() {
                         c["action"] = json!("add");
                     }
                 } else {
-                    c["symbol"] = json!(key_of(&sym));
+                    c["symbol"] = json!(key);
                 }
             }
         }
@@ -391,7 +399,7 @@ impl Engine {
             self.store
                 .transition(
                     cs_key,
-                    ChangesetState::Approved,
+                    ProposalState::Approved,
                     "orchestrator",
                     "auto-approved",
                 )
@@ -399,6 +407,40 @@ impl Engine {
             Box::pin(self.execute(cs_key)).await?;
         }
         Ok(v)
+    }
+
+    /// Answers left in a project's recording (`None` before it used the recorded backend).
+    pub fn recording_remaining(&self, project: &str) -> Option<usize> {
+        self.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|((_, p), _)| p == project)
+            .map(|(_, b)| b.remaining())
+    }
+
+    /// The configured recording for the request's project, shared by every task of that
+    /// project so its position carries across tasks (agent containers are fresh each time).
+    /// An exhausted recording fails loudly instead of silently replaying (review M6 #15);
+    /// re-selecting the recorded backend in settings resets it.
+    fn shared_recording(&self, cfg: &Config) -> Result<Arc<RecordedBackend>> {
+        let path = cfg
+            .agents
+            .recording
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(default_recording);
+        let key = (
+            path.to_string_lossy().to_string(),
+            kodehub_store::request_project().unwrap_or_default(),
+        );
+        let mut g = self.recorded.lock().unwrap();
+        if let Some(b) = g.get(&key) {
+            return Ok(b.clone());
+        }
+        let b = Arc::new(RecordedBackend::from_file(&path)?);
+        g.insert(key, b.clone());
+        Ok(b)
     }
 
     /// The backend inside agent containers: the same choice and credential rules, the
@@ -438,6 +480,11 @@ impl Engine {
             _ => None,
         };
         let storage = kodehub_storage::StorageClient::from_env_or_local(&self.runner.home);
+        let recorded = if choice == "recorded" {
+            Some(self.shared_recording(&cfg)?)
+        } else {
+            None
+        };
         Ok(Arc::new(crate::backend::container::ContainerBackend {
             inner: choice,
             jobs: kodehub_runner::jobs::JobRuntime::from_env(),
@@ -446,6 +493,7 @@ impl Engine {
             server_url: std::env::var("KODEHUB_INTERNAL_URL")
                 .unwrap_or_else(|_| self.server_url.clone()),
             timeout: Duration::from_secs(cfg.agents.timeout_secs.max(120)),
+            recorded,
         }))
     }
 
@@ -457,7 +505,7 @@ impl Engine {
         if let Some(p) = &project {
             let bind = work_item
                 .clone()
-                .or_else(|| task.changeset.clone())
+                .or_else(|| task.work_item.clone())
                 .unwrap_or_else(|| "adhoc".into());
             task.api_token = Some(
                 self.store
@@ -472,7 +520,7 @@ impl Engine {
             );
             task.project = Some(p.clone());
         }
-        let cs = task.changeset.clone();
+        let cs = task.work_item.clone();
         self.set_status(task.role, "working", &task.label, cs.as_deref());
         let res = match self.backend().await {
             Ok(b) => b.run(&task).await,
@@ -500,10 +548,9 @@ impl Engine {
     /// actions.
     pub async fn run_role(&self, agent_type: &str, w: &Value) -> Result<AgentOutput> {
         let doc = crate::roles::agent_type(&self.store, agent_type).await?;
-        let target = w["target"]
-            .as_str()
-            .unwrap_or("philosophy/philosophy")
-            .to_string();
+        let target = w["target"].as_str().map(str::to_string).unwrap_or_else(|| {
+            kodehub_store::c4::project_node_of(w["project"].as_str().unwrap_or_default())
+        });
         let ctx = self
             .store
             .requirements_for(&target)
@@ -543,7 +590,7 @@ impl Engine {
             input,
             schema: crate::roles::actions_schema(),
             model,
-            changeset: None,
+            work_item: None,
             label: format!("{agent_type}: {}", w["kind"].as_str().unwrap_or("")),
             api_token: None,
             project: None,
@@ -552,12 +599,17 @@ impl Engine {
     }
 
     async fn decisions_md(&self, symbols: &BTreeSet<String>) -> Result<String> {
-        let ids: Vec<String> = symbols.iter().map(|s| format!("symbols/{s}")).collect();
+        // decisions are requirements of kind `decision` applying to the code (docs/ontology.md)
+        let ids: Vec<String> = symbols
+            .iter()
+            .flat_map(|s| [format!("code/{s}"), format!("tests/{s}")])
+            .collect();
         let rows = self
             .store
             .aql(
-                "FOR e IN @@justified_by FILTER e._from IN @ids LET d = DOCUMENT(e._to)
-                 COLLECT k = d._key, t = d.title, c = d.choice, r = d.rationale
+                "FOR e IN @@applies_to FILTER e._to IN @ids LET d = DOCUMENT(e._from)
+                 FILTER d.kind == 'decision'
+                 COLLECT k = d._key, t = d.title, c = d.statement, r = d.rationale
                  RETURN CONCAT('- **', t, '** — ', c, ' (', r, ')')",
                 json!({"ids": ids}),
             )
@@ -588,14 +640,14 @@ impl Engine {
             Ok(s) => {
                 let _ = self
                     .store
-                    .patch_changeset(cs_key, json!({"error": null}))
+                    .patch_proposal(cs_key, json!({"error": null}))
                     .await;
                 Ok(s)
             }
             Err(e) => {
                 let _ = self
                     .store
-                    .patch_changeset(cs_key, json!({"error": e.to_string()}))
+                    .patch_proposal(cs_key, json!({"error": e.to_string()}))
                     .await;
                 self.activity(cs_key, "orchestrator", &format!("Stopped: {e}"))
                     .await;
@@ -608,16 +660,16 @@ impl Engine {
         self.running.lock().unwrap().contains(cs_key)
     }
 
-    async fn state(&self, cs_key: &str) -> Result<(Value, ChangesetState)> {
-        let cs = self.store.get_changeset(cs_key).await?;
-        let st: ChangesetState = serde_json::from_value(cs["state"].clone())
+    async fn state(&self, cs_key: &str) -> Result<(Value, ProposalState)> {
+        let cs = self.store.get_proposal(cs_key).await?;
+        let st: ProposalState = serde_json::from_value(cs["state"].clone())
             .map_err(|e| AgentError::Workflow(e.to_string()))?;
         Ok((cs, st))
     }
 
-    async fn to(&self, cs: &str, s: ChangesetState, by: &str, note: &str) -> Result<()> {
+    async fn to(&self, cs: &str, s: ProposalState, by: &str, note: &str) -> Result<()> {
         self.store.transition(cs, s, by, note).await?;
-        (self.emit)("changeset.updated", json!({"key": cs, "state": s.as_str()}));
+        (self.emit)("proposal.updated", json!({"key": cs, "state": s.as_str()}));
         Ok(())
     }
 
@@ -626,21 +678,21 @@ impl Engine {
             let (cs, st) = self.state(cs_key).await?;
             let rounds = cs["rounds"].as_i64().unwrap_or(0);
             match st {
-                ChangesetState::Draft => {
+                ProposalState::Draft => {
                     self.plan(cs_key).await?;
                     return Ok("planned".into());
                 }
-                ChangesetState::Planned => return Ok("awaiting approval".into()),
-                ChangesetState::Approved => {
+                ProposalState::Planned => return Ok("awaiting approval".into()),
+                ProposalState::Approved => {
                     self.to(
                         cs_key,
-                        ChangesetState::Building,
+                        ProposalState::Building,
                         "orchestrator",
                         "build started",
                     )
                     .await?
                 }
-                ChangesetState::Building => {
+                ProposalState::Building => {
                     let has_code = cs["proposals"]
                         .as_object()
                         .map(|o| o.values().any(|p| p["kind"] != "test"))
@@ -648,7 +700,7 @@ impl Engine {
                     if cs["skip_to_review"] == json!(true) {
                         // re-approved after out-of-plan changes: proposals are unchanged
                         self.store
-                            .patch_changeset(cs_key, json!({"skip_to_review": null}))
+                            .patch_proposal(cs_key, json!({"skip_to_review": null}))
                             .await?;
                     } else if !has_code {
                         self.tester(cs_key).await?;
@@ -663,26 +715,26 @@ impl Engine {
                         let out_of_plan = self.coder(cs_key, &findings, &failures).await?;
                         if !out_of_plan.is_empty() {
                             self.store
-                                .patch_changeset(cs_key, json!({"rework": null}))
+                                .patch_proposal(cs_key, json!({"rework": null}))
                                 .await?;
                             return self.request_reapproval(cs_key, &out_of_plan).await;
                         }
                     }
                     self.store
-                        .patch_changeset(cs_key, json!({"rework": null}))
+                        .patch_proposal(cs_key, json!({"rework": null}))
                         .await?;
                     self.to(
                         cs_key,
-                        ChangesetState::Reviewing,
+                        ProposalState::Reviewing,
                         "coder",
                         "proposals ready for review",
                     )
                     .await?;
                 }
-                ChangesetState::Reviewing => {
+                ProposalState::Reviewing => {
                     let open = self.reviewer(cs_key, rounds).await?;
                     if open.is_empty() {
-                        self.to(cs_key, ChangesetState::Testing, "reviewer", "review passed")
+                        self.to(cs_key, ProposalState::Testing, "reviewer", "review passed")
                             .await?;
                     } else if rounds >= self.opts.max_rounds {
                         return self
@@ -697,24 +749,24 @@ impl Engine {
                             .await;
                     } else {
                         self.store
-                            .patch_changeset(cs_key, json!({"rework": {"findings": open}}))
+                            .patch_proposal(cs_key, json!({"rework": {"findings": open}}))
                             .await?;
                         self.to(
                             cs_key,
-                            ChangesetState::Building,
+                            ProposalState::Building,
                             "reviewer",
                             "changes requested",
                         )
                         .await?;
                     }
                 }
-                ChangesetState::Testing => {
+                ProposalState::Testing => {
                     let (passed, failures) = self.run_tests(cs_key).await?;
                     if passed {
                         self.record_decisions(cs_key).await?;
                         self.to(
                             cs_key,
-                            ChangesetState::Ready,
+                            ProposalState::Ready,
                             "tester",
                             "all affected tests pass",
                         )
@@ -728,13 +780,13 @@ impl Engine {
                             .await;
                     } else {
                         self.store
-                            .patch_changeset(cs_key, json!({"rework": {"failures": failures}}))
+                            .patch_proposal(cs_key, json!({"rework": {"failures": failures}}))
                             .await?;
-                        self.to(cs_key, ChangesetState::Building, "tester", "tests failing")
+                        self.to(cs_key, ProposalState::Building, "tester", "tests failing")
                             .await?;
                     }
                 }
-                ChangesetState::Ready => {
+                ProposalState::Ready => {
                     if !self.opts.auto_merge {
                         return Ok("ready".into());
                     }
@@ -747,7 +799,7 @@ impl Engine {
                         {
                             self.to(
                                 cs_key,
-                                ChangesetState::Testing,
+                                ProposalState::Testing,
                                 "orchestrator",
                                 "tests stale at merge time — re-testing",
                             )
@@ -756,9 +808,9 @@ impl Engine {
                         Err(e) => return Err(e),
                     }
                 }
-                ChangesetState::Merged => return Ok("merged".into()),
-                ChangesetState::Rejected => return Ok("rejected".into()),
-                ChangesetState::Escalated => return Ok("escalated".into()),
+                ProposalState::Accepted => return Ok("merged".into()),
+                ProposalState::Rejected => return Ok("rejected".into()),
+                ProposalState::Escalated => return Ok("escalated".into()),
             }
         }
         Err(AgentError::Workflow("workflow did not converge".into()))
@@ -767,7 +819,7 @@ impl Engine {
     /// The coder touched symbols the human did not approve: add them to the plan (flagged) and
     /// send the changeset back for re-approval (review M6 #13).
     async fn request_reapproval(&self, cs_key: &str, out_of_plan: &[String]) -> Result<String> {
-        let cs = self.store.get_changeset(cs_key).await?;
+        let cs = self.store.get_proposal(cs_key).await?;
         let mut plan = cs["plan"].clone();
         if let Some(ch) = plan["changes"].as_array_mut() {
             for k in out_of_plan {
@@ -780,11 +832,11 @@ impl Engine {
             }
         }
         self.store
-            .patch_changeset(cs_key, json!({"plan": plan, "skip_to_review": true}))
+            .patch_proposal(cs_key, json!({"plan": plan, "skip_to_review": true}))
             .await?;
         self.to(
             cs_key,
-            ChangesetState::Planned,
+            ProposalState::Planned,
             "orchestrator",
             "coder changed symbols outside the approved plan — re-approval needed",
         )
@@ -802,7 +854,7 @@ impl Engine {
     }
 
     async fn escalate(&self, cs_key: &str, why: &str) -> Result<String> {
-        let cs = self.store.get_changeset(cs_key).await?;
+        let cs = self.store.get_proposal(cs_key).await?;
         let d = self
             .store
             .create_decision(
@@ -815,9 +867,9 @@ impl Engine {
         let mut decisions = cs["decisions"].as_array().cloned().unwrap_or_default();
         decisions.push(d["_id"].clone());
         self.store
-            .patch_changeset(cs_key, json!({"decisions": decisions}))
+            .patch_proposal(cs_key, json!({"decisions": decisions}))
             .await?;
-        self.to(cs_key, ChangesetState::Escalated, "orchestrator", why)
+        self.to(cs_key, ProposalState::Escalated, "orchestrator", why)
             .await?;
         self.activity(
             cs_key,
@@ -828,9 +880,26 @@ impl Engine {
         Ok("escalated".into())
     }
 
+    /// May an agent type take an action in the active project (D-062)? Unknown types may not.
+    async fn may(&self, agent_type: &str, permission: &str) -> bool {
+        self.store
+            .agent_may(agent_type, permission)
+            .await
+            .unwrap_or(false)
+    }
+
     /// Tester: tests from requirements and signatures only (never function bodies).
     async fn tester(&self, cs_key: &str) -> Result<()> {
-        let cs = self.store.get_changeset(cs_key).await?;
+        if !self.may("test_author", "write_tests").await {
+            self.activity(
+                cs_key,
+                "tester",
+                "The test author may not write tests in this project; no tests proposed",
+            )
+            .await;
+            return Ok(());
+        }
+        let cs = self.store.get_proposal(cs_key).await?;
         let reqs = str_list(&cs["requirements"]);
         let g = self.store.load_code_graph().await?;
         let relevant = relevant_symbols(&self.store, &g, &reqs).await?;
@@ -855,7 +924,7 @@ impl Engine {
                 serde_json::from_value(t["language"].clone()).unwrap_or(Language::Rust);
             let tests_for: Vec<String> = str_list(&t["tests_for"])
                 .into_iter()
-                .map(|k| key_of(&k).to_string())
+                .filter_map(|k| self.store.db.pkey(key_of(&k)).ok())
                 .filter(|k| g.symbols.contains_key(k))
                 .collect();
             let component = self.component_of(tests_for.first()).await?;
@@ -905,7 +974,7 @@ impl Engine {
         let Some(s) = sym else { return Ok(None) };
         let rows = self
             .store
-            .aql("FOR e IN @@contains FILTER e._to == CONCAT(@pfx, 'symbols/', @s) AND STARTS_WITH(e._from, CONCAT(@pfx, 'components/')) RETURN PARSE_IDENTIFIER(e._from).key", json!({"s": s}))
+            .aql("FOR e IN @@contains FILTER e._to IN [CONCAT('code/', @s), CONCAT('tests/', @s)] AND STARTS_WITH(e._from, 'components/') RETURN PARSE_IDENTIFIER(e._from).key", json!({"s": s}))
             .await?;
         Ok(rows.first().and_then(Value::as_str).map(String::from))
     }
@@ -913,7 +982,7 @@ impl Engine {
     /// Coder: initial implementation or rework for findings / failing tests.
     /// Returns symbols touched outside the approved plan (initial implementation only).
     async fn coder(&self, cs_key: &str, findings: &[Value], failures: &str) -> Result<Vec<String>> {
-        let cs = self.store.get_changeset(cs_key).await?;
+        let cs = self.store.get_proposal(cs_key).await?;
         let reqs = str_list(&cs["requirements"]);
         let g = self.store.load_code_graph().await?;
         let mut relevant = relevant_symbols(&self.store, &g, &reqs).await?;
@@ -998,8 +1067,9 @@ impl Engine {
             let sym = c["symbol"]
                 .as_str()
                 .map(key_of)
-                .filter(|s| !s.is_empty() && g.symbols.contains_key(*s))
-                .map(String::from);
+                .filter(|s| !s.is_empty())
+                .and_then(|s| self.store.db.pkey(s).ok())
+                .filter(|s| g.symbols.contains_key(s));
             // tests belong to the tester (written from requirements); the coder may not change
             // them (review M6 #5)
             // resolve by name too: `symbol: ""` + an existing display name is a modification
@@ -1016,7 +1086,20 @@ impl Engine {
                     .and_then(|k| g.symbols.get(k))
                     .map(|s| s.kind == Kind::Test)
                     .unwrap_or(false);
-            if targets_test {
+            // what the coding agent type may do in this project (D-062): by default it never
+            // touches tests, and new code needs `author_new_code`, changes `modify_code`
+            let needed = if targets_test {
+                if sym.is_some() {
+                    "modify_tests"
+                } else {
+                    "write_tests"
+                }
+            } else if sym.is_some() {
+                "modify_code"
+            } else {
+                "author_new_code"
+            };
+            if !self.may("coding", needed).await {
                 refused.push(c["display_name"].as_str().unwrap_or("?").to_string());
                 continue;
             }
@@ -1086,7 +1169,7 @@ impl Engine {
                 .map(|k| g.symbols.contains_key(k))
                 .unwrap_or(false);
             if !in_plan && (initial || modifies_existing) {
-                let p = self.store.get_changeset(cs_key).await?;
+                let p = self.store.get_proposal(cs_key).await?;
                 let key = p["proposals"]
                     .as_object()
                     .and_then(|o| {
@@ -1124,7 +1207,7 @@ impl Engine {
             }
         }
         self.store
-            .patch_changeset(cs_key, json!({"coder_responses": responses}))
+            .patch_proposal(cs_key, json!({"coder_responses": responses}))
             .await?;
         self.activity(
             cs_key,
@@ -1138,13 +1221,18 @@ impl Engine {
     /// Blind review. Input = mission + requirements + diff + tests + the reviewer's own previous
     /// findings. Returns the findings that still require rework.
     async fn reviewer(&self, cs_key: &str, round: i64) -> Result<Vec<Value>> {
-        let cs = self.store.get_changeset(cs_key).await?;
+        if !self.may("review", "review_code").await {
+            return Err(AgentError::Workflow(
+                "the review agent type may not review code in this project; with blind review on, nothing can be accepted".into(),
+            ));
+        }
+        let cs = self.store.get_proposal(cs_key).await?;
         let reqs = str_list(&cs["requirements"]);
         let g = self.store.load_code_graph().await?;
         let verifying: BTreeSet<String> = self
             .store
             .aql(
-                "FOR e IN @@verifies FILTER e._to IN @r RETURN PARSE_IDENTIFIER(e._from).key",
+                "FOR e IN @@verified_by FILTER e._from IN @r RETURN PARSE_IDENTIFIER(e._to).key",
                 json!({"r": reqs.iter().map(|r| format!("requirements/{r}")).collect::<Vec<_>>()}),
             )
             .await?
@@ -1277,7 +1365,7 @@ impl Engine {
             );
         }
         self.store
-            .patch_changeset(cs_key, json!({"test_results": outcomes}))
+            .patch_proposal(cs_key, json!({"test_results": outcomes}))
             .await?;
         let failed: Vec<_> = outcomes.iter().filter(|o| o.status != "pass").collect();
         let report = failed
@@ -1307,7 +1395,7 @@ impl Engine {
 
     /// Record a Decision for every blocking/major finding that was resolved.
     async fn record_decisions(&self, cs_key: &str) -> Result<()> {
-        let cs = self.store.get_changeset(cs_key).await?;
+        let cs = self.store.get_proposal(cs_key).await?;
         let responses = cs["coder_responses"].clone();
         let mut seen: BTreeMap<String, Value> = BTreeMap::new();
         for r in cs["reviews"].as_array().cloned().unwrap_or_default() {
@@ -1322,7 +1410,7 @@ impl Engine {
             .map(|o| {
                 o.iter()
                     .filter(|(_, p)| p["kind"] != "test" && p["new"] != json!(true))
-                    .map(|(k, _)| format!("symbols/{k}"))
+                    .map(|(k, _)| format!("code/{k}"))
                     .collect()
             })
             .unwrap_or_default();
@@ -1338,8 +1426,8 @@ impl Engine {
                 .iter()
                 .filter(|t| {
                     location.is_empty()
-                        || location.contains(t.trim_start_matches("symbols/"))
-                        || cs["proposals"][t.trim_start_matches("symbols/")]["display_name"]
+                        || location.contains(t.trim_start_matches("code/"))
+                        || cs["proposals"][t.trim_start_matches("code/")]["display_name"]
                             .as_str()
                             .map(|n| location.contains(n))
                             .unwrap_or(false)
@@ -1376,18 +1464,18 @@ impl Engine {
             .await;
         }
         self.store
-            .patch_changeset(cs_key, json!({"decisions": decisions}))
+            .patch_proposal(cs_key, json!({"decisions": decisions}))
             .await?;
         Ok(())
     }
 
     pub async fn merge(&self, cs_key: &str) -> Result<()> {
         self.store
-            .merge_changeset(cs_key, "orchestrator", false)
+            .accept_proposal(cs_key, "orchestrator", false)
             .await?;
-        let cs = self.store.get_changeset(cs_key).await?;
+        let cs = self.store.get_proposal(cs_key).await?;
         (self.emit)(
-            "changeset.updated",
+            "proposal.updated",
             json!({"key": cs_key, "state": "merged"}),
         );
         (self.emit)(
@@ -1401,7 +1489,7 @@ impl Engine {
         )
         .await;
         if self.opts.warm_cache {
-            let touched: Vec<String> = cs["merged_versions"]
+            let touched: Vec<String> = cs["accepted_versions"]
                 .as_object()
                 .map(|o| o.keys().cloned().collect())
                 .unwrap_or_default();
@@ -1435,7 +1523,10 @@ impl Engine {
                     .await
                 {
                     if !b.cache_hit {
-                        let _ = self.runner.record_artifact(&self.store, &b).await;
+                        let _ = self
+                            .runner
+                            .record_artifact(&self.store, &b, &g, std::slice::from_ref(&t))
+                            .await;
                     }
                 }
             }
@@ -1462,11 +1553,13 @@ impl Engine {
                 refs.push_str(&format!("- `{r}`: {}\n", truncate(&n.to_string(), 1500)));
             }
         }
+        let chat_id = main_chat(&self.store).await?;
         let history = self
             .store
             .aql(
-                "FOR m IN @@chat_messages SORT m.created_at DESC LIMIT 8 RETURN m",
-                json!({}),
+                "FOR e IN @@has_message FILTER e._from == @c LET m = DOCUMENT(e._to)
+                   SORT m.created_at DESC LIMIT 8 RETURN MERGE(m, m.data)",
+                json!({"c": chat_id}),
             )
             .await?;
         let hist: String = history
@@ -1485,8 +1578,15 @@ impl Engine {
             "## Mission\n{}\n\n## Requirements\n{}\n\n## Referenced nodes\n{}\n\n## Recent conversation\n{}\n\n## Human says\n{}\n\n## Task\nReply briefly. If the human asks for a behaviour change, choose an action: `add_edge_case` / `add_example` (set `requirement` key, `description`, `input_json`, `expected_json`), `create_requirement` (`title`, `statement`), or `open_changeset` (`title`, `description` as intent, `requirement` optional). Otherwise action `none`. Unused fields are \"\".",
             mission(&self.store).await?, req_list, if refs.is_empty() { "(none)".into() } else { refs }, hist, message
         );
-        let now = now_iso();
-        self.store.db.insert("chat_messages", &json!({"role": "human", "text": message, "references": references, "created_at": now}), None).await?;
+        self.store
+            .chat_message(
+                &chat_id,
+                "human",
+                message,
+                json!({"role": "human", "references": references}),
+                references,
+            )
+            .await?;
         let out = self
             .call(Role::Orchestrator, "chat", input, schemas::chat(), None)
             .await?;
@@ -1498,9 +1598,19 @@ impl Engine {
         } else {
             Value::Null
         };
-        let reply = json!({"role": "orchestrator", "text": a["reply"], "action": a["action"], "proposal": proposal,
-                           "status": if proposal.is_null() { "none" } else { "pending" }, "created_at": now_iso()});
-        let saved = self.store.db.insert("chat_messages", &reply, None).await?;
+        let reply = json!({"role": "orchestrator", "action": a["action"], "proposal": proposal,
+                           "status": if proposal.is_null() { "none" } else { "pending" }});
+        let saved = self
+            .store
+            .chat_message(
+                &chat_id,
+                "orchestrator",
+                a["reply"].as_str().unwrap_or(""),
+                reply,
+                &[],
+            )
+            .await?;
+        let saved = flatten_message(saved);
         (self.emit)(
             "agent.activity",
             json!({"role": "orchestrator", "message": "chat reply", "chat": true}),
@@ -1510,27 +1620,19 @@ impl Engine {
 
     /// Apply (or discard) an action the orchestrator proposed in chat. Only a human calls this.
     pub async fn apply_chat_action(&self, message_key: &str, apply: bool) -> Result<Value> {
-        let msg = self
-            .store
-            .db
-            .get("chat_messages", message_key, None)
-            .await?;
+        let msg = flatten_message(
+            self.store
+                .db
+                .get("agent_chat_msgs", key_of(message_key), None)
+                .await?,
+        );
         if msg["status"] != json!("pending") {
             return Err(AgentError::Workflow(
                 "this proposal was already handled".into(),
             ));
         }
         if !apply {
-            return Ok(self
-                .store
-                .db
-                .patch(
-                    "chat_messages",
-                    message_key,
-                    &json!({"status": "discarded"}),
-                    None,
-                )
-                .await?);
+            return set_message_status(&self.store, &msg, json!({"status": "discarded"})).await;
         }
         let a = msg["proposal"].clone();
         let parse = |s: &str| -> Value {
@@ -1564,11 +1666,26 @@ impl Engine {
                     )
                     .await?;
                 if changed {
+                    let rid = self.store.db.pid("requirements", &req)?;
                     (self.emit)(
                         "node.changed",
-                        json!({"id": format!("requirements/{req}"), "change": "requirement_edited"}),
+                        json!({"id": rid, "change": "requirement_edited"}),
                     );
-                    changeset = Some(self.on_requirement_edited(&req, "human").await?);
+                    // the edit becomes work for a coding agent (like any requirement edit)
+                    let w = self
+                        .store
+                        .enqueue(&kodehub_store::queue::NewWorkItem {
+                            project: self.store.db.require_project()?,
+                            agent_type: "coding".into(),
+                            kind: "requirement_changed".into(),
+                            target: Some(rid),
+                            priority: kodehub_store::queue::PRIORITY_HIGH,
+                            task: json!({"requirement": req, "edited_by": "human (proposed by orchestrator)"}),
+                            requested_by: Some("human".into()),
+                            ..Default::default()
+                        })
+                        .await?;
+                    changeset = w["_key"].as_str().map(str::to_string);
                 }
             }
             "create_requirement" => {
@@ -1584,32 +1701,87 @@ impl Engine {
                     .filter(|s| !s.is_empty())
                     .map(|s| vec![key_of(s).to_string()])
                     .unwrap_or_default();
-                let cs = self
+                // a change asked for in chat is a work item with a proposal, planned now
+                let w = self
                     .store
-                    .open_changeset(
+                    .enqueue(&kodehub_store::queue::NewWorkItem {
+                        project: self.store.db.require_project()?,
+                        agent_type: "coding".into(),
+                        kind: "chat_request".into(),
+                        task: json!({"title": a["title"], "description": a["description"]}),
+                        requested_by: Some("human".into()),
+                        ..Default::default()
+                    })
+                    .await?;
+                let k = w["_key"].as_str().unwrap_or_default().to_string();
+                self.store
+                    .open_proposal(
+                        &k,
                         a["title"].as_str().unwrap_or("Change"),
                         a["description"].as_str().unwrap_or(""),
                         &req,
                         "orchestrator",
                     )
                     .await?;
-                let k = cs["_key"].as_str().unwrap_or_default().to_string();
                 self.plan(&k).await?;
                 changeset = Some(k);
             }
             _ => {}
         }
-        Ok(self
-            .store
+        set_message_status(
+            &self.store,
+            &msg,
+            json!({"status": "applied", "work_item": changeset}),
+        )
+        .await
+    }
+}
+
+/// The project's conversation between humans and the orchestrator (an `agent_chats` thread).
+pub async fn main_chat(store: &Store) -> Result<String> {
+    let key = store.db.pkey("main")?;
+    let id = format!("agent_chats/{key}");
+    if store.get_node(&id).await.is_err() {
+        store
             .db
-            .patch(
-                "chat_messages",
-                message_key,
-                &json!({"status": "applied", "changeset": changeset}),
+            .insert_ignore(
+                "agent_chats",
+                &json!({"_key": key, "kind": "conversation", "title": "Ask Kodehub",
+                        "created_at": now_iso()}),
                 None,
             )
-            .await?)
+            .await?;
+        store.own(&id).await?;
     }
+    Ok(id)
+}
+
+/// A chat message with its `data` (role, action, proposal, status) at the top level.
+pub fn flatten_message(m: Value) -> Value {
+    let mut out = m.clone();
+    if let Some(d) = m["data"].as_object() {
+        for (k, v) in d {
+            out[k] = v.clone();
+        }
+    }
+    out
+}
+
+/// Record what happened to a proposal made in chat (bookkeeping on the message; its text never
+/// changes).
+async fn set_message_status(store: &Store, msg: &Value, status: Value) -> Result<Value> {
+    let mut data = msg["data"].clone();
+    if let Some(o) = status.as_object() {
+        for (k, v) in o {
+            data[k] = v.clone();
+        }
+    }
+    let key = msg["_key"].as_str().unwrap_or_default();
+    let v = store
+        .db
+        .patch("agent_chat_msgs", key, &json!({"data": data}), None)
+        .await?;
+    Ok(flatten_message(v))
 }
 
 fn str_list(v: &Value) -> Vec<String> {

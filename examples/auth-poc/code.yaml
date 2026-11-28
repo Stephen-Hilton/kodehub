@@ -1,9 +1,11 @@
-# Code symbols. `signature` is name-free; the renderer composes `<display name><signature>`.
-# Bodies are stored unindented, without the enclosing braces / `def` line.
+# Code nodes (docs/ontology.md `code`). `signature` is name-free; the renderer composes
+# `<display name><signature>`. Bodies are stored unindented, without the enclosing braces / `def` line.
+# `namespace` / `public_name` are the public projection used when rendering.
 
-# ------------------------------------------------------------------ Rust: password-hashing
 - key: hash_password
   display_name: hash_password
+  namespace: auth_sdk
+  public_name: hash_new_password
   kind: function
   language: rust
   description: Hash a password with Argon2id and a fresh random salt.
@@ -23,6 +25,7 @@
       - argon2::password_hash::{PasswordHasher, SaltString}
       - rand_core::OsRng
 
+
 - key: verify_password
   display_name: verify_password
   kind: function
@@ -41,6 +44,7 @@
     uses:
       - argon2::Argon2
       - argon2::password_hash::{PasswordHash, PasswordVerifier}
+
 
 # Planted fixture (doc 08): exact duplicate of verify_password under another name.
 - key: check_password
@@ -63,6 +67,7 @@
       - argon2::Argon2
       - argon2::password_hash::{PasswordHash, PasswordVerifier}
 
+
 # ------------------------------------------------------------------ Rust: credential-verification
 - key: AuthResult
   display_name: AuthResult
@@ -77,6 +82,7 @@
     derives: [Debug, Clone, PartialEq, Eq]
     item_attrs: ['#[serde(rename_all = "snake_case")]']
 
+
 - key: User
   display_name: User
   kind: class
@@ -88,6 +94,7 @@
     pub password_hash: String,
   attributes:
     derives: [Debug, Clone, Default, PartialEq, Eq]
+
 
 - key: UserStore
   display_name: UserStore
@@ -101,6 +108,7 @@
     derives: [Debug, Clone, Default]
     uses: [std::collections::HashMap]
 
+
 - key: UserStore-new
   display_name: UserStore::new
   kind: function
@@ -108,6 +116,7 @@
   signature: "() -> Self"
   body: |
     Self::default()
+
 
 - key: UserStore-add_user
   display_name: UserStore::add_user
@@ -123,6 +132,7 @@
     };
     self.users.insert(username.to_string(), user);
 
+
 - key: UserStore-find_user
   display_name: UserStore::find_user
   kind: function
@@ -131,8 +141,11 @@
   body: |
     self.users.get(username).cloned()
 
+
 - key: verify_credentials
   display_name: verify_credentials
+  namespace: auth_sdk
+  public_name: check_login
   kind: function
   language: rust
   description: Check a username/password pair; every failure is the same generic result.
@@ -147,79 +160,6 @@
         _ => AuthResult::InvalidCredentials,
     }
 
-# ------------------------------------------------------------------ Rust tests (from requirements)
-- key: test_unknown_user_is_invalid
-  display_name: test_unknown_user_is_invalid
-  kind: test
-  language: rust
-  description: "R1 example: unknown user → invalid_credentials"
-  signature: ""
-  body: |
-    let mut store = UserStore::new();
-    store.add_user("alice", "correct horse");
-    assert_eq!(
-        verify_credentials(&store, "bob", "correct horse"),
-        AuthResult::InvalidCredentials
-    );
-
-- key: test_wrong_password_is_invalid
-  display_name: test_wrong_password_is_invalid
-  kind: test
-  language: rust
-  description: "R1 example: wrong password → invalid_credentials"
-  signature: ""
-  body: |
-    let mut store = UserStore::new();
-    store.add_user("alice", "correct horse");
-    assert_eq!(
-        verify_credentials(&store, "alice", "wrong"),
-        AuthResult::InvalidCredentials
-    );
-
-- key: test_empty_username_is_invalid
-  display_name: test_empty_username_is_invalid
-  kind: test
-  language: rust
-  description: "R1 edge case: empty username → invalid_credentials"
-  signature: ""
-  body: |
-    let mut store = UserStore::new();
-    store.add_user("alice", "correct horse");
-    assert_eq!(
-        verify_credentials(&store, "", "anything"),
-        AuthResult::InvalidCredentials
-    );
-
-- key: test_valid_login_succeeds
-  display_name: test_valid_login_succeeds
-  kind: test
-  language: rust
-  description: "R1 constraint: the generic error is only for failures; valid credentials authenticate"
-  signature: ""
-  body: |
-    let mut store = UserStore::new();
-    store.add_user("alice", "correct horse");
-    assert_eq!(
-        verify_credentials(&store, "alice", "correct horse"),
-        AuthResult::Authenticated {
-            username: "alice".to_string()
-        }
-    );
-
-- key: test_hashes_are_salted_argon2id
-  display_name: test_hashes_are_salted_argon2id
-  kind: test
-  language: rust
-  description: "R2 example: same password hashed twice → different Argon2id hashes, both verify"
-  signature: ""
-  body: |
-    let a = hash_password("hunter2");
-    let b = hash_password("hunter2");
-    assert_ne!(a, b);
-    assert!(a.starts_with("$argon2id$"));
-    assert!(verify_password("hunter2", &a));
-    assert!(verify_password("hunter2", &b));
-    assert!(!verify_password("hunter3", &a));
 
 # ------------------------------------------------------------------ Python: credential-verification
 - key: py-demo_users
@@ -238,6 +178,7 @@
   attributes:
     imports: ["from argon2 import PasswordHasher"]
     packages: ["argon2-cffi"]
+
 
 - key: py-authenticate
   display_name: authenticate
@@ -258,8 +199,11 @@
     imports: ["from argon2 import PasswordHasher"]
     packages: ["argon2-cffi"]
 
+
 - key: py-login
   display_name: login
+  namespace: auth_sdk
+  public_name: sign_in
   kind: function
   language: python
   description: Public login entry point. Never says which credential failed.
@@ -268,39 +212,3 @@
     if authenticate(demo_users(), username, password) == "authenticated":
         return {"ok": True, "username": username}
     return {"ok": False, "error": "invalid_credentials"}
-
-- key: py-test_login_unknown_user
-  display_name: test_login_unknown_user
-  kind: test
-  language: python
-  description: "R1 example: unknown user → invalid_credentials"
-  signature: ""
-  body: |
-    assert login("mallory", "wonderland") == {"ok": False, "error": "invalid_credentials"}
-
-- key: py-test_login_wrong_password
-  display_name: test_login_wrong_password
-  kind: test
-  language: python
-  description: "R1 example: wrong password → invalid_credentials"
-  signature: ""
-  body: |
-    assert login("alice", "nope") == {"ok": False, "error": "invalid_credentials"}
-
-- key: py-test_login_empty_username
-  display_name: test_login_empty_username
-  kind: test
-  language: python
-  description: "R1 edge case: empty username → invalid_credentials"
-  signature: ""
-  body: |
-    assert login("", "wonderland") == {"ok": False, "error": "invalid_credentials"}
-
-- key: py-test_login_success
-  display_name: test_login_success
-  kind: test
-  language: python
-  description: Valid credentials authenticate.
-  signature: ""
-  body: |
-    assert login("alice", "wonderland") == {"ok": True, "username": "alice"}

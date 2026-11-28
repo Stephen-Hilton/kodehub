@@ -294,23 +294,29 @@ impl Runner {
         Ok((out.success(), out.combined(), !out.timed_out))
     }
 
-    /// Record an artifact in the store (`artifacts` collection).
-    pub async fn record_artifact(&self, store: &Store, b: &BuildOutcome) -> Result<()> {
-        let key = blake3::hash(format!("{}|{}", b.closure_hash, b.target).as_bytes()).to_hex()
-            [..24]
-            .to_string();
+    /// Record a build in the store (`builds`, docs/ontology.md) with `build_of` edges to the
+    /// versions of `g` it was made from (its closure).
+    pub async fn record_artifact(
+        &self,
+        store: &Store,
+        b: &BuildOutcome,
+        g: &kodehub_core::CodeGraph,
+        roots: &[String],
+    ) -> Result<()> {
+        let members: Vec<String> = g
+            .closure(roots, false)
+            .map(|m| m.into_values().collect())
+            .unwrap_or_default();
         store
-            .db
-            .upsert(
-                "artifacts",
-                &json!({
-                    "_key": key,
-                    "closure_hash": b.closure_hash,
-                    "build_target": b.target,
+            .record_build(
+                &b.closure_hash,
+                &b.target,
+                json!({
                     "path": b.dir.to_string_lossy(),
-                    "built_at": now_iso(),
                     "status": if b.ok { "ok" } else { "failed" },
+                    "duration_ms": b.duration_ms,
                 }),
+                &members,
                 None,
             )
             .await?;

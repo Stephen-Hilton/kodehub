@@ -73,10 +73,10 @@ test("doc 08 demo, entirely in the desktop UI", async ({ page, request }) => {
   await page.getByTestId("req-save").click();
   await expect(editor).toBeHidden();
 
-  // 3. R1 turns amber; the edit is queued and a changeset is planned, with ghost nodes on the map
+  // 3. R1 turns amber; the edit is queued and its work item proposal is planned, with ghost nodes on the map
   await expect(page.getByTestId("req-r1-generic-failure")).toContainText("At risk");
   await page.getByTestId("tab-work").click();
-  const planned = page.locator('[data-testid^="changeset-"][data-state="planned"]');
+  const planned = page.locator('[data-testid^="proposal-"][data-state="planned"]');
   await expect(planned).toBeVisible({ timeout: 60_000 });
   await page.getByTestId("tab-map").click();
   await expect.poll(() => page.evaluate(() => (window as any).__kodehubCy.nodes(".ghost").length)).toBeGreaterThan(0);
@@ -84,9 +84,9 @@ test("doc 08 demo, entirely in the desktop UI", async ({ page, request }) => {
   await shot(page, "03-planned-ghosts");
   await page.getByTestId("tab-work").click();
 
-  // 4. human approves the plan → 5–7 tester, coder, blind reviewer, decision, tests, merge
+  // 4. human approves the plan → 5–7 tester, coder, blind reviewer, decision, tests, acceptance
   await planned.getByTestId("cs-approve").click();
-  const merged = page.locator('[data-testid^="changeset-"][data-state="merged"]');
+  const merged = page.locator('[data-testid^="proposal-"][data-state="accepted"]');
   await expect(merged).toBeVisible({ timeout: 240_000 });
   await expect(merged).toContainText("decision");
   await merged.getByRole("button", { name: "Details" }).click();
@@ -96,7 +96,7 @@ test("doc 08 demo, entirely in the desktop UI", async ({ page, request }) => {
   await shot(page, "04-merged-green");
   await page.getByTestId("tab-decisions").click();
   await expect(page.getByTestId("decisions")).toContainText("Review: Timing");
-  await page.getByTestId("tab-changesets").click();
+  await page.getByTestId("tab-proposals").click();
   await page.getByTestId("tab-requirements").click();
   await expect(page.getByTestId("req-r1-generic-failure")).toContainText("Passing", { timeout: 60_000 });
   await page.getByTestId("tab-map").click();
@@ -141,28 +141,32 @@ test("doc 08 demo, entirely in the desktop UI", async ({ page, request }) => {
   await panel.getByTestId("example-desc").fill("Locked user with the right password");
   await panel.getByTestId("example-save").click();
   await expect(page.locator(".toast", { hasText: "Saved as example" })).toBeVisible();
-  // saving an example is a requirement edit: the agents turn it into a test and merge — green again
+  // saving an example is a requirement edit: the agents turn it into a test and accept it — green again
   await page.getByRole("button", { name: "Close panel" }).click();
   await page.getByTestId("tab-work").click();
-  const example = page.locator('[data-testid^="changeset-"][data-state="planned"]');
+  const example = page.locator('[data-testid^="proposal-"][data-state="planned"]');
   await expect(example).toBeVisible({ timeout: 60_000 });
   await example.getByTestId("cs-approve").click();
   await expect(page.getByTestId("kpi-passing")).toHaveText("2/2", { timeout: 240_000 });
   await page.getByTestId("tab-requirements").click();
   await expect(page.getByTestId("req-r1-generic-failure")).toContainText("Passing", { timeout: 240_000 });
 
-  // 9. create a release and promote it to test
+  // 9. open a named project version (the release), deploy it to dev and promote it to test:
+  // the first deployment beyond dev freezes it
   await page.getByTestId("tab-releases").click();
   await page.getByTestId("release-name").fill("demo-1");
   await page.getByTestId("cut-release").click();
-  await expect(page.getByTestId("env-dev-release")).toHaveText("demo-1");
+  await expect(page.getByTestId("release-state-demo-1")).toHaveText("open");
+  await page.getByTestId("deploy-demo-1").click();
+  await expect(page.getByTestId("env-dev-release")).toHaveText("demo-1", { timeout: 60_000 });
   await page.getByTestId("promote-test").click();
   await expect(page.getByTestId("env-test-release")).toHaveText("demo-1", { timeout: 120_000 });
   await expect(page.getByTestId("gate-report")).toContainText("passed");
+  await expect(page.getByTestId("release-state-demo-1")).toHaveText("frozen");
   await shot(page, "06-release-promoted");
   await page.getByTestId("tab-map").click();
 
-  // time slider: view the system as it was at the seed — every seed symbol, no ghosts
+  // time slider: view the first project version (open since the seed) — every seed symbol, no ghosts
   await page.getByTestId("time-stop-0").click();
   await expect(page.getByTestId("history-banner")).toBeVisible();
   await expect.poll(() => page.evaluate(() => (window as any).__kodehubCy.nodes(".symbol").length)).toBeGreaterThanOrEqual(10);

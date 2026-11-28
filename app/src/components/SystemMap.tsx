@@ -1,7 +1,7 @@
 import cytoscape, { type Core, type StylesheetJson } from "cytoscape";
 import fcose from "cytoscape-fcose";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { MapData, MapNode } from "../lib/api";
+import { localKey, type MapData, type MapNode } from "../lib/api";
 import { HEALTH } from "../lib/health";
 import { buildElements, computeLayout, depthForZoom, isVisible, LEVELS, nodeWidth, shownOnMap } from "../lib/mapModel";
 import { Fit, Layers, Search } from "./icons";
@@ -108,7 +108,7 @@ function style(): StylesheetJson {
       },
     },
     { selector: "edge.e-depends_on", style: { "line-style": "dashed", "line-color": "rgba(148,163,184,0.35)", "target-arrow-color": "rgba(148,163,184,0.55)" } },
-    { selector: "edge.e-tested_by", style: { "line-style": "dotted", "line-color": "rgba(94,234,212,0.35)", "target-arrow-color": "rgba(94,234,212,0.55)" } },
+    { selector: "edge.e-tested_with", style: { "line-style": "dotted", "line-color": "rgba(94,234,212,0.35)", "target-arrow-color": "rgba(94,234,212,0.55)" } },
     { selector: "edge.e-binds_to", style: { "line-color": "rgba(251,146,60,0.6)", "target-arrow-color": "rgba(251,146,60,0.8)", width: 2 } },
     { selector: "edge.hl", style: { width: 2.2, opacity: 1 } },
   );
@@ -342,7 +342,7 @@ export function SystemMap({ data, selected, highlight, onSelect, showTests, setS
           {qOpen && matches.length > 0 && (
             <div className="search-results glass">
               {matches.map((m, i) => (
-                <div key={m.id} className={`search-item ${i === qIdx ? "on" : ""}`} onMouseDown={() => choose(m)} data-testid={`search-result-${m.key}`}>
+                <div key={m.id} className={`search-item ${i === qIdx ? "on" : ""}`} onMouseDown={() => choose(m)} data-testid={`search-result-${localKey(m.key)}`}>
                   <span className="dot" style={{ background: HEALTH[m.health]?.color ?? "#64748b" }} />
                   <span className="mono" style={{ flex: 1 }}>{m.label}</span>
                   <span className="faint" style={{ fontSize: 11 }}>{m.level === "symbol" ? `${m.kind} · ${m.language}` : m.level}</span>

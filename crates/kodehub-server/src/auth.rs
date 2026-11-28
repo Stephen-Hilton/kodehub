@@ -42,6 +42,33 @@ const UNSCOPED: &[&str] = &[
     "/api/users",
 ];
 
+/// The only writes a remote agent may make (D-061): add work items, edit requirements and use
+/// cases, start tests and runs, talk to the agents. Never code, builds, releases or deploys.
+const REMOTE_AGENT_WRITES: &[&str] = &[
+    "/api/work-items",
+    "/api/requirements",
+    "/api/use-cases",
+    "/api/tests/run",
+    "/api/test-now",
+    "/api/run",
+    "/api/chat",
+    "/api/query",
+    "/api/traverse",
+    "/api/auth/logout",
+];
+
+/// True when a remote agent may make this (non-GET) call.
+pub fn remote_agent_may_write(path: &str) -> bool {
+    // a work item's proposal is driven by Kodehub's own agents and humans, never a remote
+    // agent (as v0.1 changesets were) — it may create and follow work items only
+    if path.starts_with("/api/work-items/") && path.contains("/proposal") {
+        return false;
+    }
+    REMOTE_AGENT_WRITES
+        .iter()
+        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
+}
+
 /// The selected project for a request.
 #[derive(Debug, Clone)]
 pub struct ProjectCtx {
@@ -153,6 +180,12 @@ pub async fn auth_guard(State(s): State<AppState>, mut req: Request, next: Next)
         }
     }
     let method = req.method().clone();
+    if principal.is_remote_agent() && method != Method::GET && !remote_agent_may_write(&path) {
+        return forbidden(
+            "remote agents add work items, edit requirements and start tests; \
+             code, builds and deployments are changed only by Kodehub's internal agents",
+        );
+    }
     let needs_project = !UNSCOPED.iter().any(|u| path.starts_with(u));
     let mut project: Option<ProjectCtx> = None;
     if needs_project {
@@ -180,7 +213,7 @@ pub async fn auth_guard(State(s): State<AppState>, mut req: Request, next: Next)
         // reading endpoints that use POST for a query body
         let read_post = matches!(
             path.as_str(),
-            "/api/query" | "/api/traverse" | "/api/releases/bisect"
+            "/api/query" | "/api/traverse" | "/api/project-versions/bisect"
         );
         if perm < need && !(read_post && perm >= Permission::Read) {
             return forbidden(&format!(
@@ -240,5 +273,14 @@ mod tests {
             Some("abc")
         );
         assert_eq!(project_in_path("/api/scopes/org:x/settings"), None);
+        assert!(remote_agent_may_write("/api/work-items"));
+        assert!(remote_agent_may_write("/api/requirements/r1/edge_cases"));
+        assert!(!remote_agent_may_write("/api/work-items/x/proposal/accept"));
+        assert!(!remote_agent_may_write("/api/requirementsx"));
+        assert!(!remote_agent_may_write("/api/environments/prod/promote"));
+        assert!(!remote_agent_may_write("/api/deployments"));
+        assert!(!remote_agent_may_write(
+            "/api/work-items/x/proposal/versions"
+        ));
     }
 }

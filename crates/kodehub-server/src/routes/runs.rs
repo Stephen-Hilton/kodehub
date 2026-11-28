@@ -72,8 +72,8 @@ pub struct RunBody {
     pub token: Option<String>,
 }
 
-/// The code graph an environment runs: the lowest environment (dev) = the stable working
-/// graph; others = their most recently entered release.
+/// The code graph an environment runs: the lowest environment (dev) = the current project
+/// version; others = the project version most recently deployed there.
 pub async fn graph_for_env(
     s: &AppState,
     env: &str,
@@ -82,10 +82,16 @@ pub async fn graph_for_env(
     if lowest.as_deref() == Some(env) || env == "dev" {
         return Ok((s.store.load_code_graph().await?, None));
     }
-    match s.store.release_graph_for_env(env).await? {
-        Some((rel, g)) => Ok((g, Some(rel))),
+    match s.store.current_deployments(env).await?.first() {
+        Some(d) => {
+            let pv = d["project_version"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            Ok((s.store.load_code_graph_at(Some(&pv)).await?, Some(pv)))
+        }
         None => Err(ApiError::bad_request(format!(
-            "no release is running in `{env}` yet — promote one first"
+            "nothing runs in `{env}` yet — deploy a project version first"
         ))),
     }
 }
@@ -93,7 +99,7 @@ pub async fn graph_for_env(
 pub async fn run_now(State(s): State<AppState>, Json(b): Json<RunBody>) -> ApiResult<Value> {
     let env = b.environment.unwrap_or_else(|| "dev".into());
     let key = crate::routes::graph::resolve_symbol(&s, &b.symbol).await?;
-    let (g, release) = graph_for_env(&s, &env).await?;
+    let (g, project_version) = graph_for_env(&s, &env).await?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<kodehub_runner::OutputLine>();
     let ev = s.events.clone();
     let token = b.token.clone();
@@ -118,7 +124,7 @@ pub async fn run_now(State(s): State<AppState>, Json(b): Json<RunBody>) -> ApiRe
                 symbol: key.clone(),
                 args,
                 environment: env.clone(),
-                release,
+                project_version,
             },
             Some(tx),
         )
@@ -139,8 +145,9 @@ pub async fn list_runs(
     Ok(Json(
         s.store
             .aql(
-                "FOR r IN @@runs FILTER @s == null OR r.symbol == @s SORT r.ran_at DESC LIMIT @n RETURN r",
-                json!({"s": q.symbol, "n": q.limit.unwrap_or(50)}),
+                "FOR r IN @@test_logs FILTER r.kind == 'run' AND (@s == null OR r.symbol == @s)
+                   SORT r.ran_at DESC LIMIT @n RETURN r",
+                json!({"s": q.symbol.as_deref().map(|x| s.store.db.pkey(x)).transpose()?, "n": q.limit.unwrap_or(50)}),
             )
             .await?,
     ))

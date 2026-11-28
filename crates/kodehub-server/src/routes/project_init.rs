@@ -44,48 +44,70 @@ pub async fn copy_template(s: &AppState, from: &str, to: &str) -> Result<Value, 
     let src = s.store.for_project(from);
     let dst = s.store.for_project(to);
     let mut copied = json!({"contexts": 0, "requirements": 0});
-    for coll in ["contexts", "requirement_groups", "requirements"] {
-        for mut d in src
-            .aql(
-                "FOR d IN @@c RETURN UNSET(d, '_id', '_rev')",
-                json!({"@c": coll}),
-            )
-            .await?
-        {
-            if coll == "requirements" {
-                d["revision"] = json!(1);
-                d["covered_revision"] = json!(0);
-                d["at_risk"] = json!(false);
-            }
-            if coll == "contexts" {
-                d["lifecycle"] = json!("planned");
-            }
-            dst.db.upsert(coll, &d, None).await?;
-            if let Some(n) = copied.get_mut(coll).and_then(|v| v.as_u64()) {
-                copied[coll] = json!(n + 1);
-            }
+    // keys and ids move from the source project to the target project (D-055)
+    let rekey = |k: &str| kodehub_store::arango::qualify(to, kodehub_store::arango::local_key(k));
+    let reid = |id: &str| match id.split_once('/') {
+        Some((c, k)) => format!("{c}/{}", rekey(k)),
+        None => id.to_string(),
+    };
+    // contexts are placed under the target's project node (into its current project version)
+    let root = dst.project_node()?;
+    for mut d in src
+        .aql(
+            "FOR d IN @@contexts RETURN UNSET(d, '_id', '_rev', 'project')",
+            json!({}),
+        )
+        .await?
+    {
+        d["_key"] = json!(rekey(d["_key"].as_str().unwrap_or_default()));
+        d["lifecycle"] = json!("planned");
+        let id = format!("contexts/{}", d["_key"].as_str().unwrap_or_default());
+        if dst.get_node(&id).await.is_err() {
+            dst.insert_node("contexts", d).await?;
+            dst.insert_edge("contains", &root, &id, json!({})).await?;
+            copied["contexts"] = json!(copied["contexts"].as_u64().unwrap_or(0) + 1);
         }
     }
-    for coll in ["satisfies", "includes", "contains"] {
-        let rows = src
-            .aql(
-                "FOR e IN @@c FILTER !STARTS_WITH(e._from, CONCAT(@pfx, 'symbols/')) AND !STARTS_WITH(e._to, CONCAT(@pfx, 'symbols/'))
-                   AND !STARTS_WITH(e._to, CONCAT(@pfx, 'containers/')) AND !STARTS_WITH(e._from, CONCAT(@pfx, 'containers/'))
-                   RETURN {_from: e._from, _to: e._to}",
-                json!({"@c": coll}),
-            )
-            .await?;
-        for e in rows {
-            let (f, t) = (
-                e["_from"].as_str().unwrap_or(""),
-                e["_to"].as_str().unwrap_or(""),
-            );
-            if dst.get_node(f).await.is_ok() && dst.get_node(t).await.is_ok() {
-                let k = kodehub_store::edge_key(coll, f, t);
-                dst.db
-                    .insert_ignore(coll, &json!({"_key": k, "_from": f, "_to": t}), None)
-                    .await?;
-            }
+    // accepted requirements start over at revision 1 (with their first version)
+    for d in src
+        .aql(
+            "FOR d IN @@requirements FILTER d.state == null OR d.state == 'accepted'
+               RETURN UNSET(d, '_id', '_rev', 'project', 'revision', 'covered_revision', 'at_risk',
+                            'created_at', 'updated_at')",
+            json!({}),
+        )
+        .await?
+    {
+        let mut d = d;
+        d["_key"] = json!(rekey(d["_key"].as_str().unwrap_or_default()));
+        if dst
+            .get_node(&format!(
+                "requirements/{}",
+                d["_key"].as_str().unwrap_or_default()
+            ))
+            .await
+            .is_err()
+        {
+            dst.create_requirement(d).await?;
+            copied["requirements"] = json!(copied["requirements"].as_u64().unwrap_or(0) + 1);
+        }
+    }
+    // what each requirement applies to: the project or a copied context
+    let src_root = src.project_node()?;
+    let rows = src
+        .aql(
+            "FOR e IN @@applies_to FILTER STARTS_WITH(e._from, 'requirements/')
+               AND (STARTS_WITH(e._to, 'contexts/') OR STARTS_WITH(e._to, 'projects/'))
+               RETURN {_from: e._from, _to: e._to}",
+            json!({}),
+        )
+        .await?;
+    for e in rows {
+        let f = reid(e["_from"].as_str().unwrap_or(""));
+        let t = e["_to"].as_str().unwrap_or("");
+        let t = if t == src_root { root.clone() } else { reid(t) };
+        if dst.get_node(&f).await.is_ok() && dst.get_node(&t).await.is_ok() {
+            dst.insert_edge("applies_to", &f, &t, json!({})).await?;
         }
     }
     Ok(copied)
@@ -130,18 +152,9 @@ pub async fn initialize(
                 )
                 .await?;
             let id = doc["_id"].as_str().unwrap_or_default().to_string();
-            // contexts hang off the project root (the philosophy node)
-            if store.get_philosophy().await?.is_some() {
-                let k = kodehub_store::edge_key("contains", kodehub_store::c4::PHILOSOPHY_ID, &id);
-                store
-                    .db
-                    .insert_ignore(
-                        "contains",
-                        &json!({"_key": k, "_from": kodehub_store::c4::PHILOSOPHY_ID, "_to": id}),
-                        None,
-                    )
-                    .await?;
-            }
+            // contexts hang off the project node; placing puts them in the current version
+            let root = store.project_node()?;
+            store.insert_edge("contains", &root, &id, json!({})).await?;
             made.push(json!(id));
         }
         Ok::<_, ApiError>(json!({"contexts": made}))

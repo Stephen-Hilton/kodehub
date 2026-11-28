@@ -27,12 +27,12 @@ export function ProjectsScreen({ current, onOpen }: { current: string | null; on
             <div>
               <div style={{ fontWeight: 600 }}>{p.name}</div>
               <div className="faint" style={{ fontSize: 12 }}>
-                {p.description || "—"} · {p.counts?.symbols ?? 0} code nodes · {p.counts?.requirements ?? 0} requirements
+                {p.description || "—"} · {p.counts?.code ?? 0} code nodes · {p.counts?.tests ?? 0} tests · {p.counts?.requirements ?? 0} requirements
                 {p.last_opened_at ? ` · opened ${relTime(p.last_opened_at)}` : ""}
               </div>
             </div>
             <span className="spacer" />
-            <span className="chip">{String(p.owner ?? "").replace("kodehub_users/", "").replace("kodehub_orgs/", "org: ")}</span>
+            <span className="chip">{String(p.owner ?? "").replace("users/", "").replace("orgs/", "org: ")}</span>
             <span className={`badge ${p.permission === "admin" ? "pass" : ""}`}>{p.permission}</span>
           </button>
         ))}

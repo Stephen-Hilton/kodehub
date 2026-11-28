@@ -103,7 +103,7 @@ function Shell({ me }: { me: Json }) {
     if (!selectedReq) { setHighlight(null); return; }
     api.requirement(selectedReq).then((r) => {
       const p = r.path ?? {};
-      const ids = new Set<string>([...(p.satisfiers ?? []), ...(p.beneath ?? []), ...(p.tests ?? [])]);
+      const ids = new Set<string>([...(p.applies_to ?? []), ...(p.beneath ?? []), ...(p.tests ?? [])]);
       const byId = new Map((data.map?.nodes ?? []).map((n) => [n.id, n]));
       for (const id of [...ids]) {
         let n = byId.get(id);
@@ -116,8 +116,10 @@ function Shell({ me }: { me: Json }) {
   useEffect(() => {
     if (!at || !compareAt) { setCompare(null); return; }
     Promise.all([api.map(at), api.map(compareAt)]).then(([a, b]) => {
-      const va = new Map(a.nodes.filter((n) => n.level === "symbol").map((n) => [n.id, n.version_at]));
-      const names = b.nodes.filter((n) => n.level === "symbol" && va.get(n.id) !== n.version_at).map((n) => n.label);
+      // the version of each code node in either project version (the live map has no version_at)
+      const ver = (n: MapNode) => n.version_at ?? n.version ?? null;
+      const va = new Map(a.nodes.filter((n) => n.level === "symbol" && !n.ghost).map((n) => [n.id, ver(n)]));
+      const names = b.nodes.filter((n) => n.level === "symbol" && !n.ghost && va.get(n.id) !== ver(n)).map((n) => n.label);
       setCompare({ names });
     });
   }, [at, compareAt]);
@@ -134,7 +136,7 @@ function Shell({ me }: { me: Json }) {
   const selectNode = useCallback((id: string | null, node?: MapNode) => {
     setBadge(null);
     if (!id) { setSelected(null); return; }
-    if (node?.ghost) { toast("info", `${node.label} is proposed in changeset ${node.changeset} — it becomes real when that merges.`); return; }
+    if (node?.ghost) { toast("info", `${node.label} is proposed by work item ${node.work_item} — it becomes real when its proposal is accepted.`); return; }
     setSelected({ id, ...anchorOf(id) });
   }, [toast, anchorOf]);
 
@@ -153,7 +155,9 @@ function Shell({ me }: { me: Json }) {
   const symbolKey = selectedNode && selectedNode.level === "symbol" && !at ? selectedNode.key : null;
   const testsTotal = useMemo(() => (data.map?.nodes ?? []).filter((n) => n.kind === "test" && !n.ghost).length, [data.map]);
   const tests = useMemo(() => (data.map?.nodes ?? []).filter((n) => n.kind === "test" && !n.ghost).map((n) => ({ id: n.id, label: n.label })), [data.map]);
-  const atLabel = data.timeline.find((e) => e.at === at);
+  // `at` is a project version id; its stop on the time slider names it
+  const atLabel = data.timeline.find((e) => e.project_version === at && e.kind !== "accept")
+    ?? data.timeline.find((e) => e.project_version === at);
 
   const runAll = async () => {
     setTestsRunning(true);
@@ -175,7 +179,7 @@ function Shell({ me }: { me: Json }) {
   return (
     <div className="app v01" style={{ gridTemplateRows: terminalOpen ? "auto auto minmax(0,1fr) auto auto auto" : undefined }}>
       <MissionBanner mission={data.map?.mission} requirements={data.requirements} connected={data.connected}
-        openChangesets={data.changesets.filter((c) => !["merged", "rejected"].includes(c.state)).length} testsTotal={testsTotal} />
+        openChangesets={data.proposals.filter((c) => !["accepted", "rejected"].includes(c.state)).length} testsTotal={testsTotal} />
       <TopNav screen={screen} setScreen={(s) => { setScreen(s); setBadge(null); setSelected(null); }} me={me} projects={projects}
         project={project} onProject={openProject} attention={attention} />
       <div className="main single">
@@ -188,7 +192,7 @@ function Shell({ me }: { me: Json }) {
               {at && (
                 <div className="history-banner glass" data-testid="history-banner">
                   <Eye size={14} />
-                  <span>Viewing the system as of <b>{atLabel?.label ?? at}</b> · {relTime(at)}</span>
+                  <span>Viewing project version <b>{data.map?.project_version?.name ?? atLabel?.label ?? at}</b>{atLabel?.at ? <> · {relTime(atLabel.at)}</> : null}</span>
                   {compare && <span className="badge ghost">{compare.names.length} changed between points{compare.names.length ? `: ${compare.names.slice(0, 4).join(", ")}${compare.names.length > 4 ? "…" : ""}` : ""}</span>}
                   <button className="btn sm" onClick={() => { setAt(null); setCompareAt(null); }}>Back to live</button>
                 </div>
@@ -226,19 +230,23 @@ function Shell({ me }: { me: Json }) {
           </div>
         )}
         {screen === "requirements" && (
-          <RequirementsScreen requirements={data.requirements} groups={data.groups} onOpen={(k) => setEditor({ key: k, edge: false })}
+          <RequirementsScreen requirements={data.requirements} tags={data.tags} onOpen={(k) => setEditor({ key: k, edge: false })}
             onAddEdgeCase={(k) => setEditor({ key: k, edge: true })} onNew={() => setEditor({ key: null, edge: false })}
             onRunTests={runAll} running={testsRunning} onSelectNode={goToNode}
             selected={selectedReq} setSelected={setSelectedReq} />
         )}
         {screen === "use_cases" && <UseCasesScreen requirements={data.requirements} tests={tests} />}
-        {screen === "work" && <WorkScreen agents={data.agents} changesets={data.changesets} reqTitle={reqTitle} />}
-        {screen === "releases" && <ReleasesDrawer inline releases={data.releases} environments={data.environments} onClose={() => setScreen("map")} />}
+        {screen === "work" && <WorkScreen agents={data.agents} proposals={data.proposals} reqTitle={reqTitle} />}
+        {screen === "releases" && <ReleasesDrawer inline versions={data.versions} environments={data.environments} onClose={() => setScreen("map")} />}
         {screen === "settings" && project && <SettingsScreen project={project} me={me} />}
         {screen === "projects" && <ProjectsScreen current={project} onOpen={openProject} />}
       </div>
       <TimeSlider events={data.timeline} at={at} compareAt={compareAt}
-        onPick={(t, cmp) => { if (cmp && at) setCompareAt(t); else { setAt(t); setCompareAt(null); setSelected(null); setScreen("map"); } }}
+        onPick={(t, cmp) => {
+          const current = data.versions.find((v) => v.current)?._id;
+          if (cmp && at) setCompareAt(t);
+          else { setAt(t === current ? null : t); setCompareAt(null); setSelected(null); setScreen("map"); }
+        }}
         onLive={() => { setAt(null); setCompareAt(null); }} />
       <StatusBar environment={environment} setEnvironment={setEnvironment} environments={data.environments} settings={data.settings} health={health}
         onSetToken={(t) => api.patchAgents({ token_env: t }).then(() => toast("success", t ? `New agent work will use ${t}` : "Agents will use the claude CLI login")).catch((e) => toast("error", e.message))}
@@ -246,7 +254,7 @@ function Shell({ me }: { me: Json }) {
         onReleases={() => setScreen("releases")} onTerminal={() => setTerminalOpen((t) => !t)} terminalOpen={terminalOpen} />
       {terminalOpen && <TerminalDock onClose={() => setTerminalOpen(false)} resizer={null} />}
       {editor && editor.key && editor.key !== selectedReq && <ReqHighlight k={editor.key} set={setSelectedReq} />}
-      {editor && <RequirementEditor reqKey={editor.key} groups={data.groups} focusEdgeCase={editor.edge} onClose={() => setEditor(null)} />}
+      {editor && <RequirementEditor reqKey={editor.key} tags={data.tags} focusEdgeCase={editor.edge} onClose={() => setEditor(null)} />}
     </div>
   );
 }

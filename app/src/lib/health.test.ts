@@ -7,8 +7,8 @@ describe("health helpers", () => {
     expect(worst(["pass", "fail", "at_risk"])).toBe("fail");
     expect(worst([])).toBe("uncovered");
   });
-  it("orders changeset states", () => {
-    expect(stateIndex("planned")).toBeLessThan(stateIndex("merged"));
+  it("orders proposal states", () => {
+    expect(stateIndex("planned")).toBeLessThan(stateIndex("accepted"));
   });
   it("formats relative time", () => {
     const now = Date.parse("2026-01-01T00:10:00Z");

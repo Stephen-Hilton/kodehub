@@ -1,67 +1,18 @@
-//! Agent types (spec §4.1): one base agent instantiated per work item with a role, instructions,
-//! tools and context. Built-in types are seeded into each project's `agent_types` collection;
-//! projects can add custom types (`custom:<name>`, e.g. a policy agent) with their own role text.
+//! Agent types (spec §4.1, D-062): one base agent instantiated per work item with a role,
+//! instructions, tools and context. The types live in each project's `agents` collection
+//! (`kodehub_store::agents`): built-ins seeded from the defaults, each with a start-up prompt a
+//! project can change and the permissions it holds; projects can add custom types
+//! (`custom:<name>`, e.g. a policy agent). The prompt templates live here.
 //!
 //! Every non-coding role answers with the same structured shape — a change log and a list of
-//! actions the orchestrator applies through the graph API (`actions.rs`). Coding work goes
-//! through the changeset engine (plan → tests → code → blind review → formal tests → promote).
+//! actions the orchestrator applies through the graph API (`actions.rs`), each checked against
+//! the type's permissions. Coding work goes through the work item's proposal (plan → tests →
+//! code → blind review → formal tests → acceptance).
 
 use kodehub_store::Store;
 use serde_json::{json, Value};
 
 use crate::{Result, Role};
-
-/// (agent type, prompt file, tool role, description)
-pub const BUILTIN: &[(&str, &str, Role, &str)] = &[
-    (
-        "coding",
-        "coder",
-        Role::Coder,
-        "Changes code at the code-node level through changesets.",
-    ),
-    (
-        "test_author",
-        "test_author",
-        Role::Tester,
-        "Writes deterministic shell-run tests and owns the test schedule.",
-    ),
-    (
-        "review",
-        "reviewer",
-        Role::Reviewer,
-        "Blind review of a changeset.",
-    ),
-    (
-        "planning",
-        "planning",
-        Role::Orchestrator,
-        "Breaks direction into containers, components and work items.",
-    ),
-    (
-        "architect",
-        "architect",
-        Role::Orchestrator,
-        "Higher-level decisions: hard failures, conflicts, deadlocks, use cases.",
-    ),
-    (
-        "import",
-        "import",
-        Role::Orchestrator,
-        "Maps an imported repository onto the C4 graph.",
-    ),
-    (
-        "design",
-        "design",
-        Role::Orchestrator,
-        "UI designs that satisfy use cases, handed to coding agents.",
-    ),
-    (
-        "sysadmin",
-        "sysadmin",
-        Role::Orchestrator,
-        "Sets agent caps to fit the cluster.",
-    ),
-];
 
 pub fn prompt_text(file: &str) -> &'static str {
     match file {
@@ -82,33 +33,34 @@ const CONVENTIONS: &str = include_str!("../prompts/conventions.md");
 
 /// Seed the built-in agent types into the project (idempotent).
 pub async fn ensure_agent_types(store: &Store) -> Result<()> {
-    for (t, file, role, desc) in BUILTIN {
-        store
-            .db
-            .insert_ignore(
-                "agent_types",
-                &json!({"_key": t, "builtin": true, "prompt": file, "tool_role": role,
-                        "description": desc, "model": null}),
-                None,
-            )
-            .await?;
-    }
-    Ok(())
+    Ok(store.ensure_agents().await?)
 }
 
-/// The agent type document (`custom:<name>` maps to key `custom-<name>`).
+/// The agent type document (`custom:<name>` is stored as `custom-<name>`).
 pub async fn agent_type(store: &Store, t: &str) -> Result<Value> {
-    ensure_agent_types(store).await?;
-    let key = t.replace(':', "-");
-    Ok(store.db.get("agent_types", &key, None).await?)
+    Ok(store.agent(t).await?)
 }
 
-/// System prompt for an agent type.
+/// System prompt for an agent type: its template, with the project's start-up prompt as the
+/// role text of a custom type, or added as project instructions to a built-in one.
 pub fn system_for(doc: &Value) -> String {
-    let file = doc["prompt"].as_str().unwrap_or("custom");
+    let file = doc["prompt_file"]
+        .as_str()
+        .or(doc["prompt"].as_str().filter(|_| doc["builtin"] == true))
+        .unwrap_or("custom");
     let base = prompt_text(file);
-    base.replace("{{ROLE}}", doc["instructions"].as_str().unwrap_or(""))
-        .replace("{{CONVENTIONS}}", CONVENTIONS)
+    let custom = doc["prompt"]
+        .as_str()
+        .filter(|p| !p.trim().is_empty() && doc["prompt_file"].is_string())
+        .or(doc["instructions"].as_str())
+        .unwrap_or("");
+    let mut out = base
+        .replace("{{ROLE}}", custom)
+        .replace("{{CONVENTIONS}}", CONVENTIONS);
+    if doc["builtin"] == true && !custom.trim().is_empty() && !base.contains("{{ROLE}}") {
+        out.push_str(&format!("\n\n## Project instructions\n{custom}\n"));
+    }
+    out
 }
 
 pub fn tool_role(doc: &Value) -> Role {

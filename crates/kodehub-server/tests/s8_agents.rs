@@ -126,17 +126,19 @@ async fn kickoff_chain_tests_first_escalation_blockers_budget() {
         ),
     )
     .await;
-    // (test setup: trace edges otherwise come through changesets)
-    t.store
-        .for_project(&pid)
-        .db
-        .insert(
-            "satisfies",
-            &json!({"_from": "contexts/web-system", "_to": "requirements/sessions-idle"}),
-            None,
-        )
-        .await
-        .unwrap();
+    // the requirement applies to the context (what the UI does when a human attaches it)
+    let ps0 = t.store.for_project(&pid);
+    kodehub_store::with_project(
+        pid.clone(),
+        ps0.insert_edge(
+            "applies_to",
+            "requirements/sessions-idle",
+            "contexts/web-system",
+            json!({}),
+        ),
+    )
+    .await
+    .unwrap();
 
     drain(&d, 6).await;
     let ps = t.store.for_project(&pid);
@@ -153,16 +155,22 @@ async fn kickoff_chain_tests_first_escalation_blockers_budget() {
         .await
         .unwrap();
     assert!(ps.get_node("containers/web-api").await.is_ok());
-    assert_eq!(lc["components/sessions"]["state"], "planned");
+    assert_eq!(
+        lc[&ps.db.qid("components/sessions").unwrap()]["state"],
+        "planned"
+    );
     // 4. tests before code: the test exists for the planned component, the coding item came after it
     let tests = ps
-        .aql(
-            "FOR s IN @@symbols FILTER s.kind == 'test' RETURN s._key",
-            json!({}),
-        )
+        .aql("FOR s IN @@tests RETURN s._key", json!({}))
         .await
         .unwrap();
-    assert_eq!(tests, vec![json!("test_session_expires_after_idle")]);
+    assert_eq!(
+        tests,
+        vec![json!(ps
+            .db
+            .pkey("test_session_expires_after_idle")
+            .unwrap())]
+    );
     let items = t
         .store
         .list_work_items(Some(&pid), None, 100)

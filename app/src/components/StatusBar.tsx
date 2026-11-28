@@ -1,4 +1,4 @@
-import type { Json } from "../lib/api";
+import { localKey, type Json } from "../lib/api";
 import { Bot, Rocket, TerminalIcon } from "./icons";
 
 export function StatusBar({ environment, setEnvironment, environments, settings, onSetToken, onSetBackend, onReleases, onTerminal, terminalOpen, health }: {
@@ -12,9 +12,9 @@ export function StatusBar({ environment, setEnvironment, environments, settings,
       <div className="status-item">
         <span className="faint">Environment</span>
         <select className="select" value={environment} onChange={(e) => setEnvironment(e.target.value)} data-testid="env-select">
-          {(environments.length ? environments : [{ _key: "dev" }]).map((e: Json) => (
-            <option key={e._key} value={e._key}>
-              {e._key}{e.order === 0 ? " · working state" : e.currently_running ? ` · ${e.currently_running.name}` : " · nothing deployed"}
+          {(environments.length ? environments : [{ name: "dev", order: 0 }]).map((e: Json) => (
+            <option key={e.name} value={e.name}>
+              {e.name}{e.order === 0 ? " · working state" : e.running?.length ? ` · ${e.running.map((d: Json) => localKey(d.project_version)).join(", ")}` : " · nothing deployed"}
             </option>
           ))}
         </select>

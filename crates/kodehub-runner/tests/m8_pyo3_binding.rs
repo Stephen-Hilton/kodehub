@@ -26,13 +26,13 @@ async fn python_login_calls_rust_through_generated_extension() {
     )
     .await
     .unwrap();
-    s.remove_edge("calls", "symbols/py-login", "symbols/py-authenticate")
+    s.remove_edge("calls", "code/py-login", "code/py-authenticate")
         .await
         .unwrap();
     s.insert_edge(
         "binds_to",
-        "symbols/py-login",
-        "symbols/verify_credentials",
+        "code/py-login",
+        "code/verify_credentials",
         json!({}),
     )
     .await
@@ -40,8 +40,10 @@ async fn python_login_calls_rust_through_generated_extension() {
 
     let g = s.load_code_graph().await.unwrap();
     // the Python closure now includes the Rust code
-    let cl = g.closure(&["py-login".to_string()], false).unwrap();
-    assert!(cl.contains_key("verify_credentials") && cl.contains_key("verify_password"));
+    let cl = g.closure(&[q(&s, "py-login")], false).unwrap();
+    assert!(
+        cl.contains_key(&q(&s, "verify_credentials")) && cl.contains_key(&q(&s, "verify_password"))
+    );
 
     // the rendered package really goes through the generated extension
     let rendered = r
@@ -49,7 +51,7 @@ async fn python_login_calls_rust_through_generated_extension() {
             &g,
             &kodehub_runner::BuildTarget::Run {
                 language: Language::Python,
-                symbol: "py-login".into(),
+                symbol: q(&s, "py-login"),
             },
         )
         .unwrap();
@@ -60,7 +62,7 @@ async fn python_login_calls_rust_through_generated_extension() {
     assert!(rendered.ext.as_ref().unwrap().files["src/lib.rs"].contains("fn kodehub_ext("));
     // python tests for login pass through the extension
     let tests = r
-        .resolve_scope(&s, &g, &TestScope::Symbol("py-login".into()))
+        .resolve_scope(&s, &g, &TestScope::Symbol(q(&s, "py-login")))
         .await
         .unwrap();
     assert_eq!(tests.len(), 4);
@@ -75,10 +77,10 @@ async fn python_login_calls_rust_through_generated_extension() {
         .run_now(
             &g,
             &RunRequest {
-                symbol: "py-login".into(),
+                symbol: q(&s, "py-login"),
                 args: json!({"username": "alice", "password": "wonderland"}),
                 environment: "dev".into(),
-                release: None,
+                project_version: None,
             },
             None,
         )
@@ -90,10 +92,10 @@ async fn python_login_calls_rust_through_generated_extension() {
         .run_now(
             &g,
             &RunRequest {
-                symbol: "py-login".into(),
+                symbol: q(&s, "py-login"),
                 args: json!({"username": "alice", "password": "wonderland"}),
                 environment: "dev".into(),
-                release: None,
+                project_version: None,
             },
             None,
         )
@@ -104,10 +106,10 @@ async fn python_login_calls_rust_through_generated_extension() {
         .run_now(
             &g,
             &RunRequest {
-                symbol: "py-login".into(),
+                symbol: q(&s, "py-login"),
                 args: json!({"username": "alice", "password": "nope"}),
                 environment: "dev".into(),
-                release: None,
+                project_version: None,
             },
             None,
         )
@@ -124,12 +126,22 @@ async fn python_login_calls_rust_through_generated_extension() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|x| x["id"] == "symbols/py-login"));
+        .any(|x| x["id"] == q(&s, "code/py-login")));
     let before = s.node_health().await.unwrap();
-    assert_eq!(before["symbols/py-login"]["health"], "pass");
+    assert_eq!(
+        before[&q(&s, "code/py-login")]["health"],
+        "pass",
+        "{}",
+        before[&q(&s, "code/py-login")]
+    );
 
     // changing the Rust signature marks the Python wrapper (and R1) at risk
-    let doc = s.aql("FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/verify_credentials') AND e.state == 'stable' RETURN DOCUMENT(e._to)", json!({})).await.unwrap();
+    let v = s
+        .version_in(&q(&s, "code/verify_credentials"), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let doc = s.aql("RETURN DOCUMENT(@v)", json!({"v": v})).await.unwrap();
     let mut c = version_content_from_doc(&doc[0]).unwrap();
     c.signature =
         "(store: &UserStore, username: &str, password: &str, _audit: Option<String>) -> AuthResult"
@@ -139,9 +151,10 @@ async fn python_login_calls_rust_through_generated_extension() {
         .unwrap();
     let after = s.node_health().await.unwrap();
     assert_eq!(
-        after["symbols/py-login"]["health"], "at_risk",
+        after[&q(&s, "code/py-login")]["health"],
+        "at_risk",
         "{}",
-        after["symbols/py-login"]
+        after[&q(&s, "code/py-login")]
     );
     let cov = s.coverage(Some("r1-generic-failure")).await.unwrap();
     assert_eq!(cov.requirements[0].status, "at_risk");

@@ -4,6 +4,165 @@ Record build-time decisions here: context, decision, consequence. Newest first.
 
 ---
 
+## D-063 Choices made while porting the code to the ontology
+- **Context:** Porting the server, agents, CLI and UI to the v2 ontology (D-055 to D-062)
+  raised questions the ontology leaves open.
+- **Decision:**
+  - **History is per project version.** The time slider's stops are project versions (opened,
+    frozen) and the proposals accepted into them; picking one shows that project version
+    (`/api/map?at=<project version>`). A frozen version is an exact snapshot; an open one is
+    shown as it is now, because its tree changes in place while open (D-057). Timestamps are
+    no longer a way to address history.
+  - **Decisions are not traceability.** Requirements of kind `decision` record a choice: they
+    are listed with the nodes they apply to, but are not tested, do not count in coverage, and
+    do not make code reachable (orphans). `/api/requirements` lists the others.
+  - **Health and coverage do not cross a language binding.** `binds_to` makes code reachable
+    (no orphan), but a wrapper's health and a requirement's tests are its own language's tests,
+    as in v0.1.
+  - **Settling a work item with its proposal.** Accepting a proposal completes its work item
+    whatever state it is in (a human may drive a still-queued item). A human rejection cancels
+    the item (never retried); an escalation fails it, so the queue retries or hands it to the
+    architect.
+  - **Remote agents never drive a proposal.** `/api/work-items/{key}/proposal/…` is refused to
+    remote agents, as v0.1 changesets were; they may still create and follow work items.
+  - **Proposing a version without `attributes` keeps the base version's** (imports, derives);
+    an explicit `{}` clears them.
+  - **Bisect follows the version line** (`based_on` from bad back to good); a hotfix branch is
+    not on the line of later releases.
+  - **Requirement history lists every version**, the current one included, newest first, with
+    its state (accepted, proposed, rejected); the UI shows the earlier ones.
+  - **A recording replays per project, from the server.** Agent containers are fresh for every
+    task, so a container that loaded the recording itself always replayed its first answer
+    (in the cluster a blind review could never pass). The server now keeps each project's
+    position in the recording and hands every container its answer; the container still runs.
+  - **Test ids in the UI use local keys** (`req-r1-…`, `badge-life-contexts/x`), so they read
+    the same in every project.
+- **Consequence:** The UI's history banner names a project version instead of a time. Tests
+  cover each choice (server `m4`, `m7_deployments`, runner `m8`, store `o4`).
+
+## D-062 Agents, schedules and audit in the ontology
+- **Context:** The ontology (`docs/ontology.md`) gives agents, schedules, chat and audit their
+  own places. Agent types were a fixed list in code; schedules were global records with a
+  target string; negotiations, chat messages and intents were separate collections.
+- **Decision:**
+  - `agents` are per-project agent types seeded from the built-in defaults (coding,
+    test_author, review, planning, architect, import, design, sysadmin). Each has a start-up
+    `prompt` and `permissions`: the actions (MCP tools) it may use. Defaults are wide — one
+    agent doing most of a build cycle is cheapest; review and testing stay separate for
+    safety, not efficiency. The engine and the MCP server refuse a tool outside the agent's
+    permissions, and whatever the permissions say, the reviewer of a work item is never the
+    agent instance that wrote it.
+  - `schedules` are project-scoped and point at what they act on with a `targets` edge.
+  - Negotiations and agent conversation are `agent_chats` threads with `agent_chat_msgs`;
+    messages are addressed to work items (which outlive the ephemeral agents) and may
+    `refers_to` any node.
+  - `audit_log` entries carry actor, on-behalf-of, project, action, target and time as
+    properties (no edges: high volume, rarely traversed).
+- **Consequence:** Adding an agent type or narrowing one is project data, not code.
+
+## D-061 Identity: remote agents, secrets, access edges
+- **Context:** Internal agents (coding, testing, review…) are ephemeral containers working
+  for the orchestrator. External AI clients that sign in like a user are a different thing.
+- **Decision:** `users` holds humans only; `remote_agents` holds external agents with an
+  `acts_for` edge to one or more users (M:M: one agent may serve a team, a user may have many).
+  Remote agents may add work items, edit requirements and start tests; they never change
+  code, build or deploy (refused by the API). Credentials become `secrets` with `secures`
+  edges to the holder (org, user, remote agent, deployer); the value stays ciphertext (D-040).
+  Org membership is `works_with`, project access `has_access` with a permission; the
+  project's `owner` (an org or a user) is a property that decides which credentials and
+  settings layer apply, independent of how many admins it has.
+- **Consequence:** Agent users and their tokens are re-created as remote agents; internal
+  agent tokens are unchanged.
+
+## D-060 Deploy targets, deployers, deployments
+- **Context:** One project version may need compute in AWS, auth in GCP and data on internal
+  servers in PROD, while in DEV everything runs in a local Kind namespace. The code must not
+  change between environments.
+- **Decision:** A `deploy_target` is a logical name the code uses ("aws"); cloud-specific
+  versions say `deployed_to` it, everything else uses the project's `default` target. A
+  `deployer` is exactly one (environment, deploy target) pair and holds the real setup
+  (endpoint, image via `runs`, secret via `secures`). A `deployment` is one project version
+  into one environment; it `uses` the environment's deployers for the targets the version
+  needs, is retryable (pending → awaiting_approval → running → succeeded | failed) and
+  `logs_to` immutable `deploy_logs`. The environment link of a deployment is explicit
+  (`has_deployment` from both the project version and the environment), and all its deployers
+  must belong to that environment (checked on write). v0.1 ships one deployer kind,
+  `k8s_namespace` (the environment's namespace in this cluster); `k8s_remote` (another
+  cluster through a kubeconfig secret) is the next kind and needs no model change.
+- **Consequence:** "Which environments is v123 in" is a query over its succeeded,
+  not-superseded deployments. Hard rule 5 changes: an environment may hold several project
+  versions at once (prod plus a hotfix, one per cloud); `max_releases` stays as an optional
+  per-environment limit.
+
+## D-059 Releases are project versions
+- **Context:** A release must be referencable and immutable once deployed, and several can be
+  live at once (a hotfix while the next release is under way; one per cloud).
+- **Decision:** There is no separate release node. A `project_version` is the release: open
+  while work is accepted into it, frozen when the orchestrator or an architect agent decides
+  it is done or on its first deployment beyond the lowest environment. `based_on` links it to
+  the version it started from; a hotfix is a new open project version based on a frozen one,
+  starting with the same tree. New project versions are created deliberately (a milestone, a
+  hotfix), not per change. Selection rules, `supports` edges and `cloned_from` are removed.
+- **Consequence:** Work items name the open project version their changes go into; with
+  several open, the project's `current_version` is the default. A fix accepted into a hotfix
+  is carried into the current version by the orchestrator when the node did not change there
+  since, otherwise by a work item.
+
+## D-058 No changesets: work items carry the proposal
+- **Context:** Every code-changing work item owned exactly one changeset; code is changed only
+  by internal agents; agents coordinate up front through intents and negotiation, never by
+  merging after the fact.
+- **Decision:** The changeset collection and `proposes` are removed. The work item holds the
+  proposal (plan, candidate versions, edges, change log, review findings, test results) and
+  its stage; candidate versions are `has_version` edges with `state: candidate` and the work
+  item key. Agents write only the versions of nodes they change; the orchestrator builds the
+  ancestor chain at acceptance, inside the transaction that moves the project version's root,
+  against the tree as it is at that moment. Gates (orphans, affected formal tests, blind
+  review) are unchanged.
+- **Consequence:** Two agents on disjoint nodes never lose each other's work and need no
+  rebase; a dependency that moved underneath a change changes its closure hash, so its tests
+  rerun. Work items are kept after completion as the record of the change.
+
+## D-057 The version tree replaces the single stable version
+- **Context:** With one global stable version per node and validity intervals, two releases
+  could not be live at once, and a release had to point at every version it contained.
+- **Decision:** Versions link to their child versions (`contains`, written once), from
+  `project_versions` down to code and test versions. A version's key is derived from its node
+  and a hash of its content plus its children's ids, so unchanged subtrees are shared between
+  project versions. "The version of N" always means "in project version P", by default the
+  project's `current_version`. `validFrom` / `validTo` and the one-stable-edge index are
+  removed; hard rule 1 becomes "at most one version of a node per project version". Code
+  relationships (`calls`, `depends_on`, `member_of`, `binds_to`, `tested_with`) stay between
+  unversioned nodes and are resolved through the project version; closure hashes are
+  computed per project version.
+- **Consequence:** A change writes one new version per ancestor level plus edges to all of
+  their children (the sum of fan-outs along the path), not only deltas.
+
+## D-056 Global collections, hubs and names
+- **Context:** The drawing has hub boxes (orgs, users, remote agents, work queue, audit logs)
+  so a project or the cluster is not saturated by edges to high-volume detail.
+- **Decision:** In ArangoDB the collection is the hub: no edge is written from the cluster or a
+  project to each work item, audit entry, user or org; they are indexed queries. Global
+  collections drop the `kodehub_` prefix and take the ontology names. Plumbing collections
+  (settings, sessions, tokens, OAuth, usage, notifications, schedule triggers, meta) stay
+  outside the graph.
+- **Consequence:** `docs/ontology.md` lists node and edge collections; the system collections
+  are listed separately.
+
+## D-055 One set of collections for every project
+- **Context:** v0.05 gave every project its own collections (`<project>__<name>`) and named
+  graph (kept in D-041). The schema grew with every project, adding a project was a structural
+  change, and cross-project work was impossible.
+- **Decision:** One fixed set of collections and one named graph. Every project-scoped document
+  and edge carries `project` (indexed), and every project-scoped key starts with
+  `<project>.`. The store enforces hard rule 9 on write (keys, `_from` and `_to` must belong
+  to the request's project) and filters every collection scan to the request's project. The
+  named graph's edge definitions list the exact from/to collections of the ontology, so the
+  database itself refuses an edge between the wrong kinds of node. Supersedes the tenancy part
+  of D-041.
+- **Consequence:** A disjoint SmartGraph sharded on `project` is a deployment choice later, not
+  a redesign. Deleting a project deletes its documents.
+
 ## D-054 SeaweedFS as the self-hosted S3 tier (MinIO dropped)
 - **Context:** MinIO's community edition is no longer a dependable open-source option (no
   published community binaries or images, admin features removed, community edition in

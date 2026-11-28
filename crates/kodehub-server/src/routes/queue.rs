@@ -67,7 +67,7 @@ pub async fn create(
             project: p.id.clone(),
             agent_type: b.agent_type,
             kind: b.kind,
-            target: b.target,
+            target: b.target.as_deref().map(|t| s.store.db.qid(t)).transpose()?,
             priority: b.priority.unwrap_or(kodehub_store::queue::PRIORITY_NORMAL),
             task: b.task,
             requested_by: Some(who.id()),
@@ -131,7 +131,17 @@ pub async fn create_schedule(
 ) -> ApiResult<Value> {
     Ok(Json(
         s.store
-            .upsert_schedule(&p.id, &b.target, &b.level, b.interval_secs, "manual")
+            .upsert_schedule(
+                &p.id,
+                &if b.target == "project" {
+                    b.target.clone()
+                } else {
+                    s.store.db.qid(&b.target)?
+                },
+                &b.level,
+                b.interval_secs,
+                "manual",
+            )
             .await?,
     ))
 }
@@ -173,16 +183,21 @@ pub async fn test_now(
     Extension(who): Extension<Principal>,
     Json(b): Json<TestNow>,
 ) -> ApiResult<Value> {
-    if b.target != "project" {
-        s.store.get_node(&b.target).await?;
+    let target = if b.target == "project" {
+        b.target.clone()
+    } else {
+        s.store.db.qid(&b.target)?
+    };
+    if target != "project" {
+        s.store.get_node(&target).await?;
     }
     let t = s
         .store
-        .trigger(&p.id, "test_now", &b.target, &who.id())
+        .trigger(&p.id, "test_now", &target, &who.id())
         .await?;
     s.events.emit(
         "test.requested",
-        json!({"target": b.target, "trigger": t["_key"]}),
+        json!({"target": target, "trigger": t["_key"]}),
     );
     Ok(Json(t))
 }
@@ -278,50 +293,49 @@ pub async fn unblock(
 
 // ---------------------------------------------------------------------- agent types
 
+/// The project's agent types (built-in and custom) with their permissions, and the catalogue
+/// of permissions an agent type can hold (D-062).
 pub async fn agent_types(State(s): State<AppState>) -> ApiResult<Value> {
-    kodehub_agents::roles::ensure_agent_types(&s.store)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(json!(
-        s.store
-            .aql("FOR t IN @@agent_types SORT t._key RETURN t", json!({}))
-            .await?
-    )))
+    let agents = s.store.list_agents().await?;
+    let catalogue: Vec<Value> = kodehub_store::agents::PERMISSIONS
+        .iter()
+        .map(|(n, d)| json!({"name": n, "description": d}))
+        .collect();
+    Ok(Json(json!({"agents": agents, "permissions": catalogue})))
 }
 
-#[derive(Deserialize)]
-pub struct CustomAgent {
-    pub instructions: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub model: Option<String>,
-}
-
-/// A custom agent type (spec §4.1), e.g. a policy agent: the same base agent with a role
-/// definition stored in the graph.
+/// Create a custom agent type (e.g. a policy agent: `custom:policy`) or change one, built-in
+/// or custom: start-up `prompt`, `permissions`, `description`, `model`.
+/// `instructions` is accepted as the v0.1 name of a custom type's prompt.
 pub async fn put_agent_type(
     State(s): State<AppState>,
+    Extension(who): Extension<Principal>,
     Path(name): Path<String>,
-    Json(b): Json<CustomAgent>,
+    Json(mut b): Json<Value>,
 ) -> ApiResult<Value> {
-    let slug = kodehub_store::slug(name.trim_start_matches("custom:"));
-    if slug.is_empty() || b.instructions.trim().is_empty() {
+    let name = name.trim().to_string();
+    let builtin = kodehub_store::agents::BUILTIN
+        .iter()
+        .any(|x| x.name == name);
+    let name = if builtin || name.starts_with("custom:") {
+        name
+    } else {
+        format!("custom:{}", kodehub_store::slug(&name))
+    };
+    if b.get("prompt").is_none() {
+        if let Some(i) = b.get("instructions").cloned() {
+            b["prompt"] = i;
+        }
+    }
+    if !builtin
+        && s.store.agent(&name).await.is_err()
+        && b["prompt"].as_str().unwrap_or("").trim().is_empty()
+    {
         return Err(ApiError::bad_request(
-            "a custom agent needs a name and instructions",
+            "a custom agent needs a name and a prompt",
         ));
     }
-    let key = format!("custom-{slug}");
-    s.store
-        .db
-        .upsert(
-            "agent_types",
-            &json!({"_key": key, "builtin": false, "prompt": "custom", "tool_role": "orchestrator",
-                    "instructions": b.instructions, "description": b.description, "model": b.model}),
-            None,
-        )
-        .await?;
-    Ok(Json(s.store.db.get("agent_types", &key, None).await?))
+    Ok(Json(s.store.put_agent(&name, &b, &who.id()).await?))
 }
 
 // ---------------------------------------------------------------------- git import / export
@@ -368,7 +382,7 @@ pub async fn git_import(
             project: p.id.clone(),
             agent_type: "git_import".into(),
             kind: "import".into(),
-            target: Some("philosophy/philosophy".into()),
+            target: Some(kodehub_store::c4::philosophy_id_of(&p.id)),
             priority: kodehub_store::queue::PRIORITY_NORMAL,
             task: json!({"repo_url": url, "ref": b.r#ref}),
             requested_by: Some(who.id()),
@@ -404,7 +418,7 @@ pub async fn git_export(
             project: p.id.clone(),
             agent_type: "git_export".into(),
             kind: "export".into(),
-            target: Some("philosophy/philosophy".into()),
+            target: Some(kodehub_store::c4::philosophy_id_of(&p.id)),
             priority: kodehub_store::queue::PRIORITY_NORMAL,
             task: json!({"repo_url": b.repo_url, "branch": b.branch,
                          "message": b.message.unwrap_or_else(|| format!("Kodehub export of {}", p.id))}),

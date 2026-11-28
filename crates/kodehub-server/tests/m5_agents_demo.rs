@@ -12,14 +12,16 @@ use serde_json::{json, Value};
 async fn wait_state(t: &TestServer, cs: &str, want: &[&str], secs: u64) -> Value {
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
     loop {
-        let v = t.ok("GET", &format!("/api/changesets/{cs}"), None).await;
+        let v = t
+            .ok("GET", &format!("/api/work-items/{cs}/proposal"), None)
+            .await;
         let st = v["state"].as_str().unwrap_or("").to_string();
         if want.contains(&st.as_str()) {
             return v;
         }
         if let Some(e) = v["error"].as_str() {
             panic!(
-                "changeset error in state {st}: {e}\nactivity: {}",
+                "proposal error in state {st}: {e}\nactivity: {}",
                 v["activity"]
             );
         }
@@ -77,16 +79,16 @@ async fn demo_scenario_with_recorded_agents() {
         .await;
     assert_eq!(edit["changed"], true);
 
-    // 3. R1 and everything beneath it turns amber; a changeset is opened and planned with ghost nodes
+    // 3. R1 and everything beneath it turns amber; a work item proposal is opened and planned with ghost nodes
     let cov = t
         .ok("GET", "/api/coverage?requirement=r1-generic-failure", None)
         .await;
     assert_eq!(cov["requirements"][0]["status"], "at_risk");
     let health = t.ok("GET", "/api/health/nodes", None).await;
-    assert_eq!(health["symbols/verify_credentials"]["health"], "at_risk");
+    assert_eq!(health[&t.q("code/verify_credentials")]["health"], "at_risk");
     let mut cs_key = String::new();
     for _ in 0..80 {
-        let list = t.ok("GET", "/api/changesets?open=true", None).await;
+        let list = t.ok("GET", "/api/proposals?open=true", None).await;
         if let Some(c) = list
             .as_array()
             .unwrap()
@@ -100,7 +102,7 @@ async fn demo_scenario_with_recorded_agents() {
     }
     assert!(
         !cs_key.is_empty(),
-        "orchestrator should open and plan a changeset"
+        "orchestrator should open and plan a proposal"
     );
     let map = t.ok("GET", "/api/map", None).await;
     let ghosts: Vec<&Value> = map["nodes"]
@@ -119,13 +121,17 @@ async fn demo_scenario_with_recorded_agents() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|n| n["id"] == "symbols/verify_credentials" && n["proposed_in"].is_array()));
+        .any(|n| n["id"] == t.q("code/verify_credentials") && n["proposed_in"].is_array()));
 
-    // 4. human approves → 5–7. tester, coder, blind reviewer, rework, decision, tests, merge
-    t.uok("POST", &format!("/api/changesets/{cs_key}/approve"), None)
-        .await;
-    let cs = wait_state(&t, &cs_key, &["merged", "escalated"], 600).await;
-    assert_eq!(cs["state"], "merged", "activity: {}", cs["activity"]);
+    // 4. human approves → 5–7. tester, coder, blind reviewer, rework, decision, tests, acceptance
+    t.uok(
+        "POST",
+        &format!("/api/work-items/{cs_key}/proposal/approve"),
+        None,
+    )
+    .await;
+    let cs = wait_state(&t, &cs_key, &["accepted", "escalated"], 600).await;
+    assert_eq!(cs["state"], "accepted", "activity: {}", cs["activity"]);
 
     // blind review: the reviewer's prompts contain none of the coder's messages
     let calls = rec.calls();
@@ -189,10 +195,11 @@ async fn demo_scenario_with_recorded_agents() {
     assert!(d["justifies"]
         .as_array()
         .unwrap()
-        .contains(&json!("symbols/verify_credentials")));
+        .contains(&json!(t.q("code/verify_credentials"))));
+    assert_eq!(d["kind"], "decision");
     assert!(d["choice"].as_str().unwrap().contains("Argon2"));
 
-    // merge happened only after tests passed
+    // acceptance happened only after tests passed
     let states: Vec<&str> = cs["history"]
         .as_array()
         .unwrap()
@@ -201,7 +208,7 @@ async fn demo_scenario_with_recorded_agents() {
         .collect();
     let ti = states.iter().rposition(|s| *s == "testing").unwrap();
     let ri = states.iter().position(|s| *s == "ready").unwrap();
-    let mi = states.iter().position(|s| *s == "merged").unwrap();
+    let mi = states.iter().position(|s| *s == "accepted").unwrap();
     assert!(ti < ri && ri < mi, "{states:?}");
     assert!(cs["test_results"]
         .as_array()
@@ -220,12 +227,12 @@ async fn demo_scenario_with_recorded_agents() {
     for r in cov["requirements"].as_array().unwrap() {
         assert_eq!(r["status"], "pass", "{}", r);
     }
-    assert_eq!(cov["groups"][0]["status"], "pass");
+    assert_eq!(cov["tags"][0]["status"], "pass");
     let health = t.ok("GET", "/api/health/nodes", None).await;
-    assert_eq!(health["contexts/authentication"]["health"], "pass");
+    assert_eq!(health[&t.q("contexts/authentication")]["health"], "pass");
     assert_eq!(t.ok("GET", "/api/invariants", None).await["ok"], true);
 
-    // 8. run now with a locked user: invalid_credentials, instantly (cache hit — warmed after merge)
+    // 8. run now with a locked user: invalid_credentials, instantly (cache hit — warmed after acceptance)
     let mut hit = Value::Null;
     for _ in 0..120 {
         let h = t
@@ -273,8 +280,8 @@ async fn demo_scenario_with_recorded_agents() {
         4,
         "the demo consumed its 6 responses; 4 remain for the optional save-as-example cycle"
     );
-    // the edit went through the work queue: one coding item, parked for the plan approval and
-    // settled when the changeset merged
+    // the edit went through the work queue: one coding item carrying the proposal, parked for
+    // the plan approval and settled when the proposal was accepted
     let items = t.ok("GET", "/api/work-items", None).await;
     let coding: Vec<&Value> = items
         .as_array()
@@ -284,9 +291,21 @@ async fn demo_scenario_with_recorded_agents() {
         .collect();
     assert_eq!(coding.len(), 1, "{items}");
     assert_eq!(coding[0]["state"], "done", "{}", coding[0]);
+    assert_eq!(
+        coding[0]["_key"],
+        json!(cs_key),
+        "the proposal lives on that work item"
+    );
+    // the accepted versions are in the current project version; the timeline shows it
+    let tl = t.ok("GET", "/api/timeline", None).await;
+    assert!(tl["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "accept" && e["key"] == json!(cs_key)));
     // re-importing the seed over the changed graph works (the UI e2e suite does this)
     let (s, v) = t
-        .req("POST", "/api/seed", Some(json!({"path": seed_path()})))
+        .ui("POST", "/api/seed", Some(json!({"path": seed_path()})))
         .await;
     assert_eq!(s, 200, "re-seed after the demo: {v}");
     t.stop().await;

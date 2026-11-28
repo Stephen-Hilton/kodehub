@@ -1,6 +1,6 @@
 // App data: loads every slice the UI shows and refreshes the right ones on server events.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Changeset, type Group, type Json, type MapData, type Requirement } from "./api";
+import { api, type Json, type MapData, type Proposal, type ProjectVersion, type Requirement, type TagCoverage } from "./api";
 import { useEvents, type KodehubEvent } from "./events";
 
 type Listener = (e: KodehubEvent) => void;
@@ -14,26 +14,29 @@ export function onKodehubEvent(l: Listener): () => void {
 export interface KodehubData {
   map: MapData | null;
   requirements: Requirement[];
-  groups: Group[];
+  /** Coverage per requirement tag. */
+  tags: TagCoverage[];
   summary: Record<string, number>;
-  changesets: Changeset[];
+  /** Work-item proposals (code changes in flight and done). */
+  proposals: Proposal[];
   agents: Json;
   settings: Json;
   timeline: Json[];
   environments: Json[];
-  releases: Json[];
+  /** Project versions: the releases. */
+  versions: ProjectVersion[];
   connected: boolean;
   error: string | null;
   loading: boolean;
 }
 
-const SLICES = ["map", "requirements", "changesets", "agents", "settings", "timeline", "environments", "releases"] as const;
+const SLICES = ["map", "requirements", "proposals", "agents", "settings", "timeline", "environments", "versions"] as const;
 type Slice = (typeof SLICES)[number];
 
 export function useKodehub(at: string | null) {
   const [d, setD] = useState<Omit<KodehubData, "connected">>({
-    map: null, requirements: [], groups: [], summary: {}, changesets: [], agents: { agents: [] }, settings: null,
-    timeline: [], environments: [], releases: [], error: null, loading: true,
+    map: null, requirements: [], tags: [], summary: {}, proposals: [], agents: { agents: [] }, settings: null,
+    timeline: [], environments: [], versions: [], error: null, loading: true,
   });
   const atRef = useRef(at);
   atRef.current = at;
@@ -44,14 +47,14 @@ export function useKodehub(at: string | null) {
         case "map": return { map: await api.map(atRef.current) };
         case "requirements": {
           const r = await api.requirements();
-          return { requirements: r.requirements, groups: r.groups, summary: r.summary };
+          return { requirements: r.requirements, tags: r.tags, summary: r.summary };
         }
-        case "changesets": return { changesets: await api.changesets() };
+        case "proposals": return { proposals: await api.proposals() };
         case "agents": return { agents: await api.agents() };
         case "settings": return { settings: await api.settings() };
         case "timeline": return { timeline: (await api.timeline()).events };
         case "environments": return { environments: await api.environments() };
-        case "releases": return { releases: await api.releases() };
+        case "versions": return { versions: await api.projectVersions() };
       }
     });
     const results = await Promise.allSettled(tasks);
@@ -93,10 +96,10 @@ export function useKodehub(at: string | null) {
     listeners.forEach((l) => l(e));
     switch (e.type) {
       case "node.changed":
-        schedule(["map", "requirements", "timeline", "changesets"]);
+        schedule(["map", "requirements", "timeline", "proposals"]);
         break;
-      case "changeset.updated":
-        schedule(["changesets", "map", "requirements", "timeline"]);
+      case "proposal.updated":
+        schedule(["proposals", "map", "requirements", "timeline"]);
         break;
       case "test.result":
         schedule(["map", "requirements"]);
@@ -105,7 +108,10 @@ export function useKodehub(at: string | null) {
         schedule(e.data?.settings ? ["agents", "settings"] : ["agents"]);
         break;
       case "env.deployed":
-        schedule(["environments", "releases", "timeline"]);
+        schedule(["environments", "versions", "timeline", "map"]);
+        break;
+      case "project_version.changed":
+        schedule(["versions", "timeline", "map"]);
         break;
     }
   });

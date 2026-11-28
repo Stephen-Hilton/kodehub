@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::{Result, Store, StoreError};
 
-pub const WORK_ITEMS: &str = "kodehub_work_items";
+pub const WORK_ITEMS: &str = "work_items";
 
 /// Queue priorities (higher first). Failures and regressions enter high (spec §4.4).
 pub const PRIORITY_HIGH: i64 = 100;
@@ -44,7 +44,8 @@ pub struct NewWorkItem {
     /// Free label of the work (`implement`, `fix_failure`, `write_tests`, `plan_context`, …).
     #[serde(default)]
     pub kind: String,
-    /// The node the work is about (`components/x`, `symbols/y`, `philosophy/philosophy`).
+    /// The node the work is about (`components/x`, `code/y`, `projects/<id>` for project-level
+    /// work).
     #[serde(default)]
     pub target: Option<String>,
     #[serde(default = "normal")]
@@ -66,6 +67,10 @@ pub struct NewWorkItem {
     pub retry_count: i64,
     #[serde(default)]
     pub retry_of: Option<String>,
+    /// The open project version the work's accepted changes go into (default: the project's
+    /// current version).
+    #[serde(default)]
+    pub project_version: Option<String>,
 }
 
 fn normal() -> i64 {
@@ -97,13 +102,50 @@ impl Store {
         let now = now_iso();
         let mut doc = serde_json::to_value(w).map_err(|e| StoreError::Invalid(e.to_string()))?;
         doc["_key"] = json!(key);
+        // a project node named by its local id is qualified for the item's project (D-055)
+        if let Some(t) = w.target.as_deref() {
+            if let Some((c, k)) = t.split_once('/') {
+                if crate::arango::is_project_collection(c) && !k.contains(crate::arango::KEY_SEP) {
+                    doc["target"] = json!(format!("{c}/{}", crate::arango::qualify(&w.project, k)));
+                }
+            }
+        }
         doc["state"] = json!("queued");
         doc["owner"] = Value::Null;
         doc["lease_expires"] = Value::Null;
         doc["created_at"] = json!(now);
         doc["updated_at"] = json!(now);
         doc["combined_with"] = json!([]);
-        self.g_insert(WORK_ITEMS, &doc).await
+        // the open project version this work goes into (`has_work_item`, docs/ontology.md)
+        let ps = self.for_project(&w.project);
+        let pv = match &w.project_version {
+            Some(v) => Some(ps.pv_id(v)?),
+            None if self.project_registered(&w.project).await? => Some(ps.current_version().await?),
+            None => None,
+        };
+        doc["project_version"] = json!(pv);
+        let created = self.g_insert(WORK_ITEMS, &doc).await?;
+        if let Some(pv) = pv {
+            let wid = format!("{WORK_ITEMS}/{key}");
+            ps.db
+                .insert_ignore(
+                    "has_work_item",
+                    &json!({"_key": crate::edge_key("has_work_item", &pv, &wid),
+                            "_from": pv, "_to": wid}),
+                    None,
+                )
+                .await?;
+        }
+        Ok(created)
+    }
+
+    /// True when a project is in the registry.
+    pub(crate) async fn project_registered(&self, project: &str) -> Result<bool> {
+        Ok(crate::arango::valid_project_id(project)
+            && self
+                .g_get(crate::schema::PROJECTS, project)
+                .await?
+                .is_some())
     }
 
     pub async fn work_item(&self, key: &str) -> Result<Value> {
@@ -388,6 +430,7 @@ impl Store {
                 w["kind"].as_str().unwrap_or_default().into()
             },
             target: w["target"].as_str().map(str::to_string),
+            project_version: w["project_version"].as_str().map(str::to_string),
             priority: PRIORITY_HIGH,
             task: if escalate {
                 json!({"escalated_from": key, "original": w["task"], "reason": reason,
@@ -482,35 +525,47 @@ impl Store {
     }
 
     /// The work waits for a human (a plan to approve): release the claim, keep the link.
-    pub async fn park_work_item(&self, key: &str, owner: &str, changeset: &str) -> Result<Value> {
+    /// Park a claimed work item while its proposal waits for a human (a plan to approve).
+    pub async fn park_work_item(&self, key: &str, owner: &str) -> Result<Value> {
         self.owned(key, owner).await?;
         self.g_patch(
             WORK_ITEMS,
             key,
             &json!({"state": "waiting_human", "owner": null, "lease_expires": null,
-                    "changeset": changeset, "updated_at": now_iso()}),
+                    "updated_at": now_iso()}),
         )
         .await
     }
 
-    /// Finish the work item linked to a changeset once the changeset ends (merged / rejected).
-    pub async fn settle_changeset_item(
+    /// Finish a work item once its proposal ends. Accepted: the work is done (whatever state
+    /// the item was in — a human may have driven the proposal while it was still queued).
+    /// Rejected by a human: the work is not wanted, so the item is cancelled, never retried.
+    /// Escalated: the item fails, so the queue retries it or hands it to the architect.
+    pub async fn settle_proposal_item(
         &self,
-        changeset: &str,
-        merged: bool,
+        work_item: &str,
+        accepted: bool,
         note: &str,
     ) -> Result<Option<Value>> {
         let rows = self
             .g_aql(
-                "FOR w IN @@w FILTER w.changeset == @c AND w.state IN ['waiting_human', 'claimed'] RETURN w",
-                json!({"@w": WORK_ITEMS, "c": changeset}),
+                "FOR w IN @@w FILTER w._key == @c
+                   AND w.state IN ['queued', 'waiting_human', 'claimed', 'blocked'] RETURN w",
+                json!({"@w": WORK_ITEMS, "c": work_item}),
             )
             .await?;
         let Some(w) = rows.into_iter().next() else {
             return Ok(None);
         };
         let key = w["_key"].as_str().unwrap_or_default().to_string();
-        let owner = format!("settle-{changeset}");
+        if !accepted && note == "rejected" {
+            let out = self.cancel_work_item(&key, "proposal rejected").await?;
+            self.revoke_work_item_tokens(&key).await?;
+            self.close_intents(w["project"].as_str().unwrap_or_default(), &key, "cancelled")
+                .await?;
+            return Ok(Some(out));
+        }
+        let owner = format!("settle-{key}");
         // take the item over, then finish it like any other
         self.g_patch(
             WORK_ITEMS,
@@ -518,19 +573,26 @@ impl Store {
             &json!({"state": "claimed", "owner": owner, "lease_expires": lease_until(300)}),
         )
         .await?;
-        let out = if merged {
+        let out = if accepted {
             self.complete_work_item(
                 &key,
                 &owner,
-                json!({"changeset": changeset, "note": note}),
-                json!({"merged": true}),
+                json!({"work_item": key, "note": note}),
+                json!({"accepted": true}),
             )
             .await?
         } else {
-            self.fail_work_item(&key, &owner, note, json!({"changeset": changeset}))
+            self.fail_work_item(&key, &owner, note, json!({"work_item": key}))
                 .await?
         };
         Ok(Some(out))
+    }
+
+    /// Patch bookkeeping fields of a work item.
+    pub async fn patch_work_item(&self, key: &str, patch: Value) -> Result<Value> {
+        let mut p = patch;
+        p["updated_at"] = json!(now_iso());
+        self.g_patch(WORK_ITEMS, key, &p).await
     }
 
     pub async fn cancel_work_item(&self, key: &str, by: &str) -> Result<Value> {

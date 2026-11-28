@@ -10,12 +10,12 @@ use serde_json::json;
 fn status_of(cov: &kodehub_store::queries::Coverage, key: &str) -> String {
     cov.requirements
         .iter()
-        .find(|r| r.key == key)
+        .find(|r| kodehub_store::arango::local_key(&r.key) == key)
         .map(|r| r.status.clone())
         .or_else(|| {
-            cov.groups
+            cov.tags
                 .iter()
-                .find(|g| g.key == key)
+                .find(|g| g.tag == key)
                 .map(|g| g.status.clone())
         })
         .unwrap_or_else(|| panic!("no coverage row for {key}"))
@@ -66,12 +66,14 @@ async fn coverage_passes_then_broken_helper_turns_requirements_red() {
     .await;
     let g2 = s.load_code_graph().await.unwrap();
     let affected = r
-        .resolve_scope(&s, &g2, &TestScope::Symbol("verify_password".into()))
+        .resolve_scope(&s, &g2, &TestScope::Symbol(q(&s, "verify_password")))
         .await
         .unwrap();
-    assert!(affected.contains(&"test_valid_login_succeeds".to_string()));
+    assert!(affected.contains(&q(&s, "test_valid_login_succeeds")));
     assert!(
-        !affected.iter().any(|t| t.starts_with("py-")),
+        !affected
+            .iter()
+            .any(|t| kodehub_store::arango::local_key(t).starts_with("py-")),
         "python tests don't depend on the rust helper"
     );
     let out = r
@@ -89,14 +91,17 @@ async fn coverage_passes_then_broken_helper_turns_requirements_red() {
     // node health propagates red up the C4 hierarchy
     let health = s.node_health().await.unwrap();
     assert_eq!(
-        health["symbols/verify_credentials"]["health"],
+        health[&q(&s, "code/verify_credentials")]["health"],
         json!("fail")
     );
     assert_eq!(
-        health["components/password-hashing"]["health"],
+        health[&q(&s, "components/password-hashing")]["health"],
         json!("fail")
     );
-    assert_eq!(health["contexts/authentication"]["health"], json!("fail"));
+    assert_eq!(
+        health[&q(&s, "contexts/authentication")]["health"],
+        json!("fail")
+    );
     s.drop_db().await.unwrap();
 }
 
@@ -105,6 +110,19 @@ async fn orphans_impact_and_duplicates() {
     let s = seeded("trace").await;
     assert!(s.orphans().await.unwrap().is_empty(), "seed has no orphans");
 
+    // a requirement covers everything beneath what it applies to, so an orphan needs a home
+    // no requirement reaches: a new context
+    s.insert_node("contexts", json!({"_key": "scratch", "title": "Scratch"}))
+        .await
+        .unwrap();
+    s.insert_edge(
+        "contains",
+        &s.project_node().unwrap(),
+        "contexts/scratch",
+        json!({}),
+    )
+    .await
+    .unwrap();
     s.create_symbol(
         &NewSymbol {
             key: Some("lonely".into()),
@@ -114,6 +132,7 @@ async fn orphans_impact_and_duplicates() {
             visibility: Default::default(),
             tags: vec![],
             description: None,
+            parent: Some("contexts/scratch".into()),
         },
         &VersionContent {
             kind: Kind::Function,
@@ -128,14 +147,14 @@ async fn orphans_impact_and_duplicates() {
     .unwrap();
     let orphans = s.orphans().await.unwrap();
     assert_eq!(orphans.len(), 1);
-    assert_eq!(orphans[0]["key"], json!("lonely"));
+    assert_eq!(orphans[0]["key"], json!(q(&s, "lonely")));
 
     let imp = s.impact("hash_password").await.unwrap();
-    let groups: Vec<&str> = imp["groups"]
+    let tags: Vec<&str> = imp["tags"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|g| g["id"].as_str().unwrap())
+        .map(|g| g.as_str().unwrap())
         .collect();
     let reqs: Vec<&str> = imp["requirements"]
         .as_array()
@@ -143,12 +162,12 @@ async fn orphans_impact_and_duplicates() {
         .iter()
         .map(|g| g["id"].as_str().unwrap())
         .collect();
-    assert_eq!(groups, vec!["requirement_groups/secure-authentication"]);
+    assert_eq!(tags, vec!["secure-authentication"]);
     assert_eq!(
         reqs,
         vec![
-            "requirements/r1-generic-failure",
-            "requirements/r2-hashed-storage"
+            q(&s, "requirements/r1-generic-failure"),
+            q(&s, "requirements/r2-hashed-storage")
         ]
     );
 

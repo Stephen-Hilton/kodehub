@@ -12,8 +12,8 @@ use sha2::Digest;
 use crate::identity::{random_token, token_key, AuthVia, Permission, Principal, UserKind, TOKENS};
 use crate::{Result, Store, StoreError};
 
-pub const CLIENTS: &str = "kodehub_oauth_clients";
-pub const CODES: &str = "kodehub_oauth_codes";
+pub const CLIENTS: &str = "oauth_clients";
+pub const CODES: &str = "oauth_codes";
 
 const ACCESS_TTL_SECS: i64 = 3600;
 const REFRESH_TTL_DAYS: i64 = 30;
@@ -131,7 +131,7 @@ impl Store {
             TOKENS,
             &json!({"_key": token_key(&access), "user": agent, "name": "oauth access",
                     "scope": {"projects": null, "permission": Permission::Write},
-                    "created_at": now_iso(), "created_by": format!("kodehub_users/{human}"),
+                    "created_at": now_iso(), "created_by": format!("users/{human}"),
                     "expires_at": after(ACCESS_TTL_SECS), "revoked": false, "prefix": &access[..12],
                     "oauth_client": client_id}),
         )
@@ -193,10 +193,12 @@ impl Store {
         // the human (and the agent) must still be allowed in
         let agent = t["user"].as_str().unwrap_or_default().to_string();
         let human = t["human"].as_str().unwrap_or_default().to_string();
-        for u in [&agent, &human] {
-            if self.get_user(u).await?["disabled"] == true {
-                return Err(bad());
-            }
+        let agent_doc = self
+            .g_get(crate::identity::REMOTE_AGENTS, &agent)
+            .await?
+            .ok_or_else(bad)?;
+        if agent_doc["disabled"] == true || self.get_user(&human).await?["disabled"] == true {
+            return Err(bad());
         }
         self.g_patch(
             TOKENS,

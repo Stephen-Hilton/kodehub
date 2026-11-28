@@ -3,13 +3,13 @@
 
 pub mod agents;
 pub mod c4;
-pub mod changesets;
+pub mod deploy;
 pub mod graph;
 pub mod identity;
 pub mod oauth;
 pub mod project_init;
+pub mod proposals;
 pub mod queue;
-pub mod releases;
 pub mod requirements;
 pub mod runs;
 pub mod settings;
@@ -219,38 +219,56 @@ pub fn api() -> Router<AppState> {
             "/api/decisions",
             get(requirements::list_decisions).post(requirements::create_decision),
         )
-        // changesets
+        // work items carry their proposals (D-058)
+        .route("/api/proposals", get(proposals::list).post(proposals::open))
         .route(
-            "/api/changesets",
-            get(changesets::list).post(changesets::open),
+            "/api/work-items/{key}/proposal",
+            get(proposals::get).post(proposals::open_on),
         )
-        .route("/api/changesets/{key}", get(changesets::get))
-        .route("/api/changesets/{key}/plan", post(changesets::plan))
-        .route("/api/changesets/{key}/approve", post(changesets::approve))
+        .route("/api/work-items/{key}/proposal/plan", post(proposals::plan))
         .route(
-            "/api/changesets/{key}/versions",
-            post(changesets::propose_version),
-        )
-        .route(
-            "/api/changesets/{key}/edges",
-            post(changesets::propose_edge),
+            "/api/work-items/{key}/proposal/approve",
+            post(proposals::approve),
         )
         .route(
-            "/api/changesets/{key}/reviews",
-            post(changesets::submit_review),
+            "/api/work-items/{key}/proposal/versions",
+            post(proposals::propose_version),
         )
         .route(
-            "/api/changesets/{key}/transition",
-            post(changesets::transition),
+            "/api/work-items/{key}/proposal/edges",
+            post(proposals::propose_edge),
         )
-        .route("/api/changesets/{key}/test", post(changesets::test))
-        .route("/api/changesets/{key}/checks", get(changesets::checks))
-        .route("/api/changesets/{key}/merge", post(changesets::merge))
-        .route("/api/changesets/{key}/reject", post(changesets::reject))
-        .route("/api/changesets/{key}/run", post(changesets::run))
-        .route("/api/changesets/{key}/resolve", post(changesets::resolve))
-        .route("/api/manual-edit", post(changesets::manual_edit))
-        .route("/api/changesets/{key}/replan", post(changesets::replan))
+        .route(
+            "/api/work-items/{key}/proposal/reviews",
+            post(proposals::submit_review),
+        )
+        .route(
+            "/api/work-items/{key}/proposal/transition",
+            post(proposals::transition),
+        )
+        .route("/api/work-items/{key}/proposal/test", post(proposals::test))
+        .route(
+            "/api/work-items/{key}/proposal/checks",
+            get(proposals::checks),
+        )
+        .route(
+            "/api/work-items/{key}/proposal/accept",
+            post(proposals::accept),
+        )
+        .route(
+            "/api/work-items/{key}/proposal/reject",
+            post(proposals::reject),
+        )
+        .route("/api/work-items/{key}/proposal/run", post(proposals::run))
+        .route(
+            "/api/work-items/{key}/proposal/resolve",
+            post(proposals::resolve),
+        )
+        .route(
+            "/api/work-items/{key}/proposal/replan",
+            post(proposals::replan),
+        )
+        .route("/api/manual-edit", post(proposals::manual_edit))
         // agents
         .route("/api/agents", get(agents::status))
         .route("/api/chat", get(agents::history).post(agents::chat))
@@ -260,23 +278,33 @@ pub fn api() -> Router<AppState> {
         .route("/api/tests/results", get(runs::test_results))
         .route("/api/run", post(runs::run_now))
         .route("/api/runs", get(runs::list_runs))
-        // releases & environments
-        .route("/api/releases", get(releases::list).post(releases::cut))
-        .route("/api/releases/bisect", post(releases::bisect))
-        .route("/api/releases/{key}", get(releases::get))
-        .route("/api/releases/{key}/reselect", post(releases::reselect))
-        .route("/api/releases/{key}/selection", get(releases::selection))
-        .route("/api/releases/{key}/clone", post(releases::clone))
-        .route("/api/releases/{key}/patch", post(releases::patch))
-        .route("/api/releases/{key}/swap", post(releases::swap))
-        .route("/api/releases/{a}/diff/{b}", get(releases::diff))
-        .route("/api/environments", get(releases::environments))
-        .route("/api/environments/{env}/promote", post(releases::promote))
-        .route("/api/environments/{env}/rollback", post(releases::rollback))
+        // project versions are the releases; deployments carry them into environments
         .route(
-            "/api/environments/{env}/approvals",
-            post(releases::approve_prod),
+            "/api/project-versions",
+            get(deploy::list_versions).post(deploy::create_version),
         )
+        .route("/api/project-versions/bisect", post(deploy::bisect))
+        .route("/api/project-versions/{key}", get(deploy::get_version))
+        .route(
+            "/api/project-versions/{key}/freeze",
+            post(deploy::freeze_version),
+        )
+        .route(
+            "/api/project-versions/{key}/current",
+            post(deploy::make_current),
+        )
+        .route("/api/project-versions/{key}/hotfix", post(deploy::hotfix))
+        .route("/api/project-versions/{key}/trace", get(deploy::trace))
+        .route("/api/project-versions/{a}/diff/{b}", get(deploy::diff))
+        .route("/api/environments", get(deploy::environments))
+        .route("/api/environments/{env}/rollback", post(deploy::rollback))
+        .route(
+            "/api/deployments",
+            get(deploy::list_deployments).post(deploy::deploy),
+        )
+        .route("/api/deployments/{key}", get(deploy::get_deployment))
+        .route("/api/deployments/{key}/approve", post(deploy::approve))
+        .route("/api/deployments/{key}/retry", post(deploy::retry))
         // embedded terminal
         .route("/api/terminal", get(terminal::ws))
         .route("/api/terminal/mcp-command", get(terminal::mcp_command))

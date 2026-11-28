@@ -1,9 +1,10 @@
-//! Git import (spec §13.1): the import container's code units are staged in the project; the
-//! import agent maps them onto contexts, containers and components; the mapping becomes an
-//! import changeset whose promotion makes the code live versions.
+//! Git import (spec §13.1): the import container's code units are staged in the project (the
+//! `import_staging` system collection, not graph data); the import agent maps them onto
+//! contexts, containers and components; the mapping becomes the proposal of the agent's work
+//! item, whose acceptance makes the code versions in the current project version.
 //!
 //! Imported code arrives without Kodehub requirements, so every component gets a generated
-//! requirement — "preserve the behaviour of the imported code" — that it satisfies. That keeps
+//! requirement — "preserve the behaviour of the imported code" — that applies to it. That keeps
 //! the code traceable (no orphans) until humans and agents write real requirements.
 
 use std::collections::BTreeMap;
@@ -11,7 +12,7 @@ use std::collections::BTreeMap;
 use kodehub_core::model::{now_iso, Kind, Language};
 use serde_json::{json, Value};
 
-use crate::changesets::ProposeVersion;
+use crate::proposals::ProposeVersion;
 use crate::{Result, Store, StoreError};
 
 fn unit_key(id: &str) -> String {
@@ -21,8 +22,9 @@ fn unit_key(id: &str) -> String {
 impl Store {
     /// Stage parsed units of an import (replacing any earlier staging of the same import).
     pub async fn stage_import(&self, import: &str, meta: &Value, units: &[Value]) -> Result<usize> {
+        let project = self.db.require_project()?;
         self.aql(
-            "FOR u IN @@import_units FILTER u.import == @i REMOVE u IN @@import_units",
+            "FOR u IN @@import_staging FILTER u.import == @i REMOVE u IN @@import_staging",
             json!({"i": import}),
         )
         .await?;
@@ -31,10 +33,10 @@ impl Store {
                 .iter()
                 .map(|u| {
                     let mut d = u.clone();
-                    d["_key"] = json!(unit_key(&format!(
-                        "{import}|{}",
-                        u["id"].as_str().unwrap_or("")
-                    )));
+                    d["_key"] = json!(crate::arango::qualify(
+                        &project,
+                        &unit_key(&format!("{import}|{}", u["id"].as_str().unwrap_or("")))
+                    ));
                     d["import"] = json!(import);
                     d["repo_url"] = meta["repo_url"].clone();
                     d["commit"] = meta["commit"].clone();
@@ -43,64 +45,68 @@ impl Store {
                 })
                 .collect();
             for d in docs {
-                self.db.insert("import_units", &d, None).await?;
+                self.db.insert("import_staging", &d, None).await?;
             }
         }
         Ok(units.len())
     }
 
-    pub async fn import_units(&self, import: &str) -> Result<Vec<Value>> {
+    pub async fn import_staging(&self, import: &str) -> Result<Vec<Value>> {
         self.aql(
-            "FOR u IN @@import_units FILTER u.import == @i SORT u.file, u.name RETURN u",
+            "FOR u IN @@import_staging FILTER u.import == @i SORT u.file, u.name RETURN u",
             json!({"i": import}),
         )
         .await
     }
 
-    /// Promote an import changeset: the code is imported as it was, so there are no Kodehub tests
-    /// to run yet and no code review; orphan checks still apply (each component satisfies its
+    /// Accept an import proposal: the code is imported as it was, so there are no Kodehub
+    /// tests to run yet and no code review; orphan checks still apply (each component has its
     /// generated requirement).
-    pub async fn merge_import(
+    pub async fn accept_import(
         &self,
-        key: &str,
+        work_item: &str,
         by: &str,
-    ) -> Result<crate::changesets::MergeChecks> {
-        let cs = self.get_changeset(key).await?;
-        if cs["import"] != true {
-            return Err(StoreError::Invalid("not an import changeset".into()));
+    ) -> Result<crate::proposals::AcceptChecks> {
+        let p = self.get_proposal(work_item).await?;
+        if p["import"] != true {
+            return Err(StoreError::Invalid("not an import proposal".into()));
         }
-        let mut hist = cs["history"].as_array().cloned().unwrap_or_default();
+        let mut hist = p["history"].as_array().cloned().unwrap_or_default();
         hist.push(json!({"state": "ready", "at": now_iso(), "by": by, "note": "git import"}));
-        self.patch_changeset(key, json!({"state": "ready", "history": hist}))
+        self.patch_proposal(work_item, json!({"state": "ready", "history": hist}))
             .await?;
-        self.merge_bypassing_tests(key, by).await
+        self.accept_bypassing_tests(work_item, by).await
     }
 }
 
 /// Apply an import agent's mapping:
 /// `{import, contexts: [{name, description}], containers: [{name, parent}],
 ///   components: [{name, parent, units: [unit id or id prefix]}]}`.
-pub async fn apply_mapping(s: &Store, m: &Value, by: &str) -> Result<Value> {
+pub async fn apply_mapping(s: &Store, m: &Value, work_item: &str, by: &str) -> Result<Value> {
     let import = m["import"]
         .as_str()
         .ok_or_else(|| StoreError::Invalid("the mapping names its import".into()))?;
-    let units = s.import_units(import).await?;
+    let units = s.import_staging(import).await?;
     if units.is_empty() {
         return Err(StoreError::Invalid(format!(
             "no units staged for import {import}"
         )));
     }
+    let project = s.db.require_project()?;
     let id_of = |level: &str, name: &str| {
         let coll = match level {
             "context" => "contexts",
             "container" => "containers",
             _ => "components",
         };
-        format!("{coll}/{}", crate::slug(name))
+        format!(
+            "{coll}/{}",
+            crate::arango::qualify(&project, &crate::slug(name))
+        )
     };
     let resolve_parent = |p: &Value, default: &str| -> String {
         match p.as_str() {
-            Some(x) if x.contains('/') => x.to_string(),
+            Some(x) if x.contains('/') => s.db.qid(x).unwrap_or_else(|_| x.to_string()),
             Some(x) => {
                 // a bare name: a container if one is mapped by that name, else a context
                 let cont = m["containers"]
@@ -115,14 +121,15 @@ pub async fn apply_mapping(s: &Store, m: &Value, by: &str) -> Result<Value> {
     for c in m["contexts"].as_array().cloned().unwrap_or_default() {
         let mut n = c.clone();
         n["level"] = json!("context");
-        n["parent"] = json!(crate::c4::PHILOSOPHY_ID);
+        n["parent"] = json!(s.philosophy_id()?);
         n["planned_by"] = json!(by);
         made.push(s.create_planned_node(&n).await?);
     }
     let first_ctx = made
         .first()
         .cloned()
-        .unwrap_or_else(|| crate::c4::PHILOSOPHY_ID.to_string());
+        .map(Ok)
+        .unwrap_or_else(|| s.philosophy_id())?;
     for c in m["containers"].as_array().cloned().unwrap_or_default() {
         let mut n = c.clone();
         n["level"] = json!("container");
@@ -169,7 +176,7 @@ pub async fn apply_mapping(s: &Store, m: &Value, by: &str) -> Result<Value> {
     // one generated requirement per component keeps the imported code traceable
     let mut reqs = Vec::new();
     for (cid, name) in &components {
-        let rk = format!("imported-{}", crate::slug(name));
+        let rk = s.db.pkey(&format!("imported-{}", crate::slug(name)))?;
         if s.db.get("requirements", &rk, None).await.is_err() {
             s.create_requirement(json!({
                 "_key": rk, "title": format!("Preserve imported behaviour: {name}"),
@@ -180,17 +187,19 @@ pub async fn apply_mapping(s: &Store, m: &Value, by: &str) -> Result<Value> {
             .await?;
         }
         let rid = format!("requirements/{rk}");
+        let _ = &project;
         s.db.insert_ignore(
-            "satisfies",
-            &json!({"_key": crate::edge_key("satisfies", cid, &rid), "_from": cid, "_to": rid}),
+            "applies_to",
+            &json!({"_key": crate::edge_key("applies_to", &rid, cid), "_from": rid, "_to": cid}),
             None,
         )
         .await?;
         reqs.push(rk);
     }
-    // the import changeset: decomposed Rust / Python units become code versions
+    // the import proposal: decomposed Rust / Python units become code versions
     let cs = s
-        .open_changeset(
+        .open_proposal(
+            work_item,
             &format!(
                 "Import {}",
                 units[0]["repo_url"].as_str().unwrap_or("repository")
@@ -204,7 +213,7 @@ pub async fn apply_mapping(s: &Store, m: &Value, by: &str) -> Result<Value> {
         )
         .await?;
     let key = cs["_key"].as_str().unwrap_or_default().to_string();
-    s.patch_changeset(&key, json!({"import": true, "import_id": import}))
+    s.patch_proposal(&key, json!({"import": true, "import_id": import}))
         .await?;
     let mut proposed = 0usize;
     let mut opaque = 0usize;
@@ -226,7 +235,7 @@ pub async fn apply_mapping(s: &Store, m: &Value, by: &str) -> Result<Value> {
         let (Some(lang), Some(kind), true) = (lang, kind, u["decomposed"] == true) else {
             // other languages: opaque modules, kept staged on their component, not decomposed
             s.db.patch(
-                "import_units",
+                "import_staging",
                 u["_key"].as_str().unwrap_or_default(),
                 &json!({"state": "opaque", "component": comp}),
                 None,
@@ -261,11 +270,11 @@ pub async fn apply_mapping(s: &Store, m: &Value, by: &str) -> Result<Value> {
         proposed += 1;
     }
     if proposed > 0 {
-        s.merge_import(&key, by).await?;
+        s.accept_import(&key, by).await?;
     }
     s.aql(
-        "FOR u IN @@import_units FILTER u.import == @i AND u.state == 'staged'
-           UPDATE u WITH {state: 'imported'} IN @@import_units",
+        "FOR u IN @@import_staging FILTER u.import == @i AND u.state == 'staged'
+           UPDATE u WITH {state: 'imported'} IN @@import_staging",
         json!({"i": import}),
     )
     .await?;

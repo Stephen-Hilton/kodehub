@@ -1,4 +1,6 @@
-//! M1 acceptance: graph core against a real ArangoDB (one throwaway database per test).
+//! M1 acceptance (graph core) on the ontology model: closure hashes per project version,
+//! requirement versions, invariants. Seeding, re-import and one-change-one-version-per-level
+//! are covered by `o3_version_tree`.
 
 use std::collections::BTreeSet;
 
@@ -15,189 +17,91 @@ async fn seeded(prefix: &str) -> Store {
     s
 }
 
-async fn count(s: &Store, coll: &str) -> usize {
-    s.aql("RETURN LENGTH(@@c)", json!({"@c": coll}))
-        .await
-        .unwrap()[0]
-        .as_u64()
-        .unwrap() as usize
-}
-
 #[tokio::test]
-async fn seed_imports_cleanly_and_reimport_is_a_noop() {
-    let s = seeded("reimport").await;
-    assert!(s.check_invariants().await.unwrap().is_empty());
-    let versions = count(&s, "versions").await;
-    let symbols = count(&s, "symbols").await;
-    // check_password duplicates verify_password, so they share one version node
-    assert_eq!(versions, symbols - 1);
-    let report = import_dir(&s, &seed_dir()).await.unwrap();
-    assert_eq!(report.versions_created, 0);
-    assert_eq!(report.symbols_changed, 0);
-    assert_eq!(report.symbols_created, 0);
-    assert_eq!(report.edges_created, 0);
-    assert_eq!(report.documents_created, 0);
-    assert_eq!(report.documents_updated, 0);
-    assert_eq!(count(&s, "versions").await, versions);
-    s.drop_db().await.unwrap();
-}
+async fn changing_a_dependency_changes_exactly_the_dependents_closure_hashes() {
+    let s = seeded("closure").await;
+    let k = |x: &str| s.db.pkey(x).unwrap();
+    let before = s.load_code_graph().await.unwrap();
+    let mut expected: BTreeSet<String> = before.dependents(&k("hash_password"));
+    expected.insert(k("hash_password"));
+    assert!(expected.contains(&k("UserStore-add_user")));
+    assert!(expected.contains(&k("test_unknown_user_is_invalid")));
+    assert!(!expected.contains(&k("verify_credentials")));
 
-#[tokio::test]
-async fn changing_one_body_creates_one_version_and_flips_edges() {
-    let s = seeded("flip").await;
-    let before_versions = count(&s, "versions").await;
-    let old = s
-        .aql(
-            "FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/verify_credentials') AND e.state == 'stable' RETURN e._to",
-            json!({}),
-        )
-        .await
-        .unwrap()[0]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let doc = s.get_node(&old).await.unwrap();
-    let mut content = version_content_from_doc(&doc).unwrap();
-    content.body = format!("// tweak\n{}", content.body);
+    let node = s.symbol_id("hash_password").await.unwrap();
+    let v = s.version_in(&node, None).await.unwrap().unwrap();
+    let mut content = version_content_from_doc(&s.get_node(&v).await.unwrap()).unwrap();
+    content.body.push_str("\n// changed");
     let out = s
-        .write_version("verify_credentials", &content, "test")
+        .write_version("hash_password", &content, "test")
         .await
         .unwrap();
-    assert!(out.created_version && out.changed);
-    assert_eq!(count(&s, "versions").await, before_versions + 1);
-    let cur = s
-        .aql(
-            "FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/verify_credentials') AND e.state == 'stable' RETURN e._to",
-            json!({}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(cur, vec![json!(format!("versions/{}", out.version))]);
-    // the old version is retired, not deleted: its edge closed with validTo (type 2 SCD)
-    let prev = s
-        .aql(
-            "FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/verify_credentials') AND e.state == 'retired' RETURN e",
-            json!({}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(prev.len(), 1);
-    assert_eq!(prev[0]["_to"], json!(old));
-    assert_eq!(prev[0]["retired_by"], json!(out.version));
-    assert!(prev[0]["validTo"].is_string());
-    let new_edge = s
-        .stable_edge_in("symbols/verify_credentials", None)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        new_edge["validFrom"], prev[0]["validTo"],
-        "intervals meet, never overlap"
-    );
-    assert_eq!(
-        new_edge["seq"].as_i64(),
-        Some(prev[0]["seq"].as_i64().unwrap() + 1)
-    );
-    // as-of lookup returns the version that was stable at that moment
-    let before = prev[0]["validFrom"].as_str().unwrap().to_string();
-    let asof = s
-        .version_as_of("symbols/verify_credentials", &before)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        format!("versions/{}", asof["version"].as_str().unwrap()),
-        old
-    );
-    let now = kodehub_core::model::now_iso();
-    let asof = s
-        .version_as_of("symbols/verify_credentials", &now)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(asof["version"], json!(out.version));
+    assert!(out.changed && out.created_version);
+    let after = s.load_code_graph().await.unwrap();
+    let changed: BTreeSet<String> = before
+        .symbols
+        .keys()
+        .filter(|id| before.closure_hash(id).ok() != after.closure_hash(id).ok())
+        .cloned()
+        .collect();
+    assert_eq!(changed, expected);
     // writing the same content again is a no-op
     let again = s
-        .write_version("verify_credentials", &content, "test")
+        .write_version("hash_password", &content, "test")
         .await
         .unwrap();
     assert!(!again.changed && !again.created_version);
     // version nodes are immutable through the API
     let err = s
-        .update_node("versions", &out.version, &json!({"body": "x"}))
+        .update_node("code_versions", &out.version, &json!({"body": "x"}))
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::Immutable(_)));
-    assert!(s.check_invariants().await.unwrap().is_empty());
-    let hist = s.version_history("verify_credentials").await.unwrap();
-    assert_eq!(hist.len(), 2);
-    assert_eq!(hist[0]["current"], json!(true));
     s.drop_db().await.unwrap();
 }
 
 #[tokio::test]
-async fn changing_a_dependency_changes_exactly_the_dependents_closure_hashes() {
-    let s = seeded("closure").await;
-    let snapshot = |s: Store| async move {
-        s.aql(
-            "FOR x IN @@symbols SORT x._key RETURN [x._key, x.closure_hash]",
-            json!({}),
-        )
-        .await
-        .unwrap()
-    };
-    let before = snapshot(s.clone()).await;
-    let graph = s.load_code_graph().await.unwrap();
-    let mut expected: BTreeSet<String> = graph.dependents("hash_password");
-    expected.insert("hash_password".into());
-    assert!(expected.contains("UserStore-add_user"));
-    assert!(expected.contains("test_unknown_user_is_invalid"));
-    assert!(!expected.contains("verify_credentials"));
-
-    let doc = s.aql("FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/hash_password') AND e.state == 'stable' RETURN DOCUMENT(e._to)", json!({})).await.unwrap();
-    let mut content = version_content_from_doc(&doc[0]).unwrap();
-    content.body.push_str("\n// changed");
-    s.write_version("hash_password", &content, "test")
-        .await
-        .unwrap();
-    let after = snapshot(s.clone()).await;
-    let changed: BTreeSet<String> = before
-        .iter()
-        .zip(after.iter())
-        .filter(|(a, b)| a[1] != b[1])
-        .map(|(a, _)| a[0].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(changed, expected);
-    s.drop_db().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_second_stable_version_edge_is_rejected() {
+async fn a_node_appears_once_per_project_version() {
     let s = seeded("invariant").await;
-    let v = s.aql("FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/hash_password') AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key", json!({})).await.unwrap();
-    // even pointing the *same* version at it again is refused
+    assert!(s.check_invariants().await.unwrap().is_empty());
+    // the generic edge API refuses the protected collections outright
+    let node = s.symbol_id("hash_password").await.unwrap();
     let err = s
-        .force_add_stable_version(v[0].as_str().unwrap(), "hash_password")
-        .await
-        .unwrap_err();
-    assert!(matches!(err, StoreError::Invariant(_)), "{err:?}");
-    // and the generic edge API refuses protected collections outright
-    let err = s
-        .insert_edge(
-            "has_version",
-            "symbols/hash_password",
-            "versions/x",
-            json!({}),
-        )
+        .insert_edge("has_version", &node, "code_versions/x", json!({}))
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::Invalid(_)));
-    assert!(s.check_invariants().await.unwrap().is_empty());
+    // a second version of a node wired into the tree by hand is reported
+    let tree = s.tree(None).await.unwrap();
+    let cv = tree.version(&node).unwrap().to_string();
+    let comp = tree
+        .version(&s.db.qid("components/password-hashing").unwrap())
+        .unwrap()
+        .to_string();
+    let doc = s.get_node(&cv).await.unwrap();
+    let mut c = version_content_from_doc(&doc).unwrap();
+    c.body.push_str("\n// sneaky");
+    let (vid, _) = s
+        .put_leaf_version(&node, &c, "test", None, None)
+        .await
+        .unwrap();
+    s.db.insert(
+        "contains",
+        &json!({"_key": s.db.pkey("sneak").unwrap(), "_from": comp, "_to": vid}),
+        None,
+    )
+    .await
+    .unwrap();
+    let problems = s.check_invariants().await.unwrap();
+    assert!(
+        problems.iter().any(|p| p.contains("appears 2 times")),
+        "{problems:?}"
+    );
     s.drop_db().await.unwrap();
 }
 
 #[tokio::test]
-async fn requirement_edits_keep_history() {
+async fn requirement_edits_are_versions() {
     let s = seeded("reqhist").await;
     let (new, changed) = s.update_requirement(
         "r1-generic-failure",
@@ -207,11 +111,29 @@ async fn requirement_edits_keep_history() {
     assert_eq!(new["revision"], json!(2));
     assert_eq!(new["at_risk"], json!(true));
     let hist = s.requirement_history("r1-generic-failure").await.unwrap();
-    assert_eq!(hist.len(), 1);
-    assert_eq!(hist[0]["revision"], json!(1));
+    assert_eq!(hist.len(), 2, "every revision is a version");
+    assert_eq!(hist[0]["revision"], json!(2));
+    assert_eq!(hist[0]["state"], json!("accepted"));
     assert_eq!(
-        hist[0]["snapshot"]["edge_cases"][0]["description"],
+        hist[1]["content"]["edge_cases"][0]["description"],
         json!("Empty username")
+    );
+    // versions hang off the requirement node
+    let rid = new["_id"].as_str().unwrap();
+    let n = s
+        .aql(
+            "RETURN COUNT(FOR e IN @@has_version FILTER e._from == @r RETURN 1)",
+            json!({"r": rid}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(n[0], 2);
+    // decisions are requirements of kind `decision`
+    let ds = s.list_decisions().await.unwrap();
+    assert_eq!(ds.len(), 1);
+    assert_eq!(
+        ds[0]["justifies"],
+        json!([s.symbol_id("verify_credentials").await.unwrap()])
     );
     s.drop_db().await.unwrap();
 }

@@ -1,16 +1,16 @@
 //! Projects: many projects in one ArangoDB database (decision D-projects).
 //!
-//! The registry (`kodehub_projects`) lists projects; `kodehub_meta/active` remembers the active
-//! one across restarts. Each project owns its own collection set (see `arango.rs`). Switching
-//! is server-wide: every clone of the store follows the active project.
+//! The registry (`projects`) lists projects; `meta/active` remembers the active
+//! one across restarts. Projects share one set of collections (D-055, see `arango.rs`).
+//! Switching is server-wide: every clone of the store follows the active project.
 
 use std::path::Path;
 
-use kodehub_core::model::{now_iso, DOCUMENT_COLLECTIONS, EDGE_COLLECTIONS};
+use kodehub_core::model::now_iso;
 use reqwest::Method;
 use serde_json::{json, Value};
 
-use crate::arango::{valid_project_id, Arango, GRAPH_NAME};
+use crate::arango::{valid_project_id, Arango};
 use crate::schema::{self, META, PROJECTS};
 use crate::{Result, Store, StoreError};
 
@@ -56,17 +56,6 @@ impl Arango {
         a.pinned = true;
         a
     }
-
-    async fn collection_exists(&self, physical: &str) -> Result<bool> {
-        match self
-            .db_raw(Method::GET, &format!("/_api/collection/{physical}"), None)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(StoreError::Arango { num: 1203, .. }) => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
 }
 
 impl Store {
@@ -78,8 +67,8 @@ impl Store {
     /// Select the active project at startup: the remembered one, else the most recently
     /// opened, else a freshly created first project. Migrates a pre-projects database first.
     pub(crate) async fn select_initial_project(&self, backup_dir: Option<&Path>) -> Result<()> {
+        let _ = backup_dir; // pre-projects databases are no longer migrated (D-055)
         schema::bootstrap_registry(&self.db).await?;
-        self.migrate_legacy(backup_dir).await?;
         let remembered = self
             .meta("active")
             .await?
@@ -145,12 +134,14 @@ impl Store {
             let counts = self
                 .db
                 .aql_raw(
-                    "RETURN {requirements: LENGTH(@@r), symbols: LENGTH(@@s), changesets: LENGTH(@@c)}",
-                    json!({
-                        "@r": Arango::phys_in(&id, "requirements"),
-                        "@s": Arango::phys_in(&id, "symbols"),
-                        "@c": Arango::phys_in(&id, "changesets"),
-                    }),
+                    "RETURN {requirements: COUNT(FOR x IN requirements FILTER x.project == @p
+                                               AND x.kind != 'decision' RETURN 1),
+                             code: COUNT(FOR x IN code FILTER x.project == @p RETURN 1),
+                             tests: COUNT(FOR x IN tests FILTER x.project == @p RETURN 1),
+                             open_proposals: COUNT(FOR w IN work_items FILTER w.project == @p
+                                 AND w.proposal != null
+                                 AND w.proposal.state NOT IN ['accepted', 'rejected'] RETURN 1)}",
+                    json!({"p": id}),
                 )
                 .await
                 .ok()
@@ -232,11 +223,22 @@ impl Store {
                 Err(e) => return Err(e),
             }
         }
-        schema::bootstrap(&self.db.scoped(&id)).await?;
+        self.for_project(&id).bootstrap_project().await?;
         Ok(json!({"id": id, "name": name, "description": description.trim()}))
     }
 
-    /// Create a project (empty graph, four environments). Does not switch to it.
+    /// A project's starting data (idempotent): its environments with a deployer for the
+    /// default deploy target in each, its first open project version (`r1`, current), the
+    /// built-in agent types and the default test images. Needs a project-bound store.
+    pub async fn bootstrap_project(&self) -> Result<()> {
+        self.env_defs().await?;
+        self.current_version().await?;
+        self.ensure_agents().await?;
+        self.ensure_test_container_types().await?;
+        Ok(())
+    }
+
+    /// Create a project (empty graph, five environments, `r1`). Does not switch to it.
     pub async fn create_project(&self, name: &str, description: &str) -> Result<Value> {
         let created = self.register_project(name, description).await?;
         let id = created["id"].as_str().unwrap_or_default().to_string();
@@ -249,8 +251,8 @@ impl Store {
 
     async fn activate(&self, id: &str) -> Result<()> {
         self.project_doc(id).await?;
-        // idempotent: heals a project whose schema is incomplete
-        schema::bootstrap(&self.db.scoped(id)).await?;
+        // idempotent: heals a project whose starting data is incomplete
+        self.for_project(id).bootstrap_project().await?;
         self.db.set_project(Some(id.to_string()));
         self.set_meta("active", json!({"project": id})).await?;
         self.db
@@ -308,7 +310,7 @@ impl Store {
                 "the open project cannot be deleted — switch to another project first".into(),
             ));
         }
-        schema::drop_project_schema(&self.db, id).await?;
+        schema::drop_project_data(&self.db, id).await?;
         self.db
             .db_raw(
                 Method::DELETE,
@@ -316,123 +318,6 @@ impl Store {
                 None,
             )
             .await?;
-        Ok(())
-    }
-
-    /// Move a pre-projects database (unprefixed collections) into a project of its own.
-    /// The data is copied first; the old collections are dropped only when `backup_dir` is
-    /// given, after a JSON backup of them has been written there.
-    async fn migrate_legacy(&self, backup_dir: Option<&Path>) -> Result<()> {
-        if !self.db.collection_exists("symbols").await? {
-            return Ok(());
-        }
-        let legacy: Vec<&str> = {
-            let mut v = Vec::new();
-            for c in DOCUMENT_COLLECTIONS.iter().chain(EDGE_COLLECTIONS) {
-                if self.db.collection_exists(c).await? {
-                    v.push(*c);
-                }
-            }
-            v
-        };
-        if self.meta("legacy").await?.is_none() {
-            let title = self
-                .db
-                .aql_raw(
-                    "FOR m IN missions SORT m._key LIMIT 1 RETURN m.title",
-                    json!({}),
-                )
-                .await
-                .ok()
-                .and_then(|r| r.into_iter().next())
-                .and_then(|v| v.as_str().map(str::to_string))
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "Kodehub".into());
-            let created = self.register_project(&title, "").await?;
-            let id = created["id"].as_str().unwrap_or_default().to_string();
-            let target = self.db.scoped(&id);
-            for c in &legacy {
-                let docs = self
-                    .db
-                    .aql_raw(
-                        "FOR d IN @@c RETURN UNSET(d, '_id', '_rev')",
-                        json!({"@c": c}),
-                    )
-                    .await?;
-                for chunk in docs.chunks(500) {
-                    target
-                        .db(
-                            Method::POST,
-                            &format!("/_api/document/{}?overwriteMode=replace", target.phys(c)),
-                            Some(&Value::Array(chunk.to_vec())),
-                        )
-                        .await?;
-                }
-                let n = target
-                    .aql_raw("RETURN LENGTH(@@c)", json!({"@c": target.phys(c)}))
-                    .await?;
-                if n.first().and_then(Value::as_u64) < Some(docs.len() as u64) {
-                    return Err(StoreError::Invariant(format!(
-                        "legacy migration of `{c}` copied {n:?} of {} documents",
-                        docs.len()
-                    )));
-                }
-            }
-            self.set_meta(
-                "legacy",
-                json!({"migrated_to": id, "at": now_iso(), "dropped": false}),
-            )
-            .await?;
-            self.set_meta("active", json!({"project": id})).await?;
-            tracing::info!("migrated the pre-projects database into project `{id}`");
-        }
-        let Some(dir) = backup_dir else {
-            return Ok(());
-        };
-        std::fs::create_dir_all(dir)
-            .map_err(|e| StoreError::Invalid(format!("backup dir: {e}")))?;
-        let mut backup = serde_json::Map::new();
-        for c in &legacy {
-            let docs = self
-                .db
-                .aql_raw("FOR d IN @@c RETURN d", json!({"@c": c}))
-                .await?;
-            backup.insert(c.to_string(), Value::Array(docs));
-        }
-        let file = dir.join(format!(
-            "pre-projects-{}.json",
-            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
-        ));
-        std::fs::write(
-            &file,
-            serde_json::to_vec(&Value::Object(backup)).unwrap_or_default(),
-        )
-        .map_err(|e| StoreError::Invalid(format!("writing backup: {e}")))?;
-        match self
-            .db
-            .db_raw(
-                Method::DELETE,
-                &format!("/_api/gharial/{GRAPH_NAME}?dropCollections=false"),
-                None,
-            )
-            .await
-        {
-            Ok(_) | Err(StoreError::Arango { num: 1924, .. }) => {}
-            Err(e) => return Err(e),
-        }
-        for c in &legacy {
-            self.db
-                .db_raw(Method::DELETE, &format!("/_api/collection/{c}"), None)
-                .await?;
-        }
-        let mut m = self.meta("legacy").await?.unwrap_or(json!({}));
-        m["dropped"] = json!(true);
-        m["backup"] = json!(file.display().to_string());
-        self.set_meta("legacy", m).await?;
-        tracing::info!(
-            "dropped the pre-projects collections (backup: {})",
-            file.display()
-        );
         Ok(())
     }
 }

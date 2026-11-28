@@ -32,7 +32,7 @@ export function MissionBanner({ mission, requirements, openChangesets, connected
           <div className="kpi"><span className="dot" style={{ background: "var(--fail)" }} /><b>{failing}</b> failing</div>
         )}
         <div className="kpi"><b>{testsTotal}</b> tests</div>
-        <div className="kpi"><b>{openChangesets}</b> open changesets</div>
+        <div className="kpi"><b>{openChangesets}</b> open proposals</div>
       </div>
       <div className="live" title={connected ? "Live updates connected" : "Reconnecting…"}>
         <span className="dot pulse" style={{ background: connected ? "var(--pass)" : "var(--fail)" }} />

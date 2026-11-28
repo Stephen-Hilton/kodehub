@@ -1,6 +1,7 @@
-//! Test container types (spec §5.4.1): per project, children of the project in the graph. Each
-//! declares the layers it needs on the one core image; the test author agent keeps the set
-//! viable. Bundles name the type they need (`rust`, `python`, `browser`).
+//! Container images (spec §5.4.1, docs/ontology.md `container_images`): per project, owned by
+//! the project. Test images declare the layers they need on the one core image; the test author
+//! agent keeps the set viable. Bundles name the image they need (`rust`, `python`, `browser`).
+//! Deploy images (`purpose: deploy`) are run by deployers (`deploy.rs`).
 
 use kodehub_core::model::now_iso;
 use serde_json::{json, Value};
@@ -24,11 +25,20 @@ impl Store {
     pub async fn ensure_test_container_types(&self) -> Result<()> {
         for d in defaults() {
             let mut d = d;
+            let name = d["_key"].as_str().unwrap_or_default().to_string();
+            d["_key"] = json!(self.db.pkey(&name)?);
+            d["name"] = json!(name);
+            d["purpose"] = json!("test");
             d["created_at"] = json!(now_iso());
             d["source"] = json!("default");
-            self.db
-                .insert_ignore("test_container_types", &d, None)
-                .await?;
+            let id = format!(
+                "container_images/{}",
+                d["_key"].as_str().unwrap_or_default()
+            );
+            if self.get_node(&id).await.is_err() {
+                self.db.insert_ignore("container_images", &d, None).await?;
+                self.own(&id).await?;
+            }
         }
         Ok(())
     }
@@ -36,7 +46,7 @@ impl Store {
     pub async fn test_container_types(&self) -> Result<Vec<Value>> {
         self.ensure_test_container_types().await?;
         self.aql(
-            "FOR t IN @@test_container_types SORT t._key RETURN t",
+            "FOR t IN @@container_images FILTER t.purpose != 'deploy' SORT t.name RETURN t",
             json!({}),
         )
         .await
@@ -65,12 +75,14 @@ impl Store {
         if let Some(bad) = layers.iter().find(|l| !LAYERS.contains(&l.as_str())) {
             return Err(StoreError::Invalid(format!("unknown layer `{bad}`")));
         }
-        doc["_key"] = json!(crate::slug(name));
+        doc["_key"] = json!(self.db.pkey(&crate::slug(name))?);
+        doc["name"] = json!(crate::slug(name));
+        doc["purpose"] = json!("test");
         doc["updated_at"] = json!(now_iso());
         doc["updated_by"] = json!(by);
-        self.db.upsert("test_container_types", &doc, None).await?;
+        self.db.upsert("container_images", &doc, None).await?;
         self.db
-            .get("test_container_types", &crate::slug(name), None)
+            .get("container_images", &crate::slug(name), None)
             .await
     }
 }

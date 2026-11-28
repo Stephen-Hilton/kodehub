@@ -10,7 +10,7 @@ use kodehub_runner::jobs::{JobRuntime, JobSpec};
 use kodehub_storage::{StorageClient, BUCKET};
 use serde_json::json;
 
-use crate::{AgentBackend, AgentError, AgentOutput, AgentTask, Result};
+use crate::{AgentBackend, AgentError, AgentOutput, AgentTask, RecordedBackend, Result};
 
 pub struct ContainerBackend {
     /// What runs inside the container: `claude_code`, `api` or `recorded`.
@@ -23,6 +23,9 @@ pub struct ContainerBackend {
     /// Kodehub API as seen from inside the cluster.
     pub server_url: String,
     pub timeout: Duration,
+    /// For `recorded`: the server's recording, which keeps the position across tasks (each
+    /// container is fresh, so it replays the answer it is handed).
+    pub recorded: Option<std::sync::Arc<RecordedBackend>>,
 }
 
 #[async_trait::async_trait]
@@ -41,7 +44,11 @@ impl AgentBackend for ContainerBackend {
         );
         let in_key = format!("projects/{project}/jobs/agent-{id}/input.json");
         let out_key = format!("projects/{project}/jobs/agent-{id}/output.json");
-        let input = json!({"task": task, "backend": self.inner, "server_url": self.server_url});
+        let mut input = json!({"task": task, "backend": self.inner, "server_url": self.server_url});
+        if let Some(r) = &self.recorded {
+            input["recorded_output"] = r.next_output(task)?;
+            input["recording"] = json!(r.scenario);
+        }
         self.storage
             .put(
                 BUCKET,

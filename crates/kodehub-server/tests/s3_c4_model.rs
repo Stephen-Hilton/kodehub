@@ -24,7 +24,8 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
         .unwrap()
         .contains("never leaks"));
 
-    // contexts / containers / components have versions; editing one moves the SCD edge
+    // contexts / containers / components have versions; editing one writes a new version into
+    // the current project version (the old one stays, held by no current tree)
     let v1 = t
         .ok(
             "GET",
@@ -33,8 +34,10 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
         )
         .await;
     assert_eq!(v1.as_array().unwrap().len(), 1);
-    assert_eq!(v1[0]["state"], "stable");
-    assert_eq!(v1[0]["collection"], "c4_versions");
+    assert_eq!(v1[0]["state"], "accepted");
+    assert_eq!(v1[0]["current"], true);
+    assert_eq!(v1[0]["collection"], "component_versions");
+    assert_eq!(v1[0]["project_versions"].as_array().unwrap().len(), 1);
     t.ok(
         "PATCH",
         "/api/nodes/components/password-hashing",
@@ -49,10 +52,19 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
         )
         .await;
     assert_eq!(v2.as_array().unwrap().len(), 2);
-    assert_eq!(v2[0]["state"], "stable");
+    assert_eq!(v2[0]["current"], true);
     assert_eq!(v2[0]["seq"], 2);
-    assert_eq!(v2[1]["state"], "retired");
-    assert_eq!(v2[1]["validTo"], v2[0]["validFrom"]);
+    assert_eq!(v2[1]["current"], false);
+    assert!(v2[1]["project_versions"].as_array().unwrap().is_empty());
+    // its container's and context's versions follow (they list their children)
+    let cv = t
+        .ok(
+            "GET",
+            "/api/node-versions?node=containers/auth-service",
+            None,
+        )
+        .await;
+    assert_eq!(cv.as_array().unwrap().len(), 2);
     // a no-op patch creates no version
     t.ok(
         "PATCH",
@@ -78,53 +90,56 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
         .ok("GET", "/api/requirements-by?kind=business", None)
         .await;
     assert_eq!(biz.as_array().unwrap().len(), 1);
-    assert_eq!(biz[0]["key"], "r1-generic-failure");
+    assert_eq!(biz[0]["key"], t.q("r1-generic-failure"));
     let ctx = t
         .ok("GET", "/api/requirements-by?level=context", None)
         .await;
     assert_eq!(
         ctx.as_array().unwrap().len(),
         2,
-        "both reach the context through the group"
+        "both apply to the context"
     );
 
-    // inheritance: verify_credentials has R1 itself and inherits R2 from the context's group
+    // inheritance: verify_credentials has R1 itself and inherits R2 from its context
     let c = t
-        .ok("GET", "/api/cascade?node=symbols/verify_credentials", None)
+        .ok("GET", "/api/cascade?node=code/verify_credentials", None)
         .await;
     let reqs = c["requirements"].as_array().unwrap();
     let r1 = reqs
         .iter()
-        .find(|r| r["key"] == "r1-generic-failure")
+        .find(|r| r["key"] == t.q("r1-generic-failure"))
         .unwrap();
     assert_eq!(r1["inherited"], false);
     let r2 = reqs
         .iter()
-        .find(|r| r["key"] == "r2-hashed-storage")
+        .find(|r| r["key"] == t.q("r2-hashed-storage"))
         .unwrap();
     assert_eq!(r2["inherited"], true);
     assert_eq!(r2["attached_level"], "context");
     assert_eq!(
         c["chain"].as_array().unwrap().last().unwrap(),
-        "philosophy/philosophy"
+        &t.store.project_node().unwrap()
     );
     assert!(c["philosophy"].as_str().unwrap().contains("never leaks"));
 
     // per-node counts: own vs with children
     let counts = t.ok("GET", "/api/requirement-counts", None).await;
-    let comp = &counts["components/credential-verification"];
+    let comp = &counts[&t.q("components/credential-verification")];
     assert_eq!(comp["own"]["business"], 0);
     assert_eq!(
         comp["total"]["business"], 1,
         "R1 on verify_credentials below it"
     );
-    let ctxc = &counts["contexts/authentication"];
+    let ctxc = &counts[&t.q("contexts/authentication")];
     assert_eq!(ctxc["own"]["technical"], 1);
     assert_eq!(ctxc["own"]["business"], 1);
 
     // lifecycle before any test run: built code with tests is ready for test, not live
     let lc = t.ok("GET", "/api/lifecycle", None).await;
-    assert_eq!(lc["symbols/verify_credentials"]["state"], "ready_for_test");
+    assert_eq!(
+        lc[&t.q("code/verify_credentials")]["state"],
+        "ready_for_test"
+    );
     t.ok(
         "POST",
         "/api/tests/run",
@@ -132,16 +147,17 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
     )
     .await;
     let lc = t.ok("GET", "/api/lifecycle", None).await;
-    assert_eq!(lc["symbols/verify_credentials"]["state"], "live");
+    assert_eq!(lc[&t.q("code/verify_credentials")]["state"], "live");
     assert_eq!(
-        lc["components/credential-verification"]["state"], "live",
+        lc[&t.q("components/credential-verification")]["state"],
+        "live",
         "all children live → live"
     );
     // the seed's untested duplicate helper has no tests, so it is not ready for test (§14.4),
     // and it holds its component, container and context back
-    assert_eq!(lc["symbols/check_password"]["state"], "in_build");
-    assert_eq!(lc["components/password-hashing"]["state"], "in_build");
-    assert_eq!(lc["contexts/authentication"]["state"], "in_build");
+    assert_eq!(lc[&t.q("code/check_password")]["state"], "in_build");
+    assert_eq!(lc[&t.q("components/password-hashing")]["state"], "in_build");
+    assert_eq!(lc[&t.q("contexts/authentication")]["state"], "in_build");
     // a planned child keeps its parent from being live; rework flags in_build
     t.ok(
         "POST",
@@ -156,29 +172,29 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
     )
     .await;
     let lc = t.ok("GET", "/api/lifecycle", None).await;
-    assert_eq!(lc["components/rate-limiting"]["state"], "planned");
-    assert_eq!(lc["containers/auth-service"]["state"], "in_build");
+    assert_eq!(lc[&t.q("components/rate-limiting")]["state"], "planned");
+    assert_eq!(lc[&t.q("containers/auth-service")]["state"], "in_build");
     let map = t.ok("GET", "/api/map", None).await;
     let node = map["nodes"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|n| n["id"] == "containers/auth-service")
+        .find(|n| n["id"] == t.q("containers/auth-service"))
         .unwrap();
     assert_eq!(node["lifecycle"], "in_build");
     assert!(node["requirements"]["total"]["technical"].as_u64().unwrap() >= 1);
 
-    // candidate versions never disturb the stable one
+    // candidate versions never disturb the accepted one
     let cs = t
         .ok(
             "POST",
-            "/api/changesets",
+            "/api/proposals",
             Some(json!({"title": "tweak", "intent": "x", "requirements": []})),
         )
         .await;
     let k = cs["_key"].as_str().unwrap().to_string();
     let before = t
-        .ok("GET", "/api/node-versions?node=symbols/hash_password", None)
+        .ok("GET", "/api/node-versions?node=code/hash_password", None)
         .await;
     let sym = t.ok("GET", "/api/symbols/hash_password", None).await;
     let sig = sym["version"]["signature"]
@@ -187,27 +203,29 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
         .to_string();
     t.ok(
         "POST",
-        &format!("/api/changesets/{k}/versions"),
+        &format!("/api/work-items/{k}/proposal/versions"),
         Some(json!({
             "symbol": "hash_password", "signature": sig, "body": "// candidate\ntodo!()",
         })),
     )
     .await;
     let after = t
-        .ok("GET", "/api/node-versions?node=symbols/hash_password", None)
+        .ok("GET", "/api/node-versions?node=code/hash_password", None)
         .await;
     assert_eq!(
         after.as_array().unwrap().len(),
         before.as_array().unwrap().len() + 1
     );
     assert_eq!(after[0]["state"], "candidate");
-    assert!(after[0]["validFrom"].is_null());
-    assert_eq!(after[1]["state"], "stable");
+    assert_eq!(after[0]["work_item"], json!(k));
+    assert_eq!(after[0]["current"], false);
+    assert_eq!(after[1]["state"], "accepted");
+    assert_eq!(after[1]["current"], true);
     let lc = t.ok("GET", "/api/lifecycle", None).await;
-    assert_eq!(lc["symbols/hash_password"]["state"], "in_build");
+    assert_eq!(lc[&t.q("code/hash_password")]["state"], "in_build");
     // blind review: required by default; off → the gate no longer needs it
     let checks = t
-        .ok("GET", &format!("/api/changesets/{k}/checks"), None)
+        .ok("GET", &format!("/api/work-items/{k}/proposal/checks"), None)
         .await["checks"]
         .clone();
     assert_eq!(checks["review_required"], true);
@@ -220,19 +238,19 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
     )
     .await;
     let checks = t
-        .ok("GET", &format!("/api/changesets/{k}/checks"), None)
+        .ok("GET", &format!("/api/work-items/{k}/proposal/checks"), None)
         .await["checks"]
         .clone();
     assert_eq!(checks["review_required"], false);
     assert_eq!(checks["review_ok"], true);
     t.uok(
         "POST",
-        &format!("/api/changesets/{k}/reject"),
+        &format!("/api/work-items/{k}/proposal/reject"),
         Some(json!({"by": "human", "reason": "test"})),
     )
     .await;
     let after = t
-        .ok("GET", "/api/node-versions?node=symbols/hash_password", None)
+        .ok("GET", "/api/node-versions?node=code/hash_password", None)
         .await;
     assert_eq!(after[0]["state"], "discarded");
 
@@ -248,7 +266,7 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
         )
         .await;
     assert_eq!(uc["state"], "draft");
-    assert_eq!(uc["requirements"][0]["key"], "r1-generic-failure");
+    assert_eq!(uc["requirements"][0]["key"], t.q("r1-generic-failure"));
     let (s, _) = t
         .ui(
             "POST",
@@ -260,7 +278,7 @@ async fn versioned_c4_model_requirements_use_cases_lifecycle() {
     t.ok(
         "POST",
         "/api/use-cases/a-user-signs-in/links",
-        Some(json!({"edge": "expected_by", "to": "symbols/test_valid_login_succeeds"})),
+        Some(json!({"edge": "verified_by", "to": "tests/test_valid_login_succeeds"})),
     )
     .await;
     let uc = t

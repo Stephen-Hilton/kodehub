@@ -1,5 +1,12 @@
 //! YAML seed importer (`kodehub seed examples/auth-poc`). Idempotent: re-importing unchanged
 //! data creates no new versions, documents or edges.
+//!
+//! Layout (docs/ontology.md names): `philosophy.yaml`; `requirements.yaml`, `contexts.yaml`,
+//! `containers.yaml`, `components.yaml` (documents with a local `_key`); `code.yaml` and
+//! `tests.yaml` (code and test nodes with their content); `edges.yaml`, a map from an edge
+//! collection to `[from, to]` or `[from, to, {data}]` pairs of local ids (`code/x`,
+//! `requirements/y`; `project` is the project's own node). After the edges, every placed node
+//! is put into the current project version (`Store::sync_tree`).
 
 use std::path::Path;
 
@@ -22,6 +29,11 @@ struct SeedSymbol {
     tags: Vec<String>,
     #[serde(default)]
     description: Option<String>,
+    /// Namespace projection (`namespace`, `public_name`) used when rendering.
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    public_name: Option<String>,
     #[serde(default)]
     signature: String,
     body: String,
@@ -40,16 +52,19 @@ pub struct SeedReport {
 }
 
 /// Document collections loaded from `<collection>.yaml`, in dependency order.
-const DOC_FILES: &[&str] = &[
-    "missions",
-    "requirement_groups",
-    "requirements",
-    "decisions",
-    "contexts",
-    "containers",
-    "components",
-    "namespaces",
-    "build_targets",
+const DOC_FILES: &[&str] = &["requirements", "contexts", "containers", "components"];
+
+/// Edge collections a seed may write.
+const SEED_EDGES: &[&str] = &[
+    "contains",
+    "member_of",
+    "calls",
+    "depends_on",
+    "binds_to",
+    "tested_with",
+    "applies_to",
+    "verified_by",
+    "relates_to",
 ];
 
 fn read_yaml(path: &Path) -> Result<Option<Value>> {
@@ -63,8 +78,11 @@ fn read_yaml(path: &Path) -> Result<Option<Value>> {
     Ok(Some(v))
 }
 
-fn norm_id(s: &str) -> String {
-    s.to_string()
+fn norm_id(store: &Store, s: &str) -> Result<String> {
+    if s == "project" {
+        return store.project_node();
+    }
+    store.db.qid(s)
 }
 
 pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
@@ -74,7 +92,7 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
             dir.display()
         )));
     }
-    // seeding writes versions: serialise with merges and deployments
+    // seeding writes versions: serialise with acceptances and deployments
     let _write = store.write_lock.lock().await;
     let mut report = SeedReport::default();
     if let Some(v) = read_yaml(&dir.join("philosophy.yaml"))? {
@@ -100,10 +118,12 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
             continue;
         };
         for doc in v.as_array().cloned().unwrap_or_default() {
-            let key = doc["_key"]
-                .as_str()
-                .ok_or_else(|| StoreError::Seed(format!("{coll}: every document needs _key")))?
-                .to_string();
+            let key =
+                store.db.pkey(doc["_key"].as_str().ok_or_else(|| {
+                    StoreError::Seed(format!("{coll}: every document needs _key"))
+                })?)?;
+            let mut doc = doc.clone();
+            doc["_key"] = json!(key);
             match store.db.get(coll, &key, None).await {
                 Ok(existing) => {
                     let obj = doc.as_object().cloned().unwrap_or_default();
@@ -150,10 +170,25 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
         }
     }
 
-    if let Some(v) = read_yaml(&dir.join("symbols.yaml"))? {
-        let syms: Vec<SeedSymbol> = serde_json::from_value(v)
-            .map_err(|e| StoreError::Seed(format!("symbols.yaml: {e}")))?;
-        for s in syms {
+    for file in ["code.yaml", "tests.yaml"] {
+        let Some(v) = read_yaml(&dir.join(file))? else {
+            continue;
+        };
+        let syms: Vec<SeedSymbol> =
+            serde_json::from_value(v).map_err(|e| StoreError::Seed(format!("{file}: {e}")))?;
+        for mut s in syms {
+            if (file == "tests.yaml") != (s.kind == Kind::Test) {
+                return Err(StoreError::Seed(format!(
+                    "{file}: `{}` belongs in {}",
+                    s.key,
+                    if s.kind == Kind::Test {
+                        "tests.yaml"
+                    } else {
+                        "code.yaml"
+                    }
+                )));
+            }
+            s.key = store.db.pkey(&s.key)?;
             let content = VersionContent {
                 kind: s.kind,
                 language: s.language,
@@ -161,14 +196,38 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
                 body: s.body.clone(),
                 attributes: s.attributes.clone().unwrap_or_else(|| json!({})),
             };
-            match store.db.get("symbols", &s.key, None).await {
-                Ok(_) => {
-                    let out = store.write_version(&s.key, &content, "seed").await?;
-                    if out.changed {
-                        report.symbols_changed += 1;
+            let coll = Store::node_collection(s.kind);
+            match store.db.get(coll, &s.key, None).await {
+                Ok(existing) => {
+                    let placed = store
+                        .tree(None)
+                        .await?
+                        .version(&format!("{coll}/{}", s.key))
+                        .is_some();
+                    if placed {
+                        let out = store.write_version(&s.key, &content, "seed").await?;
+                        if out.changed {
+                            report.symbols_changed += 1;
+                        }
+                        if out.created_version {
+                            report.versions_created += 1;
+                        }
                     }
-                    if out.created_version {
-                        report.versions_created += 1;
+                    let mut patch = serde_json::Map::new();
+                    for (k, v) in [
+                        ("namespace", json!(s.namespace)),
+                        ("public_name", json!(s.public_name)),
+                    ] {
+                        if existing.get(k).unwrap_or(&Value::Null) != &v {
+                            patch.insert(k.into(), v);
+                        }
+                    }
+                    if !patch.is_empty() {
+                        store
+                            .db
+                            .patch(coll, &s.key, &Value::Object(patch), None)
+                            .await?;
+                        report.documents_updated += 1;
                     }
                 }
                 Err(e) if e.is_not_found() => {
@@ -182,11 +241,23 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
                                 visibility: s.visibility,
                                 tags: s.tags.clone(),
                                 description: s.description.clone(),
+                                parent: None,
                             },
                             &content,
                             "seed",
                         )
                         .await?;
+                    if s.namespace.is_some() || s.public_name.is_some() {
+                        store
+                            .db
+                            .patch(
+                                coll,
+                                &s.key,
+                                &json!({"namespace": s.namespace, "public_name": s.public_name}),
+                                None,
+                            )
+                            .await?;
+                    }
                     report.symbols_created += 1;
                     if out.created_version {
                         report.versions_created += 1;
@@ -202,9 +273,7 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
             .as_object()
             .ok_or_else(|| StoreError::Seed("edges.yaml must be a map".into()))?;
         for (coll, list) in map {
-            if PROTECTED_EDGES.contains(&coll.as_str())
-                || !kodehub_core::model::EDGE_COLLECTIONS.contains(&coll.as_str())
-            {
+            if PROTECTED_EDGES.contains(&coll.as_str()) || !SEED_EDGES.contains(&coll.as_str()) {
                 return Err(StoreError::Seed(format!(
                     "edges.yaml may not seed `{coll}`"
                 )));
@@ -214,8 +283,8 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
                 if arr.len() < 2 {
                     return Err(StoreError::Seed(format!("{coll}: edge needs [from, to]")));
                 }
-                let from = norm_id(arr[0].as_str().unwrap_or_default());
-                let to = norm_id(arr[1].as_str().unwrap_or_default());
+                let from = norm_id(store, arr[0].as_str().unwrap_or_default())?;
+                let to = norm_id(store, arr[1].as_str().unwrap_or_default())?;
                 for id in [&from, &to] {
                     store
                         .get_node(id)
@@ -239,6 +308,8 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
             }
         }
     }
+    // every placed node into the current project version
+    store.sync_tree("seed").await?;
     // Union inferred references into the declared edges so a closure always contains every
     // symbol its code mentions (hand-written edges can be incomplete — review finding).
     let g = store.load_code_graph().await?;
@@ -249,7 +320,10 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
         let text = format!("{}\n{}", v.signature, v.body);
         for (to, kind) in kodehub_core::infer::references(&g, &s.id, s.language, &text) {
             let coll = kind.collection();
-            let (f, t) = (format!("symbols/{}", s.id), format!("symbols/{to}"));
+            let (f, t) = (
+                crate::queries::node_id(&g, &s.id),
+                crate::queries::node_id(&g, &to),
+            );
             let doc =
                 json!({"_key": edge_key(coll, &f, &t), "_from": f, "_to": t, "inferred": true});
             match store.db.insert(coll, &doc, None).await {
@@ -259,9 +333,6 @@ pub async fn import_dir(store: &Store, dir: &Path) -> Result<SeedReport> {
             }
         }
     }
-    store.refresh_closure_hashes(None).await?;
-    // contexts, containers and components get their (versioned) definitions
-    store.sync_all_c4_versions("seed").await?;
     let problems = store.check_invariants().await?;
     if !problems.is_empty() {
         return Err(StoreError::Invariant(problems.join("; ")));

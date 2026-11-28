@@ -48,11 +48,23 @@ pub async fn seeded(prefix: &str) -> Store {
 }
 
 pub async fn edit_body(s: &Store, symbol: &str, f: impl Fn(&str) -> String) -> String {
-    let doc = s
-        .aql("FOR e IN @@has_version FILTER e._from == CONCAT(@pfx, 'symbols/', @k) AND e.state == 'stable' RETURN DOCUMENT(e._to)", json!({"k": symbol}))
+    let node = s.symbol_id(symbol).await.unwrap();
+    let v = s
+        .version_in(&node, None)
         .await
-        .unwrap();
+        .unwrap()
+        .expect("in the current version");
+    let doc = s.aql("RETURN DOCUMENT(@v)", json!({"v": v})).await.unwrap();
     let mut c = version_content_from_doc(&doc[0]).unwrap();
     c.body = f(&c.body);
     s.write_version(symbol, &c, "test").await.unwrap().version
+}
+
+/// A project-qualified key (`x` → `<project>.x`) or id (`code/x` → `code/<project>.x`).
+pub fn q(s: &Store, x: &str) -> String {
+    if x.contains('/') {
+        s.db.qid(x).unwrap()
+    } else {
+        s.db.pkey(x).unwrap()
+    }
 }

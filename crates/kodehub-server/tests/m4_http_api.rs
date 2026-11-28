@@ -47,20 +47,29 @@ async fn full_seed_scenario_over_http() {
 
     // generic graph access
     let n = t
-        .ok("GET", "/api/node?id=symbols/verify_credentials", None)
+        .ok("GET", "/api/node?id=code/verify_credentials", None)
         .await;
     assert_eq!(n["display_name"], "verify_credentials");
-    let q = t
-        .ok(
-            "POST",
-            "/api/query",
-            Some(json!({"collection": "symbols", "filter": {"language": "python"}})),
-        )
+    // code and tests are separate collections (docs/ontology.md)
+    let mut py = 0;
+    for coll in ["code", "tests"] {
+        let q = t
+            .ok(
+                "POST",
+                "/api/query",
+                Some(json!({"collection": coll, "filter": {"language": "python"}})),
+            )
+            .await;
+        py += q.as_array().unwrap().len();
+    }
+    assert_eq!(py, 7);
+    let (s, e) = t
+        .req("POST", "/api/query", Some(json!({"collection": "symbols"})))
         .await;
-    assert_eq!(q.as_array().unwrap().len(), 7);
-    let tr = t.ok("POST", "/api/traverse", Some(json!({"start": "symbols/verify_credentials", "direction": "outbound", "edges": ["calls"], "depth": 2}))).await;
+    assert!(s == 400 || s == 404, "v0.1 collections are gone: {s} {e}");
+    let tr = t.ok("POST", "/api/traverse", Some(json!({"start": "code/verify_credentials", "direction": "outbound", "edges": ["calls"], "depth": 2}))).await;
     assert_eq!(tr["vertices"].as_array().unwrap().len(), 2);
-    let (s, _) = t.req("GET", "/api/node?id=symbols/nope", None).await;
+    let (s, _) = t.req("GET", "/api/node?id=code/nope", None).await;
     assert_eq!(s, 404);
 
     // requirements and coverage
@@ -86,7 +95,8 @@ async fn full_seed_scenario_over_http() {
         "{:?}",
         statuses(&cov)
     );
-    assert_eq!(cov["groups"][0]["status"], "pass");
+    assert_eq!(cov["tags"][0]["tag"], "secure-authentication");
+    assert_eq!(cov["tags"][0]["status"], "pass");
 
     // run now (cold, then warm)
     let args = json!({"store": {"users": {}}, "username": "", "password": "x"});
@@ -125,12 +135,12 @@ async fn full_seed_scenario_over_http() {
             Some(json!({"symbol": "verify_credentials", "environment": "prod"})),
         )
         .await;
-    assert_eq!(s, 400, "no release in prod yet");
+    assert_eq!(s, 400, "nothing deployed to prod yet");
 
     // traceability
     let imp = t.ok("GET", "/api/impact/hash_password", None).await;
     assert_eq!(imp["requirements"].as_array().unwrap().len(), 2);
-    assert_eq!(imp["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(imp["tags"], json!(["secure-authentication"]));
     assert_eq!(t.ok("GET", "/api/orphans", None).await, json!([]));
     assert_eq!(
         t.ok("GET", "/api/duplicates", None)
@@ -146,15 +156,34 @@ async fn full_seed_scenario_over_http() {
     assert_eq!(d["form"]["runnable"], true);
     assert_eq!(d["form"]["params"][0]["spec"]["type"], "struct");
     assert_eq!(d["health"], "pass");
-    assert_eq!(d["requirements"].as_array().unwrap().len(), 1);
-    assert_eq!(d["groups"].as_array().unwrap().len(), 1);
+    // R1 applies to it directly, R2 through the context that holds it
+    assert_eq!(
+        d["requirements"].as_array().unwrap().len(),
+        2,
+        "{}",
+        d["requirements"]
+    );
+    assert_eq!(d["tags"], json!(["secure-authentication"]));
     assert_eq!(d["decisions"].as_array().unwrap().len(), 1);
+    assert_eq!(d["decisions"][0]["kind"], "decision");
+    assert_eq!(d["node"], t.q("code/verify_credentials"));
     let map = t.ok("GET", "/api/map", None).await;
     assert!(map["nodes"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|n| n["id"] == "contexts/authentication" && n["health"] == "pass"));
+        .any(|n| n["id"] == t.q("contexts/authentication") && n["health"] == "pass"));
+    assert_eq!(map["project_version"]["current"], true);
+    assert!(map["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["id"] == t.q("tests/test_valid_login_succeeds") && n["level"] == "symbol"));
+    assert!(map["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "tested_with"));
     assert!(map["mission"]["statement"]
         .as_str()
         .unwrap()
@@ -168,29 +197,73 @@ async fn full_seed_scenario_over_http() {
     let hist = t
         .ok("GET", "/api/requirements/r1-generic-failure/history", None)
         .await;
-    assert_eq!(hist.as_array().unwrap().len(), 1);
+    // every requirement version, newest first (each edit is a new immutable version)
+    assert_eq!(hist.as_array().unwrap().len(), 2);
+    assert_eq!(hist[0]["revision"], 2);
+    assert_eq!(hist[1]["revision"], 1);
     let cov = t
         .ok("GET", "/api/coverage?requirement=r1-generic-failure", None)
         .await;
     assert_eq!(cov["requirements"][0]["status"], "at_risk");
 
     // decision
-    let dec = t.ok("POST", "/api/decisions", Some(json!({"title": "Trim usernames", "choice": "no", "rationale": "keep simple", "justifies": ["symbols/verify_credentials"]}))).await;
+    let dec = t.ok("POST", "/api/decisions", Some(json!({"title": "Trim usernames", "choice": "no", "rationale": "keep simple", "justifies": ["code/verify_credentials"]}))).await;
     assert!(dec["_key"].is_string());
+    assert_eq!(dec["kind"], "decision");
+    let decs = t.ok("GET", "/api/decisions", None).await;
+    assert_eq!(decs.as_array().unwrap().len(), 2);
+    let reqs = t.ok("GET", "/api/requirements", None).await;
+    assert_eq!(
+        reqs["requirements"].as_array().unwrap().len(),
+        2,
+        "decisions are not listed as requirements"
+    );
 
-    // changeset lifecycle by hand
-    let cs = t.ok("POST", "/api/changesets", Some(json!({"title": "Comment verify_credentials", "requirements": ["r1-generic-failure"]}))).await;
+    // a work item's proposal, by hand (D-058)
+    let cs = t.ok("POST", "/api/proposals", Some(json!({"title": "Comment verify_credentials", "requirements": ["r1-generic-failure"]}))).await;
     let k = cs["_key"].as_str().unwrap().to_string();
-    t.ok("POST", &format!("/api/changesets/{k}/plan"), Some(json!({"plan": {"summary": "doc comment", "changes": [{"symbol": "verify_credentials", "action": "modify"}]}}))).await;
+    assert_eq!(
+        cs["work_item"],
+        json!(k),
+        "the proposal is keyed by its work item"
+    );
+    let wi = t.ok("GET", &format!("/api/work-items/{k}"), None).await;
+    assert_eq!(wi["agent_type"], "coding");
+    assert!(
+        wi["project_version"]
+            .as_str()
+            .unwrap()
+            .contains("project_versions/"),
+        "{wi}"
+    );
+    let open = t.ok("GET", "/api/proposals?open=true", None).await;
+    assert_eq!(open.as_array().unwrap().len(), 1);
+    t.ok("POST", &format!("/api/work-items/{k}/proposal/plan"), Some(json!({"plan": {"summary": "doc comment", "changes": [{"symbol": "verify_credentials", "action": "modify"}]}}))).await;
     let (s, _) = t
-        .req("POST", &format!("/api/changesets/{k}/merge"), None)
+        .req(
+            "POST",
+            &format!("/api/work-items/{k}/proposal/accept"),
+            None,
+        )
         .await;
-    assert_eq!(s, 400, "cannot merge before ready");
-    t.uok("POST", &format!("/api/changesets/{k}/approve"), None)
+    assert_eq!(s, 403, "a remote agent never accepts (D-061)");
+    let (s, _) = t
+        .ui(
+            "POST",
+            &format!("/api/work-items/{k}/proposal/accept"),
+            None,
+        )
         .await;
+    assert_eq!(s, 400, "cannot accept before ready");
     t.uok(
         "POST",
-        &format!("/api/changesets/{k}/transition"),
+        &format!("/api/work-items/{k}/proposal/approve"),
+        None,
+    )
+    .await;
+    t.uok(
+        "POST",
+        &format!("/api/work-items/{k}/proposal/transition"),
         Some(json!({"to": "building"})),
     )
     .await;
@@ -199,28 +272,30 @@ async fn full_seed_scenario_over_http() {
         "// Every failure is the same generic result.\n{}",
         cur["version"]["body"].as_str().unwrap()
     );
-    let p = t.ok("POST", &format!("/api/changesets/{k}/versions"), Some(json!({"symbol": "verify_credentials", "signature": cur["version"]["signature"], "body": body, "by": "coder"}))).await;
+    let p = t.ok("POST", &format!("/api/work-items/{k}/proposal/versions"), Some(json!({"symbol": "verify_credentials", "signature": cur["version"]["signature"], "body": body, "by": "coder"}))).await;
     assert_eq!(p["new"], false);
     let still = t.ok("GET", "/api/symbols/verify_credentials", None).await;
     assert_eq!(
         still["version"]["_key"], cur["version"]["_key"],
-        "nothing current until merge"
+        "nothing changes in the project version until acceptance"
     );
     t.uok(
         "POST",
-        &format!("/api/changesets/{k}/transition"),
+        &format!("/api/work-items/{k}/proposal/transition"),
         Some(json!({"to": "reviewing"})),
     )
     .await;
-    // a review posted over the API (no browser Origin) is advisory: it can't satisfy invariant 6
-    t.ok(
-        "POST",
-        &format!("/api/changesets/{k}/reviews"),
-        Some(json!({"findings": [], "summary": "lgtm (agent)"})),
-    )
-    .await;
+    // a remote agent cannot review at all (D-061); without an attested review nothing is ready
+    let (s403, _) = t
+        .req(
+            "POST",
+            &format!("/api/work-items/{k}/proposal/reviews"),
+            Some(json!({"findings": [], "summary": "lgtm (agent)"})),
+        )
+        .await;
+    assert_eq!(s403, 403);
     let tr = t
-        .ok("POST", &format!("/api/changesets/{k}/test"), None)
+        .ok("POST", &format!("/api/work-items/{k}/proposal/test"), None)
         .await;
     assert_eq!(tr["passed"], true, "{tr}");
     assert_eq!(
@@ -228,51 +303,67 @@ async fn full_seed_scenario_over_http() {
         "unattested review must not reach ready"
     );
     let checks = t
-        .ok("GET", &format!("/api/changesets/{k}/checks"), None)
+        .ok("GET", &format!("/api/work-items/{k}/proposal/checks"), None)
         .await;
     assert_eq!(checks["checks"]["review_attested"], false);
     // engine-owned states can't be set directly
     let (s, _) = t
         .ui(
             "POST",
-            &format!("/api/changesets/{k}/transition"),
-            Some(json!({"to": "merged"})),
+            &format!("/api/work-items/{k}/proposal/transition"),
+            Some(json!({"to": "accepted"})),
         )
         .await;
     assert_eq!(s, 400);
     let (s, _) = t
         .ui(
             "POST",
-            &format!("/api/changesets/{k}/transition"),
+            &format!("/api/work-items/{k}/proposal/transition"),
             Some(json!({"to": "ready"})),
         )
         .await;
     assert_eq!(s, 400);
-    // R1 was edited earlier (new edge case): a changeset listing it must bring a verifying test
+    // R1 was edited earlier (new edge case): a proposal listing it must bring a verifying test
     let checks = t
-        .ok("GET", &format!("/api/changesets/{k}/checks"), None)
+        .ok("GET", &format!("/api/work-items/{k}/proposal/checks"), None)
         .await;
     assert_eq!(checks["checks"]["requirements_covered"], false, "{checks}");
-    t.ok("POST", &format!("/api/changesets/{k}/versions"), Some(json!({
+    t.ok("POST", &format!("/api/work-items/{k}/proposal/versions"), Some(json!({
         "display_name": "test_whitespace_username_is_invalid", "kind": "test", "language": "rust", "signature": "",
         "body": "let mut store = UserStore::new();\nstore.add_user(\"alice\", \"x\");\nassert_eq!(verify_credentials(&store, \"  \", \"x\"), AuthResult::InvalidCredentials);",
         "verifies": ["r1-generic-failure"], "tests_for": ["verify_credentials"], "component": "credential-verification", "by": "tester"}))).await;
     // the human reviews in the app → attested → tests move it to ready
-    let (s, _) = t.ui("POST", &format!("/api/changesets/{k}/reviews"),
+    let (s, _) = t.ui("POST", &format!("/api/work-items/{k}/proposal/reviews"),
         Some(json!({"findings": [{"severity": "minor", "location": "verify_credentials", "finding": "fine"}], "summary": "ok", "by": "human"}))).await;
     assert_eq!(s, 200);
     let tr = t
-        .ok("POST", &format!("/api/changesets/{k}/test"), None)
+        .ok("POST", &format!("/api/work-items/{k}/proposal/test"), None)
         .await;
     assert_eq!(tr["state"], "ready", "{tr}");
     let checks = t
-        .ok("GET", &format!("/api/changesets/{k}/checks"), None)
+        .ok("GET", &format!("/api/work-items/{k}/proposal/checks"), None)
         .await;
     assert_eq!(checks["ok"], true, "{checks}");
     let m = t
-        .ok("POST", &format!("/api/changesets/{k}/merge"), None)
+        .uok(
+            "POST",
+            &format!("/api/work-items/{k}/proposal/accept"),
+            None,
+        )
         .await;
-    assert_eq!(m["merged"], true);
+    assert_eq!(m["accepted"], true);
+    assert_eq!(m["proposal"]["state"], "accepted");
+    let wi = t.ok("GET", &format!("/api/work-items/{k}"), None).await;
+    assert_eq!(wi["state"], "done", "accepting settles the work item: {wi}");
+    // the new test is a node of its own, placed under its component
+    let nt = t
+        .ok(
+            "GET",
+            "/api/symbols/test_whitespace_username_is_invalid",
+            None,
+        )
+        .await;
+    assert_eq!(nt["node"], t.q("tests/test_whitespace_username_is_invalid"));
     let after = t.ok("GET", "/api/symbols/verify_credentials", None).await;
     assert_ne!(after["version"]["_key"], cur["version"]["_key"]);
     assert_eq!(after["history"].as_array().unwrap().len(), 2);
@@ -281,7 +372,7 @@ async fn full_seed_scenario_over_http() {
         .await;
     assert_eq!(
         cov["requirements"][0]["status"], "pass",
-        "merged with warm test cache: {cov}"
+        "accepted with warm test cache: {cov}"
     );
     let inv = t.ok("GET", "/api/invariants", None).await;
     assert_eq!(inv["ok"], true);
@@ -290,23 +381,23 @@ async fn full_seed_scenario_over_http() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|e| e["kind"] == "merge"));
+        .any(|e| e["kind"] == "accept"));
 
     // immutability through HTTP
     let v = after["version"]["_key"].as_str().unwrap();
     let (s, _) = t
-        .req(
+        .ui(
             "PATCH",
-            &format!("/api/nodes/versions/{v}"),
+            &format!("/api/nodes/code_versions/{v}"),
             Some(json!({"body": "x"})),
         )
         .await;
     assert_eq!(s, 409);
     let (s, _) = t
-        .req(
+        .ui(
             "POST",
             "/api/edges/has_version",
-            Some(json!({"from": "symbols/hash_password", "to": format!("versions/{v}")})),
+            Some(json!({"from": "code/hash_password", "to": format!("code_versions/{v}")})),
         )
         .await;
     assert_eq!(s, 400);
@@ -337,33 +428,31 @@ async fn full_seed_scenario_over_http() {
     assert_eq!(s, 401);
     // an agent's token plus a forged Origin and a forged UI header is not enough for
     // human-only actions: only a human's session is
+    // (a remote agent may edit requirements since D-061; the philosophy stays a human's)
     let forged = reqwest::Client::new()
-        .post(format!(
-            "{}/api/requirements/r2-hashed-storage/edge_cases",
-            t.url
-        ))
+        .put(format!("{}/api/philosophy", t.url))
         .header("Origin", "http://localhost:1420")
         .header("x-kodehub-ui", t.state.ui_token.as_str())
         .bearer_auth(&t.pat)
-        .json(&json!({"description": "agent sneaks in an edge case", "input": {}, "expected": "x"}))
+        .json(&json!({"text": "an agent rewrites the philosophy"}))
         .send()
         .await
         .unwrap();
     assert_eq!(forged.status().as_u16(), 403);
     let forged = reqwest::Client::new()
-        .post(format!("{}/api/environments/prod/approvals", t.url))
+        .post(format!("{}/api/deployments/x/approve", t.url))
         .header("Origin", "http://localhost:1420")
         .header("x-kodehub-ui", t.state.ui_token.as_str())
         .bearer_auth(&t.pat)
-        .json(&json!({"release": "x"}))
+        .json(&json!({}))
         .send()
         .await
         .unwrap();
     assert_eq!(forged.status().as_u16(), 403);
-    // code / trace edges can't be changed outside a changeset
-    let (s, _) = t.ui("POST", "/api/edges/verifies", Some(json!({"from": "symbols/test_unknown_user_is_invalid", "to": "requirements/r2-hashed-storage"}))).await;
+    // code / trace edges can't be changed outside a proposal
+    let (s, _) = t.ui("POST", "/api/edges/verified_by", Some(json!({"from": "requirements/r2-hashed-storage", "to": "tests/test_unknown_user_is_invalid"}))).await;
     assert_eq!(s, 400);
-    let (s, _) = t.ui("DELETE", "/api/edges/tested_by?from=symbols/verify_credentials&to=symbols/test_valid_login_succeeds", None).await;
+    let (s, _) = t.ui("DELETE", "/api/edges/tested_with?from=code/verify_credentials&to=tests/test_valid_login_succeeds", None).await;
     assert_eq!(s, 400);
     let ws_url = t.url.replace("http://", "ws://") + "/api/terminal";
     assert!(

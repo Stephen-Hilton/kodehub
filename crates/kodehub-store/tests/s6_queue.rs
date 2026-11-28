@@ -250,7 +250,7 @@ async fn schedules_triggers_and_intents() {
             .unwrap();
         // make it due now
         s.db.aql_raw(
-            "UPDATE @k WITH {next_due: '2000-01-01T00:00:00.000Z'} IN kodehub_schedules",
+            "UPDATE @k WITH {next_due: '2000-01-01T00:00:00.000Z'} IN schedules",
             json!({"k": sc["_key"]}),
         )
         .await

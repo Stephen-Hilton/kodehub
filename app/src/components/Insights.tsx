@@ -15,7 +15,7 @@ export function Insights({ onSelect }: { onSelect: (id: string) => void }) {
     load();
     let t: number | undefined;
     const off = onKodehubEvent((e) => {
-      if (e.type === "node.changed" || e.type === "changeset.updated") { window.clearTimeout(t); t = window.setTimeout(load, 400); }
+      if (e.type === "node.changed" || e.type === "proposal.updated") { window.clearTimeout(t); t = window.setTimeout(load, 400); }
     });
     return () => { off(); window.clearTimeout(t); };
   }, []);
@@ -31,7 +31,7 @@ export function Insights({ onSelect }: { onSelect: (id: string) => void }) {
       </div>
       <div className="insight">
         <div className="row"><span className="dot" style={{ background: dups.exact.length + dups.near.length ? "var(--ghost)" : "var(--pass)" }} /><b>Merge candidates</b><span className="spacer" /><span className="faint">{dups.exact.length + dups.near.length}</span></div>
-        <div className="faint" style={{ fontSize: 11.5 }}>Identical or near-identical symbols</div>
+        <div className="faint" style={{ fontSize: 11.5 }}>Identical or near-identical code</div>
         {dups.exact.map((d) => (
           <div className="link-item" key={d.content_hash} onClick={() => onSelect(d.symbols[0].id)}>
             <span className="badge ghost">same</span><span className="mono" style={{ flex: 1 }}>{d.symbols.map((x: Json) => x.display_name).join(" = ")}</span>

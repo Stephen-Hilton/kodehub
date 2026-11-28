@@ -5,10 +5,10 @@ import { useEffect, useState } from "react";
 import { Insights } from "../components/Insights";
 import { RequirementsPanel } from "../components/RequirementsPanel";
 import { useToast } from "../components/Toasts";
-import { api, type Group, type Json, type Requirement } from "../lib/api";
+import { api, localKey, type Json, type Requirement, type TagCoverage } from "../lib/api";
 
-export function RequirementsScreen({ requirements, groups, onOpen, onAddEdgeCase, onNew, onRunTests, running, onSelectNode, selected, setSelected }: {
-  requirements: Requirement[]; groups: Group[]; onOpen: (k: string) => void; onAddEdgeCase: (k: string) => void; onNew: () => void;
+export function RequirementsScreen({ requirements, tags, onOpen, onAddEdgeCase, onNew, onRunTests, running, onSelectNode, selected, setSelected }: {
+  requirements: Requirement[]; tags: TagCoverage[]; onOpen: (k: string) => void; onAddEdgeCase: (k: string) => void; onNew: () => void;
   onRunTests: () => void; running: boolean; onSelectNode: (id: string) => void;
   /** The selected requirement (its path is lit on the map). */
   selected: string | null; setSelected: (k: string | null) => void;
@@ -43,7 +43,7 @@ export function RequirementsScreen({ requirements, groups, onOpen, onAddEdgeCase
       </div>
       <div className="req-grid">
         <div className="req-list-col">
-          <RequirementsPanel requirements={requirements} groups={groups} selected={selected} onSelect={setSelected}
+          <RequirementsPanel requirements={requirements} tags={tags} selected={selected} onSelect={setSelected}
             onOpen={onOpen} onAddEdgeCase={onAddEdgeCase} onNew={onNew} onRunTests={onRunTests} running={running}
             insights={<Insights onSelect={onSelectNode} />} />
         </div>
@@ -55,7 +55,7 @@ export function RequirementsScreen({ requirements, groups, onOpen, onAddEdgeCase
           </div>
           <div className="faint" style={{ fontSize: 12, marginBottom: 8 }}>Each level inherits everything above it. Put a requirement at the lowest level where it applies.</div>
           {by.map((r) => (
-            <button key={r.key} className={`pop-row-main ${selected === r.key ? "on" : ""}`} onClick={() => setSelected(r.key)} data-testid={`attach-${r.key}`}>
+            <button key={r.key} className={`pop-row-main ${selected === r.key ? "on" : ""}`} onClick={() => setSelected(r.key)} data-testid={`attach-${localKey(r.key)}`}>
               <span className={`chip kind-${r.kind}`}>{r.kind === "business" ? "B" : "T"}</span>
               <span>{r.title}</span>
               <span className="spacer" />

@@ -121,7 +121,7 @@ pub async fn users(
         .store
         .db
         .aql_raw(
-            "FOR u IN kodehub_users FILTER u.kind == 'human' AND u.disabled != true
+            "FOR u IN users FILTER u.kind == 'human' AND u.disabled != true
                SORT u.username RETURN {key: u._key, display_name: u.display_name}",
             json!({}),
         )
@@ -223,17 +223,15 @@ pub async fn create_project(
             .cloned()
             .unwrap_or_default()
         {
-            let ctx = format!(
-                "contexts/{}",
-                kodehub_store::slug(r["context"].as_str().unwrap_or(""))
-            );
+            let ctx = ps.db.pid(
+                "contexts",
+                &kodehub_store::slug(r["context"].as_str().unwrap_or("")),
+            )?;
             let mut doc = r.clone();
             doc.as_object_mut().map(|m| m.remove("context"));
             let d = ps.create_requirement(doc).await?;
             let rid = d["_id"].as_str().unwrap_or_default().to_string();
-            ps.db
-                .insert_ignore("satisfies", &json!({"_key": kodehub_store::edge_key("satisfies", &ctx, &rid), "_from": ctx, "_to": rid}), None)
-                .await?;
+            ps.insert_edge("applies_to", &rid, &ctx, json!({})).await?;
         }
         out["template"] = json!("master");
     } else if let Some(from) = b
@@ -362,7 +360,7 @@ pub async fn shares(
 
 #[derive(Deserialize)]
 pub struct Share {
-    /// `kodehub_users/<u>` or `kodehub_orgs/<o>` (or `user:<u>` / `org:<o>`).
+    /// `users/<u>` or `orgs/<o>` (or `user:<u>` / `org:<o>`).
     pub grantee: String,
     /// read | write | admin; null removes the share.
     pub permission: Option<String>,

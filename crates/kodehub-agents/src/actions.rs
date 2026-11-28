@@ -4,12 +4,12 @@
 //! `human_engagement = containers`) and every requirement change become pending approvals.
 
 use kodehub_core::model::{Kind, Language};
-use kodehub_store::changesets::ProposeVersion;
+use kodehub_store::proposals::ProposeVersion;
 use kodehub_store::queue::{NewWorkItem, PRIORITY_NORMAL};
 use kodehub_store::Store;
 use serde_json::{json, Value};
 
-use crate::{AgentError, Result};
+use crate::Result;
 
 pub struct ApplyCtx<'a> {
     pub store: &'a Store,
@@ -42,6 +42,12 @@ pub async fn apply(ctx: &ApplyCtx<'_>, actions: &[Value]) -> Result<Value> {
     );
     for a in actions {
         let t = a["type"].as_str().unwrap_or("");
+        // every action is checked against the agent type's permissions in this project (D-062)
+        if let Some(perm) = permission_for(t) {
+            ctx.store
+                .require_agent_permission(ctx.agent_type, perm)
+                .await?;
+        }
         match t {
             "create_nodes" => {
                 for n in list(a, "nodes") {
@@ -118,11 +124,6 @@ pub async fn apply(ctx: &ApplyCtx<'_>, actions: &[Value]) -> Result<Value> {
                 push(&mut report, "approvals", ap["_key"].clone());
             }
             "set_philosophy" => {
-                if ctx.agent_type != "architect" {
-                    return Err(AgentError::Workflow(
-                        "only the architect rewrites the philosophy document".into(),
-                    ));
-                }
                 let text = a["text"].as_str().unwrap_or("").trim();
                 if !text.is_empty() {
                     ctx.store.set_philosophy(text, &by).await?;
@@ -131,7 +132,7 @@ pub async fn apply(ctx: &ApplyCtx<'_>, actions: &[Value]) -> Result<Value> {
             }
             "write_tests" => {
                 let k = write_tests(ctx, a, &by).await?;
-                push(&mut report, "applied", json!({"tests_changeset": k}));
+                push(&mut report, "applied", json!({"tests_work_item": k}));
             }
             "schedule" => {
                 for s in list(a, "schedules") {
@@ -149,11 +150,6 @@ pub async fn apply(ctx: &ApplyCtx<'_>, actions: &[Value]) -> Result<Value> {
                 }
             }
             "set_caps" => {
-                if ctx.agent_type != "sysadmin" {
-                    return Err(AgentError::Workflow(
-                        "only the sysadmin agent sets caps".into(),
-                    ));
-                }
                 let caps = a["agent_caps"].clone();
                 ctx.store
                     .set_setting_system("app", "agent_caps", caps.clone(), &by)
@@ -189,7 +185,8 @@ pub async fn apply(ctx: &ApplyCtx<'_>, actions: &[Value]) -> Result<Value> {
                 push(&mut report, "applied", json!({"use_case": uc, "live": ok}));
             }
             "import_mapping" => {
-                let r = ctx.store.apply_import_mapping(a, &by).await?;
+                let wi = ctx.work_item["_key"].as_str().unwrap_or_default();
+                let r = ctx.store.apply_import_mapping(a, wi, &by).await?;
                 push(&mut report, "applied", r);
             }
             "note" | "" => {}
@@ -201,14 +198,32 @@ pub async fn apply(ctx: &ApplyCtx<'_>, actions: &[Value]) -> Result<Value> {
     Ok(report)
 }
 
+/// The permission an action needs (`note` needs none).
+pub fn permission_for(action: &str) -> Option<&'static str> {
+    Some(match action {
+        "create_nodes" => "create_nodes",
+        "enqueue" => "create_work_items",
+        "propose_requirement_change" => "modify_requirements",
+        "set_philosophy" => "set_philosophy",
+        "write_tests" => "write_tests",
+        "schedule" => "schedule_tests",
+        "set_caps" => "set_caps",
+        "external_blocker" => "report_blockers",
+        "use_case_verdict" => "check_use_cases",
+        "import_mapping" => "map_imports",
+        _ => return None,
+    })
+}
+
 fn push(report: &mut Value, k: &str, v: Value) {
     if let Some(a) = report[k].as_array_mut() {
         a.push(v);
     }
 }
 
-/// Tests before code (spec §14.3): the tests go in through a changeset that may promote while
-/// the code does not exist yet; they fail until a coding agent implements the component.
+/// Tests before code (spec §14.3): the tests go in as the proposal of the test author's own
+/// work item, accepted while the code does not exist yet; they fail until a coding agent
+/// implements the component.
 async fn write_tests(ctx: &ApplyCtx<'_>, a: &Value, by: &str) -> Result<String> {
     let component = a["component"]
         .as_str()
@@ -219,9 +234,11 @@ async fn write_tests(ctx: &ApplyCtx<'_>, a: &Value, by: &str) -> Result<String> 
         .flat_map(|t| t["verifies"].as_array().cloned().unwrap_or_default())
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
+    let wi = ctx.work_item["_key"].as_str().unwrap_or_default();
     let cs = ctx
         .store
-        .open_changeset(
+        .open_proposal(
+            wi,
             &format!(
                 "Tests for {}",
                 component.as_deref().unwrap_or("the project")
@@ -233,10 +250,7 @@ async fn write_tests(ctx: &ApplyCtx<'_>, a: &Value, by: &str) -> Result<String> 
         .await?;
     let key = cs["_key"].as_str().unwrap_or_default().to_string();
     ctx.store
-        .patch_changeset(
-            &key,
-            json!({"tests_first": true, "work_item": ctx.work_item["_key"]}),
-        )
+        .patch_proposal(&key, json!({"tests_first": true}))
         .await?;
     for t in list(a, "tests") {
         let lang: Language =
@@ -283,6 +297,6 @@ async fn write_tests(ctx: &ApplyCtx<'_>, a: &Value, by: &str) -> Result<String> 
             )
             .await?;
     }
-    ctx.store.merge_tests_first(&key, by).await?;
+    ctx.store.accept_tests_first(&key, by).await?;
     Ok(key)
 }

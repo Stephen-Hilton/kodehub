@@ -95,7 +95,7 @@ pub enum CodeEdgeKind {
     Calls,
     DependsOn,
     MemberOf,
-    TestedBy,
+    TestedWith,
     BindsTo,
 }
 
@@ -105,7 +105,7 @@ impl CodeEdgeKind {
             CodeEdgeKind::Calls => "calls",
             CodeEdgeKind::DependsOn => "depends_on",
             CodeEdgeKind::MemberOf => "member_of",
-            CodeEdgeKind::TestedBy => "tested_by",
+            CodeEdgeKind::TestedWith => "tested_with",
             CodeEdgeKind::BindsTo => "binds_to",
         }
     }
@@ -114,7 +114,7 @@ impl CodeEdgeKind {
             "calls" => CodeEdgeKind::Calls,
             "depends_on" => CodeEdgeKind::DependsOn,
             "member_of" => CodeEdgeKind::MemberOf,
-            "tested_by" => CodeEdgeKind::TestedBy,
+            "tested_with" => CodeEdgeKind::TestedWith,
             "binds_to" => CodeEdgeKind::BindsTo,
             _ => return None,
         })
@@ -152,75 +152,221 @@ pub enum Health {
     Orphan,
 }
 
-/// All document collections (doc 02), in bootstrap order.
+/// Project-scoped document collections (docs/ontology.md), in bootstrap order. Every document
+/// carries `project` and a `<project>.`-qualified key (D-055).
 pub const DOCUMENT_COLLECTIONS: &[&str] = &[
-    "missions",
+    "philosophy",
     "requirements",
-    "requirement_groups",
-    "requirement_history",
-    "decisions",
+    "requirement_versions",
+    "use_cases",
+    "agents",
+    "agent_chats",
+    "agent_chat_msgs",
+    "container_images",
+    "schedules",
     "contexts",
     "containers",
     "components",
-    "symbols",
-    "versions",
-    "build_targets",
-    "artifacts",
-    "namespaces",
-    "changesets",
-    "test_runs",
-    "runs",
-    "releases",
+    "code",
+    "tests",
+    "project_versions",
+    "context_versions",
+    "container_versions",
+    "component_versions",
+    "code_versions",
+    "test_versions",
+    "builds",
+    "test_logs",
     "environments",
-    "chat_messages",
-    "philosophy",
-    "use_cases",
-    "c4_versions",
-    "change_logs",
-    "intents",
-    "negotiations",
-    "test_container_types",
-    "approvals",
-    "agent_types",
-    "import_units",
+    "deploy_targets",
+    "deployers",
+    "deployments",
+    "deploy_logs",
+    // system collection (not graph data): a Git import's staged units
+    "import_staging",
 ];
 
-/// All edge collections (doc 02).
+/// Project-scoped edge collections (docs/ontology.md).
 pub const EDGE_COLLECTIONS: &[&str] = &[
+    "owns",
     "contains",
-    "member_of",
     "has_version",
+    "based_on",
     "calls",
     "depends_on",
-    "tested_by",
-    "verifies",
-    "satisfies",
-    "justified_by",
-    "includes",
-    "traces_to",
+    "member_of",
     "binds_to",
-    "compiles_to",
-    "exposes",
-    "proposes",
-    "supports",
-    "in_environment",
-    "cloned_from",
+    "tested_with",
+    "applies_to",
+    "verified_by",
     "relates_to",
-    "expected_by",
-    "built_from",
+    "has_message",
+    "authored",
+    "refers_to",
+    "has_work_item",
+    "intends_changes",
+    "targets",
+    "build_of",
+    "built_for",
+    "logs_to",
+    "deployed_to",
+    "has_deployment",
+    "uses",
+    "has_deployer",
+    "runs",
 ];
 
+const C4: &[&str] = &["contexts", "containers", "components"];
+const LEAVES: &[&str] = &["code", "tests"];
+const NODES: &[&str] = &["contexts", "containers", "components", "code", "tests"];
+const VERSIONS: &[&str] = &[
+    "project_versions",
+    "context_versions",
+    "container_versions",
+    "component_versions",
+    "code_versions",
+    "test_versions",
+];
+
+/// The named graph's edge definitions: which collections each edge may connect (from, to).
+/// The database refuses an edge between any other pair. `projects`, `users`, `orgs`,
+/// `remote_agents` and `work_items` are global collections that project edges may touch.
+pub fn edge_definitions() -> Vec<(&'static str, Vec<&'static str>, Vec<&'static str>)> {
+    let cat = |a: &[&[&'static str]]| -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = a.iter().flat_map(|x| x.iter().copied()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let all_nodes: Vec<&'static str> = DOCUMENT_COLLECTIONS
+        .iter()
+        .copied()
+        .filter(|c| *c != "import_staging")
+        .chain(["projects", "work_items"])
+        .collect();
+    vec![
+        (
+            "owns",
+            vec!["projects"],
+            vec![
+                "philosophy",
+                "requirements",
+                "use_cases",
+                "agents",
+                "agent_chats",
+                "container_images",
+                "schedules",
+                "environments",
+                "deploy_targets",
+            ],
+        ),
+        (
+            "contains",
+            cat(&[&["projects"], C4, VERSIONS]),
+            cat(&[NODES, VERSIONS]),
+        ),
+        (
+            "has_version",
+            cat(&[&["projects", "requirements"], NODES]),
+            cat(&[VERSIONS, &["requirement_versions"]]),
+        ),
+        (
+            "based_on",
+            vec!["project_versions"],
+            vec!["project_versions"],
+        ),
+        ("calls", LEAVES.to_vec(), vec!["code"]),
+        ("depends_on", LEAVES.to_vec(), vec!["code"]),
+        ("member_of", vec!["code"], vec!["code"]),
+        ("binds_to", vec!["code"], vec!["code"]),
+        ("tested_with", cat(&[&["code"], C4]), vec!["tests"]),
+        (
+            "applies_to",
+            vec!["requirements"],
+            cat(&[&["projects"], C4, &["code"]]),
+        ),
+        (
+            "verified_by",
+            vec!["requirements", "use_cases"],
+            vec!["tests"],
+        ),
+        ("relates_to", vec!["use_cases"], vec!["requirements"]),
+        ("has_message", vec!["agent_chats"], vec!["agent_chat_msgs"]),
+        (
+            "authored",
+            vec!["agents", "users", "remote_agents"],
+            vec!["agent_chat_msgs"],
+        ),
+        ("refers_to", vec!["agent_chat_msgs"], all_nodes.clone()),
+        (
+            "has_work_item",
+            vec!["project_versions"],
+            vec!["work_items"],
+        ),
+        ("intends_changes", vec!["work_items"], NODES.to_vec()),
+        ("targets", vec!["schedules"], cat(&[&["projects"], NODES])),
+        (
+            "build_of",
+            vec!["builds"],
+            vec![
+                "code_versions",
+                "component_versions",
+                "container_versions",
+                "test_versions",
+            ],
+        ),
+        ("built_for", vec!["builds"], vec!["deploy_targets"]),
+        (
+            "logs_to",
+            vec!["test_versions", "code_versions", "builds", "deployments"],
+            vec!["test_logs", "deploy_logs"],
+        ),
+        (
+            "deployed_to",
+            vec![
+                "context_versions",
+                "container_versions",
+                "component_versions",
+                "code_versions",
+            ],
+            vec!["deploy_targets"],
+        ),
+        (
+            "has_deployment",
+            vec!["project_versions", "environments"],
+            vec!["deployments"],
+        ),
+        ("uses", vec!["deployments"], vec!["deployers"]),
+        (
+            "has_deployer",
+            vec!["environments", "deploy_targets"],
+            vec!["deployers"],
+        ),
+        ("runs", vec!["deployers"], vec!["container_images"]),
+    ]
+}
+
 /// Collections whose documents may never be updated after creation.
-pub const IMMUTABLE_COLLECTIONS: &[&str] =
-    &["versions", "c4_versions", "releases", "test_runs", "runs"];
+pub const IMMUTABLE_COLLECTIONS: &[&str] = &[
+    "context_versions",
+    "container_versions",
+    "component_versions",
+    "code_versions",
+    "test_versions",
+    "requirement_versions",
+    "builds",
+    "test_logs",
+    "deploy_logs",
+    "agent_chat_msgs",
+];
 
 /// Default environments, lowest first (the `environments` setting may change them).
 pub const ENVIRONMENTS: &[&str] = &["dev", "test", "qa", "preprod", "prod"];
 
-/// Changeset states (doc 04).
+/// Stages of a work item's proposal (D-058; the v0.1 changeset states).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ChangesetState {
+pub enum ProposalState {
     Draft,
     Planned,
     Approved,
@@ -228,33 +374,33 @@ pub enum ChangesetState {
     Reviewing,
     Testing,
     Ready,
-    Merged,
+    Accepted,
     Rejected,
     Escalated,
 }
 
-impl ChangesetState {
+impl ProposalState {
     pub fn as_str(&self) -> &'static str {
         match self {
-            ChangesetState::Draft => "draft",
-            ChangesetState::Planned => "planned",
-            ChangesetState::Approved => "approved",
-            ChangesetState::Building => "building",
-            ChangesetState::Reviewing => "reviewing",
-            ChangesetState::Testing => "testing",
-            ChangesetState::Ready => "ready",
-            ChangesetState::Merged => "merged",
-            ChangesetState::Rejected => "rejected",
-            ChangesetState::Escalated => "escalated",
+            ProposalState::Draft => "draft",
+            ProposalState::Planned => "planned",
+            ProposalState::Approved => "approved",
+            ProposalState::Building => "building",
+            ProposalState::Reviewing => "reviewing",
+            ProposalState::Testing => "testing",
+            ProposalState::Ready => "ready",
+            ProposalState::Accepted => "accepted",
+            ProposalState::Rejected => "rejected",
+            ProposalState::Escalated => "escalated",
         }
     }
-    /// Merged and rejected are final. Escalated waits for a human resolution (review M6 #9).
+    /// Accepted and rejected are final. Escalated waits for a human resolution (review M6 #9).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, ChangesetState::Merged | ChangesetState::Rejected)
+        matches!(self, ProposalState::Accepted | ProposalState::Rejected)
     }
     /// Legal forward transitions. Rework loops go back to `Building`.
-    pub fn can_transition_to(&self, next: ChangesetState) -> bool {
-        use ChangesetState::*;
+    pub fn can_transition_to(&self, next: ProposalState) -> bool {
+        use ProposalState::*;
         if next == Rejected {
             return !self.is_terminal();
         }
@@ -272,7 +418,7 @@ impl ChangesetState {
                 | (Reviewing, Building)
                 | (Testing, Building)
                 | (Testing, Ready)
-                | (Ready, Merged)
+                | (Ready, Accepted)
                 | (Ready, Building)
                 | (Ready, Testing)
                 | (Building, Planned)
@@ -291,13 +437,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn changeset_transitions() {
-        use ChangesetState::*;
+    fn every_edge_collection_has_a_definition() {
+        let defs = edge_definitions();
+        for e in EDGE_COLLECTIONS {
+            assert!(defs.iter().any(|(c, _, _)| c == e), "{e}");
+        }
+        for (c, from, to) in &defs {
+            assert!(EDGE_COLLECTIONS.contains(c), "{c}");
+            for x in from.iter().chain(to) {
+                assert!(
+                    DOCUMENT_COLLECTIONS.contains(x)
+                        || ["projects", "work_items", "users", "remote_agents"].contains(x),
+                    "{c}: {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proposal_transitions() {
+        use ProposalState::*;
         assert!(Draft.can_transition_to(Planned));
-        assert!(!Draft.can_transition_to(Merged));
+        assert!(!Draft.can_transition_to(Accepted));
         assert!(Testing.can_transition_to(Building));
         assert!(Building.can_transition_to(Escalated));
-        assert!(!Merged.can_transition_to(Rejected));
+        assert!(!Accepted.can_transition_to(Rejected));
         assert!(Escalated.can_transition_to(Building));
         assert!(Ready.can_transition_to(Testing));
     }

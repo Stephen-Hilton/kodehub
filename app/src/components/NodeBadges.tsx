@@ -5,7 +5,7 @@
 // pan, zoom and layout. Clicking a badge opens an overlay next to the node.
 import type { Core, NodeSingular } from "cytoscape";
 import { useEffect, useRef, useState } from "react";
-import type { MapNode } from "../lib/api";
+import { localId, type MapNode } from "../lib/api";
 
 export type BadgeKind = "tests" | "requirements" | "lifecycle" | "work";
 
@@ -94,28 +94,28 @@ export function NodeBadges({ cy, onOpen }: { cy: Core | null; onOpen: (c: BadgeC
         const life = n.lifecycle ?? "planned";
         return (
           <div key={p.id} className={`node-badges ${p.compact ? "compact" : ""}`}
-            style={{ left: p.left, top: p.top, maxWidth: p.width }} data-testid={`badges-${n.id}`}>
+            style={{ left: p.left, top: p.top, maxWidth: p.width }} data-testid={`badges-${localId(n.id)}`}>
             <button className={`nb life ${life}`} title={`Lifecycle: ${LIFECYCLE_LABEL[life] ?? life}`}
-              onClick={(e) => click(e, n, "lifecycle")} data-testid={`badge-life-${n.id}`}>
+              onClick={(e) => click(e, n, "lifecycle")} data-testid={`badge-life-${localId(n.id)}`}>
               <i /> {!p.compact && <span>{LIFECYCLE_LABEL[life]}</span>}
             </button>
             {t && t.total > 0 && (
               <button className={`nb tests ${testTone(t)}`} onClick={(e) => click(e, n, "tests")}
-                title={`Tests: ${t.passed}/${t.total} pass (own ${own?.passed ?? 0}/${own?.total ?? 0})`} data-testid={`badge-tests-${n.id}`}>
+                title={`Tests: ${t.passed}/${t.total} pass (own ${own?.passed ?? 0}/${own?.total ?? 0})`} data-testid={`badge-tests-${localId(n.id)}`}>
                 {t.passed}/{t.total}
               </button>
             )}
             {rq && (rq.total.business > 0 || rq.total.technical > 0) && (
               <button className="nb reqs" onClick={(e) => click(e, n, "requirements")}
                 title={`Business ${rq.own.business} on this · ${rq.total.business} with children — Technical ${rq.own.technical} · ${rq.total.technical}`}
-                data-testid={`badge-reqs-${n.id}`}>
+                data-testid={`badge-reqs-${localId(n.id)}`}>
                 <span className="k">B</span>{rq.own.business}{n.level !== "symbol" && <small>·{rq.total.business}</small>}
                 <span className="k">T</span>{rq.own.technical}{n.level !== "symbol" && <small>·{rq.total.technical}</small>}
               </button>
             )}
             {(n.in_progress ?? 0) > 0 && (
               <button className="nb work" onClick={(e) => click(e, n, "work")} title={`${n.in_progress} work item(s) on this node`}
-                data-testid={`badge-work-${n.id}`}>⚙{n.in_progress}</button>
+                data-testid={`badge-work-${localId(n.id)}`}>⚙{n.in_progress}</button>
             )}
             {(n.candidates ?? 0) > 0 && <span className="nb cand" title="A candidate version is waiting for its gates">◆</span>}
             {t && t.total > 0 && (

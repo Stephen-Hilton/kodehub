@@ -49,6 +49,22 @@ async fn agent_tasks_run_in_their_own_container() {
     let items = t.store.list_work_items(Some(&pid), None, 10).await.unwrap();
     assert_eq!(items[0]["state"], "done", "{}", items[0]);
     assert_eq!(items[0]["result"]["backend"], "recorded-in-container");
+    // each container is fresh, but the recording keeps its place across tasks: a second task
+    // of the same role gets the recording's second answer, not the first again
+    t.uok(
+        "POST",
+        "/api/work-items",
+        Some(json!({"agent_type": "planning", "kind": "smoke", "target": "philosophy/philosophy"})),
+    )
+    .await;
+    assert!(d.tick().await.unwrap());
+    let items = t.store.list_work_items(Some(&pid), None, 10).await.unwrap();
+    assert!(items.iter().all(|w| w["state"] == "done"), "{items:?}");
+    assert_eq!(
+        t.state.engine.as_ref().unwrap().recording_remaining(&pid),
+        Some(8),
+        "two container tasks took the recording's first two orchestrator answers"
+    );
     // the task input (which carried a token) is gone from storage
     let objs = kodehub_storage::StorageClient::from_env_or_local(&t.state.runner.home)
         .list(kodehub_storage::BUCKET, &format!("projects/{pid}/jobs/"))

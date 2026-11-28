@@ -1,12 +1,12 @@
 // Work queue and agent activity (spec §8.4): what needs a human (approvals, external blockers),
-// the queue, spend, and the agents' live activity and changesets.
+// the queue, spend, and the agents' live activity and proposals.
 import { useEffect, useState } from "react";
 import { AgentsPanel } from "../components/AgentsPanel";
 import { WorkRow } from "../components/NodeOverlays";
 import { useToast } from "../components/Toasts";
-import { api, type Changeset, type Json } from "../lib/api";
+import { api, type Json, type Proposal } from "../lib/api";
 
-export function WorkScreen({ agents, changesets, reqTitle }: { agents: Json; changesets: Changeset[]; reqTitle: (k: string) => string }) {
+export function WorkScreen({ agents, proposals, reqTitle }: { agents: Json; proposals: Proposal[]; reqTitle: (k: string) => string }) {
   const toast = useToast();
   const [items, setItems] = useState<Json[]>([]);
   const [stats, setStats] = useState<Json>(null);
@@ -79,7 +79,7 @@ export function WorkScreen({ agents, changesets, reqTitle }: { agents: Json; cha
           </div>
         </div>
         <div className="activity-col">
-          <AgentsPanel agents={agents} changesets={changesets} requirementsTitle={reqTitle} selectedNode={null} onClearRef={() => {}} />
+          <AgentsPanel agents={agents} proposals={proposals} requirementsTitle={reqTitle} selectedNode={null} onClearRef={() => {}} />
         </div>
       </div>
     </div>

@@ -82,6 +82,16 @@ pub async fn agent(runner: &Runner, input: &Value) -> Result<Value> {
         .as_str()
         .unwrap_or("http://kodehub-server:7878");
     let out = match input["backend"].as_str().unwrap_or("claude_code") {
+        "recorded" if !input["recorded_output"].is_null() => {
+            // the server keeps the recording's position and hands this task its answer
+            kodehub_agents::RecordedBackend::single(
+                &task,
+                input["recording"].as_str().unwrap_or("recorded"),
+                input["recorded_output"].clone(),
+            )
+            .run(&task)
+            .await?
+        }
         "recorded" => {
             let path = std::env::var("KODEHUB_RECORDING")
                 .map(std::path::PathBuf::from)

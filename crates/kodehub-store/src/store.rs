@@ -16,30 +16,55 @@ use crate::{Result, StoreError};
 /// deployments), never through the generic edge API.
 pub const PROTECTED_EDGES: &[&str] = &[
     "has_version",
-    "supports",
-    "in_environment",
-    "cloned_from",
-    "proposes",
+    "based_on",
+    "owns",
+    "has_work_item",
+    "has_deployment",
+    "has_deployer",
+    "uses",
+    "logs_to",
+    "build_of",
+    "built_for",
+    "has_message",
+    "authored",
 ];
 
 /// Document collections writable through the generic node API.
-pub const GENERIC_NODE_COLLECTIONS: &[&str] = &[
-    "missions",
-    "contexts",
-    "containers",
-    "components",
-    "namespaces",
-    "requirement_groups",
-    "build_targets",
+pub const GENERIC_NODE_COLLECTIONS: &[&str] = &["contexts", "containers", "components"];
+
+/// Presentation fields of code and test nodes that may be patched directly (their content is
+/// only ever changed through versions).
+pub const CODE_PRESENTATION_FIELDS: &[&str] = &[
+    "tags",
+    "description",
+    "visibility",
+    "namespace",
+    "public_name",
 ];
 
-const CODE_EDGES: &[&str] = &["calls", "depends_on", "member_of", "tested_by", "binds_to"];
+pub const CODE_EDGES: &[&str] = &[
+    "calls",
+    "depends_on",
+    "member_of",
+    "tested_with",
+    "binds_to",
+];
+
+/// Cached version trees: project version id → (tree revision, index).
+pub type TreeCache = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<String, (i64, std::sync::Arc<crate::tree::TreeIndex>)>,
+    >,
+>;
 
 #[derive(Debug, Clone)]
 pub struct Store {
     pub db: Arango,
     /// Serialises merges and deployments within this server process (review M6 #3).
     pub write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Version trees by project version and revision (ids are qualified, so one cache serves
+    /// every project).
+    pub trees: TreeCache,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +80,9 @@ pub struct NewSymbol {
     pub tags: Vec<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// The component (or container / context, for tests) that holds the node.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -67,9 +95,24 @@ pub struct WriteOutcome {
     pub changed: bool,
 }
 
-/// Deterministic edge key so re-imports and repeated proposals are idempotent.
+/// Deterministic edge key so re-imports and repeated proposals are idempotent. Qualified with
+/// the project of `from` (a project node id, or `projects/<id>`), else of `to` (an edge from a
+/// global record such as a work item).
 pub fn edge_key(coll: &str, from: &str, to: &str) -> String {
-    blake3::hash(format!("{coll}|{from}|{to}").as_bytes()).to_hex()[..24].to_string()
+    let h = blake3::hash(format!("{coll}|{from}|{to}").as_bytes()).to_hex()[..24].to_string();
+    match id_project(from).or_else(|| id_project(to)) {
+        Some(p) => crate::arango::qualify(&p, &h),
+        None => h,
+    }
+}
+
+/// The project an id belongs to: `code/shop.x` → `shop`, `projects/shop` → `shop`.
+pub fn id_project(id: &str) -> Option<String> {
+    let (coll, key) = id.split_once('/')?;
+    if coll == crate::schema::PROJECTS || coll == "projects" {
+        return Some(key.to_string());
+    }
+    crate::arango::key_project(key).map(str::to_string)
 }
 
 pub fn key_of(id: &str) -> &str {
@@ -101,6 +144,7 @@ impl Store {
         Store {
             db: Arango::new(cfg),
             write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            trees: Default::default(),
         }
     }
 
@@ -139,6 +183,7 @@ impl Store {
     // ---------------------------------------------------------------- generic graph access
 
     pub async fn get_node(&self, id: &str) -> Result<Value> {
+        let id = &self.db.qid(id)?;
         let (coll, key) = id
             .split_once('/')
             .ok_or_else(|| StoreError::Invalid(format!("node id must be collection/key: {id}")))?;
@@ -184,6 +229,7 @@ impl Store {
             "any" => "ANY",
             d => return Err(StoreError::Invalid(format!("bad direction {d}"))),
         };
+        let start = &self.db.qid(start)?;
         for e in edges {
             validate_name(e)?;
         }
@@ -192,7 +238,7 @@ impl Store {
         } else {
             edges
                 .iter()
-                .map(|e| self.db.phys(e))
+                .map(|e| e.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -221,7 +267,9 @@ impl Store {
                 .map(slug)
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| new_key(collection));
-            doc["_key"] = json!(base);
+            doc["_key"] = json!(self.db.pkey(&base)?);
+        } else if let Some(k) = doc["_key"].as_str() {
+            doc["_key"] = json!(self.db.pkey(k)?);
         }
         doc["created_at"] = json!(now_iso());
         let created = self.db.insert(collection, &doc, None).await?;
@@ -232,15 +280,9 @@ impl Store {
         Ok(created)
     }
 
-    /// Patch a document. Immutable collections always refuse.
+    /// Patch a document. Immutable collections always refuse. (Closure hashes are computed per
+    /// project version when needed, so a visibility change moves them automatically.)
     pub async fn update_node(&self, collection: &str, key: &str, patch: &Value) -> Result<Value> {
-        if collection == "symbols" && patch.get("visibility").is_some() {
-            // visibility changes rendered code → closure hashes must move with it (final review #9)
-            let _w = self.write_lock.lock().await;
-            let v = self.update_node_inner(collection, key, patch).await?;
-            self.refresh_closure_hashes(None).await?;
-            return Ok(v);
-        }
         self.update_node_inner(collection, key, patch).await
     }
 
@@ -250,20 +292,21 @@ impl Store {
                 "documents in `{collection}` are immutable"
             )));
         }
-        if !GENERIC_NODE_COLLECTIONS.contains(&collection) && collection != "symbols" {
+        let leaf = collection == "code" || collection == "tests";
+        if !GENERIC_NODE_COLLECTIONS.contains(&collection) && !leaf {
             return Err(StoreError::Invalid(format!(
                 "collection `{collection}` cannot be patched through the generic node API"
             )));
         }
-        if collection == "symbols" {
-            // Only presentation fields are editable on symbols.
+        if leaf {
+            // only presentation fields are editable on code and test nodes
             if let Some(obj) = patch.as_object() {
                 if let Some(bad) = obj
                     .keys()
-                    .find(|k| !["tags", "description", "visibility"].contains(&k.as_str()))
+                    .find(|k| !CODE_PRESENTATION_FIELDS.contains(&k.as_str()))
                 {
                     return Err(StoreError::Invalid(format!(
-                        "symbol field `{bad}` cannot be patched directly"
+                        "field `{bad}` of a code node cannot be patched directly"
                     )));
                 }
             }
@@ -284,6 +327,7 @@ impl Store {
         data: Value,
     ) -> Result<Value> {
         check_edge_collection(collection)?;
+        let (from, to) = (&self.db.qid(from)?, &self.db.qid(to)?);
         self.get_node(from).await?;
         self.get_node(to).await?;
         let mut doc = if data.is_object() { data } else { json!({}) };
@@ -291,35 +335,100 @@ impl Store {
         doc["_from"] = json!(from);
         doc["_to"] = json!(to);
         self.db.insert_ignore(collection, &doc, None).await?;
-        if CODE_EDGES.contains(&collection) {
-            self.refresh_closure_hashes(None).await?;
+        // placing a node in the hierarchy puts it into the current project version
+        if collection == "contains" {
+            self.place_node(to, "api").await?;
         }
         self.db
             .get(collection, &edge_key(collection, from, to), None)
             .await
     }
 
+    /// Put a placed node into the current project version: a C4 node with its definition, a
+    /// code or test node with its newest version.
+    pub async fn place_node(&self, id: &str, by: &str) -> Result<()> {
+        let (coll, key) = id
+            .split_once('/')
+            .ok_or_else(|| StoreError::Invalid(format!("bad node id {id}")))?;
+        if crate::c4::C4_COLLECTIONS.contains(&coll) {
+            self.sync_c4_version(coll, key, by).await?;
+        } else if coll == "code" || coll == "tests" {
+            let newest = self
+                .aql(
+                    "FOR e IN @@has_version FILTER e._from == @n AND e.state != 'discarded'
+                       AND e.work_item == null SORT e.seq DESC LIMIT 1 RETURN e._to",
+                    json!({"n": id}),
+                )
+                .await?;
+            if let Some(v) = newest.first().and_then(Value::as_str) {
+                let mut ch = crate::tree::TreeChanges::default();
+                ch.leaves.insert(id.to_string(), Some(v.to_string()));
+                self.apply_tree_changes(None, &ch, by, None).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn remove_edge(&self, collection: &str, from: &str, to: &str) -> Result<()> {
         check_edge_collection(collection)?;
+        let (from, to) = (&self.db.qid(from)?, &self.db.qid(to)?);
         self.aql(
             "FOR e IN @@c FILTER e._from == @f AND e._to == @t REMOVE e IN @@c",
             json!({"@c": collection, "f": from, "t": to}),
         )
         .await?;
-        if CODE_EDGES.contains(&collection) {
-            self.refresh_closure_hashes(None).await?;
-        }
         Ok(())
     }
 
-    // ---------------------------------------------------------------- code: symbols & versions
+    // ---------------------------------------------------------------- code and tests (D-057)
 
-    fn version_doc(content: &VersionContent, created_by: &str) -> (String, Value) {
+    /// The collection holding nodes of this kind: `tests` for tests, `code` for the rest.
+    pub fn node_collection(kind: Kind) -> &'static str {
+        if kind == Kind::Test {
+            "tests"
+        } else {
+            "code"
+        }
+    }
+
+    /// The id of a code or test node from its key or id (local or qualified).
+    pub async fn symbol_id(&self, key_or_id: &str) -> Result<String> {
+        if let Some((c, _)) = key_or_id.split_once('/') {
+            if c == "code" || c == "tests" {
+                return self.db.qid(key_or_id);
+            }
+        }
+        let k = self.db.pkey(key_of(key_or_id))?;
+        for c in ["code", "tests"] {
+            match self.db.get(c, &k, None).await {
+                Ok(_) => return Ok(format!("{c}/{k}")),
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(StoreError::NotFound(format!("code or test `{key_or_id}`")))
+    }
+
+    /// A leaf version document of `node` (key derived from the node and the content hash).
+    pub(crate) fn leaf_version_doc(
+        &self,
+        node_id: &str,
+        content: &VersionContent,
+        created_by: &str,
+    ) -> Result<(String, Value)> {
         let n = content.normalized();
-        let hash = n.hash();
+        let chash = n.hash();
+        let project = self.db.require_project()?;
+        let key = crate::tree::version_key(&project, node_id, &chash);
+        let coll =
+            crate::tree::version_collection(node_id.split_once('/').map(|x| x.0).unwrap_or(""))
+                .ok_or_else(|| {
+                    StoreError::Invalid(format!("{node_id} is not a code or test node"))
+                })?;
         let doc = json!({
-            "_key": hash,
-            "content_hash": hash,
+            "_key": key,
+            "node": node_id,
+            "content_hash": chash,
             "kind": n.kind,
             "language": n.language,
             "signature": n.signature,
@@ -328,46 +437,10 @@ impl Store {
             "created_at": now_iso(),
             "created_by": created_by,
         });
-        (hash, doc)
+        Ok((format!("{coll}/{key}"), doc))
     }
 
-    async fn insert_version(&self, doc: &Value, trx: &str) -> Result<bool> {
-        match self.db.insert("versions", doc, Some(trx)).await {
-            Ok(_) => Ok(true),
-            Err(e) if e.is_unique_violation() => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
-    const VERSION_WRITE: &'static [&'static str] = &["versions", "has_version", "symbols"];
-
-    /// The stable `has_version` edge of a node (`symbols/x`, `components/y`, …), if any.
-    pub async fn stable_edge_in(&self, node_id: &str, trx: Option<&str>) -> Result<Option<Value>> {
-        Ok(self
-            .db
-            .aql(
-                "FOR e IN @@has_version FILTER e._from == @n AND e.state == 'stable' RETURN e",
-                json!({"n": node_id}),
-                trx,
-            )
-            .await?
-            .into_iter()
-            .next())
-    }
-
-    /// Key of a node's stable version, if any.
-    pub async fn stable_version_in(
-        &self,
-        node_id: &str,
-        trx: Option<&str>,
-    ) -> Result<Option<String>> {
-        Ok(self
-            .stable_edge_in(node_id, trx)
-            .await?
-            .and_then(|e| e["_to"].as_str().map(|t| key_of(t).to_string())))
-    }
-
-    async fn next_seq(&self, node_id: &str, trx: Option<&str>) -> Result<i64> {
+    pub(crate) async fn next_seq(&self, node_id: &str, trx: Option<&str>) -> Result<i64> {
         Ok(self
             .db
             .aql(
@@ -382,162 +455,96 @@ impl Store {
             + 1)
     }
 
-    /// Promote `version` to be the node's stable version (spec §5.2): close the old stable edge
-    /// (`validTo` = now, state retired) and open the new one (`validFrom` = now), turning a
-    /// matching candidate edge into the stable one when it exists. The unique sparse index on
-    /// `stable_of` makes a second stable edge impossible.
-    pub async fn promote_in(
+    /// Write a version of a code or test node with its `has_version` edge. `state` is
+    /// `candidate` (a work item's proposal, or written but not yet in any tree) or `accepted`.
+    /// A work item has at most one candidate per node: a newer one replaces the older.
+    /// Returns (version id, whether the version document was created).
+    pub async fn put_leaf_version(
         &self,
         node_id: &str,
-        version_coll: &str,
-        version: &str,
-        changeset: Option<&str>,
+        content: &VersionContent,
         by: &str,
-        trx: &str,
-    ) -> Result<i64> {
-        let now = now_iso();
-        let vid = format!("{version_coll}/{version}");
-        if let Some(old) = self.stable_edge_in(node_id, Some(trx)).await? {
-            if old["_to"] == json!(vid) {
-                return Ok(old["seq"].as_i64().unwrap_or(0));
-            }
+        work_item: Option<&str>,
+        trx: Option<&str>,
+    ) -> Result<(String, bool)> {
+        let node_id = &self.db.qid(node_id)?;
+        let (coll, key) = node_id
+            .split_once('/')
+            .ok_or_else(|| StoreError::Invalid(format!("bad node id {node_id}")))?;
+        let node = self.db.get(coll, key, trx).await?;
+        if node["kind"] != json!(content.kind) || node["language"] != json!(content.language) {
+            return Err(StoreError::Invalid(format!(
+                "version kind/language must match `{node_id}`"
+            )));
+        }
+        let (vid, doc) = self.leaf_version_doc(node_id, content, by)?;
+        let vcoll = vid.split_once('/').map(|x| x.0).unwrap_or_default();
+        let created = match self.db.insert(vcoll, &doc, trx).await {
+            Ok(_) => true,
+            Err(e) if e.is_unique_violation() => false,
+            Err(e) => return Err(e),
+        };
+        if let Some(w) = work_item {
             self.db
-                .patch(
-                    "has_version",
-                    old["_key"].as_str().unwrap_or_default(),
-                    &json!({"state": "retired", "validTo": now, "stable_of": null, "retired_by": version}),
-                    Some(trx),
+                .aql(
+                    "FOR e IN @@has_version FILTER e._from == @n AND e.state == 'candidate'
+                       AND e.work_item == @w AND e._to != @v
+                       UPDATE e WITH {state: 'discarded', discarded_at: @now} IN @@has_version",
+                    json!({"n": node_id, "w": w, "v": vid, "now": now_iso()}),
+                    trx,
                 )
                 .await?;
         }
-        let cand = match changeset {
-            Some(cs) => self
-                .db
-                .aql(
-                    "FOR e IN @@has_version FILTER e._from == @n AND e._to == @v
-                       AND e.state == 'candidate' AND e.changeset == @cs RETURN e",
-                    json!({"n": node_id, "v": vid, "cs": cs}),
-                    Some(trx),
-                )
-                .await?
-                .into_iter()
-                .next(),
-            None => None,
-        };
-        let seq = match cand {
-            Some(c) => {
-                self.db
-                    .patch(
-                        "has_version",
-                        c["_key"].as_str().unwrap_or_default(),
-                        &json!({"state": "stable", "validFrom": now, "validTo": null,
-                                "stable_of": node_id, "promoted_by": by}),
-                        Some(trx),
-                    )
-                    .await?;
-                c["seq"].as_i64().unwrap_or(0)
-            }
-            None => {
-                let seq = self.next_seq(node_id, Some(trx)).await?;
-                self.db
-                    .insert(
-                        "has_version",
-                        &json!({"_from": node_id, "_to": vid, "seq": seq, "state": "stable",
-                                "validFrom": now, "validTo": null, "stable_of": node_id,
-                                "changeset": changeset, "created_at": now, "created_by": by}),
-                        Some(trx),
-                    )
-                    .await
-                    .map_err(|e| {
-                        if e.is_unique_violation() {
-                            StoreError::Invariant(format!("{node_id} already has a stable version"))
-                        } else {
-                            e
-                        }
-                    })?;
-                seq
-            }
-        };
-        Ok(seq)
-    }
-
-    /// Record a candidate version for an existing node: an edge with no `validFrom`, so it never
-    /// disturbs the stable version (spec §5.2). Idempotent per (node, version, changeset).
-    pub async fn add_candidate(
-        &self,
-        node_id: &str,
-        version_coll: &str,
-        version: &str,
-        changeset: &str,
-        by: &str,
-    ) -> Result<i64> {
-        let vid = format!("{version_coll}/{version}");
-        // one candidate per node per changeset: a re-proposal replaces the previous candidate
-        self.db
-            .aql(
-                "FOR e IN @@has_version FILTER e._from == @n AND e.state == 'candidate'
-                   AND e.changeset == @cs AND e._to != @v REMOVE e IN @@has_version",
-                json!({"n": node_id, "cs": changeset, "v": vid}),
-                None,
-            )
-            .await?;
-        if let Some(e) = self
+        let ekey = edge_key(
+            "has_version",
+            node_id,
+            &format!("{vid}|{}", work_item.unwrap_or("")),
+        );
+        let exists = self
             .db
             .aql(
-                "FOR e IN @@has_version FILTER e._from == @n AND e._to == @v
-                   AND e.state == 'candidate' AND e.changeset == @cs RETURN e",
-                json!({"n": node_id, "v": vid, "cs": changeset}),
-                None,
-            )
-            .await?
-            .into_iter()
-            .next()
-        {
-            return Ok(e["seq"].as_i64().unwrap_or(0));
-        }
-        let seq = self.next_seq(node_id, None).await?;
-        self.db
-            .insert(
-                "has_version",
-                &json!({"_key": edge_key("has_version", node_id, &format!("{vid}|{changeset}")),
-                        "_from": node_id, "_to": vid, "seq": seq, "state": "candidate",
-                        "validFrom": null, "validTo": null, "stable_of": null,
-                        "changeset": changeset, "created_at": now_iso(), "created_by": by}),
-                None,
+                "FOR e IN @@has_version FILTER e._key == @k RETURN e.state",
+                json!({"k": ekey}),
+                trx,
             )
             .await?;
-        Ok(seq)
+        if exists.is_empty() {
+            let seq = self.next_seq(node_id, trx).await?;
+            self.db
+                .insert(
+                    "has_version",
+                    &json!({"_key": ekey, "_from": node_id, "_to": vid, "seq": seq,
+                            "state": "candidate", "work_item": work_item,
+                            "created_at": now_iso(), "created_by": by}),
+                    trx,
+                )
+                .await?;
+        } else if exists[0] == "discarded" {
+            self.db
+                .patch("has_version", &ekey, &json!({"state": "candidate"}), trx)
+                .await?;
+        }
+        Ok((vid, created))
     }
 
-    /// Drop the candidate edges of a changeset (withdrawn or rejected proposals).
-    pub async fn discard_candidates(&self, changeset: &str, node_id: Option<&str>) -> Result<()> {
+    /// Mark a work item's candidate versions discarded (withdrawn or rejected proposals).
+    pub async fn discard_candidates(&self, work_item: &str, node_id: Option<&str>) -> Result<()> {
+        let node_id = node_id.map(|n| self.db.qid(n)).transpose()?;
         self.db
             .aql(
-                "FOR e IN @@has_version FILTER e.state == 'candidate' AND e.changeset == @cs
+                "FOR e IN @@has_version FILTER e.state == 'candidate' AND e.work_item == @w
                    AND (@n == null OR e._from == @n)
-                   UPDATE e WITH {state: 'discarded'} IN @@has_version",
-                json!({"cs": changeset, "n": node_id}),
+                   UPDATE e WITH {state: 'discarded', discarded_at: @now} IN @@has_version",
+                json!({"w": work_item, "n": node_id, "now": now_iso()}),
                 None,
             )
             .await
             .map(|_| ())
     }
 
-    /// The version a node had stable at time `at` (RFC 3339), from the validity intervals.
-    pub async fn version_as_of(&self, node_id: &str, at: &str) -> Result<Option<Value>> {
-        Ok(self
-            .aql(
-                "FOR e IN @@has_version FILTER e._from == @n AND e.validFrom != null
-                   AND e.validFrom <= @at AND (e.validTo == null OR e.validTo > @at)
-                   RETURN {version: PARSE_IDENTIFIER(e._to).key, seq: e.seq, validFrom: e.validFrom, validTo: e.validTo}",
-                json!({"n": node_id, "at": at}),
-            )
-            .await?
-            .into_iter()
-            .next())
-    }
-
-    /// Create a symbol with its first version, in one transaction.
+    /// Create a code or test node with its first version. With `parent` (a component, or a
+    /// container / context for tests), the node is placed and the version accepted into the
+    /// current project version at once; otherwise it waits for [`Store::sync_tree`].
     pub async fn create_symbol(
         &self,
         sym: &NewSymbol,
@@ -549,234 +556,278 @@ impl Store {
                 "version kind/language must match the symbol".into(),
             ));
         }
-        let key = sym.key.clone().unwrap_or_else(|| {
+        let key = self.db.pkey(&sym.key.clone().unwrap_or_else(|| {
             format!(
                 "{}-{}",
                 sym.language.as_str(),
                 slug(&sym.display_name.replace("::", "-").replace('.', "-"))
             )
-        });
-        let (hash, vdoc) = Self::version_doc(content, created_by);
-        let trx = self.db.begin(Self::VERSION_WRITE, &[]).await?;
-        let res: Result<bool> = async {
-            let sdoc = json!({
-                "_key": key,
-                "display_name": sym.display_name,
-                "kind": sym.kind,
-                "language": sym.language,
-                "visibility": sym.visibility,
-                "tags": sym.tags,
-                "description": sym.description,
-                "created_at": now_iso(),
-                "created_by": created_by,
-            });
-            self.db
-                .insert("symbols", &sdoc, Some(&trx))
-                .await
-                .map_err(|e| {
-                    if e.is_unique_violation() {
-                        StoreError::Conflict(format!(
-                            "a {} symbol named `{}` (or key `{key}`) already exists",
-                            sym.language.as_str(),
-                            sym.display_name
-                        ))
-                    } else {
-                        e
-                    }
-                })?;
-            let created = self.insert_version(&vdoc, &trx).await?;
-            self.promote_in(
-                &format!("symbols/{key}"),
-                "versions",
-                &hash,
-                None,
-                created_by,
-                &trx,
+        }))?;
+        let coll = Self::node_collection(sym.kind);
+        // display names are unique per language across code and tests (one code graph)
+        let clash = self
+            .aql(
+                "RETURN UNION(
+                   (FOR s IN @@code FILTER s.language == @l AND (s.display_name == @n OR s._key == @k) RETURN 1),
+                   (FOR s IN @@tests FILTER s.language == @l AND (s.display_name == @n OR s._key == @k) RETURN 1))",
+                json!({"l": sym.language, "n": sym.display_name, "k": key}),
             )
             .await?;
-            self.refresh_closure_hashes(Some(&trx)).await?;
-            Ok(created)
+        if clash
+            .first()
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+        {
+            return Err(StoreError::Conflict(format!(
+                "a {} symbol named `{}` (or key `{key}`) already exists",
+                sym.language.as_str(),
+                sym.display_name
+            )));
         }
-        .await;
-        match res {
-            Ok(created) => {
-                self.db.commit(&trx).await?;
-                Ok(WriteOutcome {
-                    symbol: key,
-                    version: hash,
-                    created_version: created,
-                    changed: true,
-                })
-            }
-            Err(e) => {
-                let _ = self.db.abort(&trx).await;
-                Err(e)
-            }
+        let node_id = format!("{coll}/{key}");
+        self.db
+            .insert(
+                coll,
+                &json!({
+                    "_key": key,
+                    "display_name": sym.display_name,
+                    "kind": sym.kind,
+                    "language": sym.language,
+                    "visibility": sym.visibility,
+                    "tags": sym.tags,
+                    "description": sym.description,
+                    "lifecycle": null,
+                    "created_at": now_iso(),
+                    "created_by": created_by,
+                }),
+                None,
+            )
+            .await
+            .map_err(|e| {
+                if e.is_unique_violation() {
+                    StoreError::Conflict(format!("`{key}` already exists"))
+                } else {
+                    e
+                }
+            })?;
+        let (vid, created) = self
+            .put_leaf_version(&node_id, content, created_by, None, None)
+            .await?;
+        if let Some(parent) = &sym.parent {
+            let parent = self.db.qid(parent)?;
+            self.get_node(&parent).await?;
+            self.db
+                .insert_ignore(
+                    "contains",
+                    &json!({"_key": edge_key("contains", &parent, &node_id), "_from": parent,
+                            "_to": node_id}),
+                    None,
+                )
+                .await?;
+            let mut ch = crate::tree::TreeChanges::default();
+            ch.leaves.insert(node_id.clone(), Some(vid.clone()));
+            self.apply_tree_changes(None, &ch, created_by, None).await?;
         }
+        Ok(WriteOutcome {
+            symbol: key,
+            version: key_of(&vid).to_string(),
+            created_version: created,
+            changed: true,
+        })
     }
 
-    /// The versioning rule (doc 02): reuse identical content, move current → previous, create
-    /// the new current edge — all in one transaction.
+    /// Write a new version of a placed node straight into the current project version (seed,
+    /// import, tests and maintenance; agents go through work items). Identical content is a
+    /// no-op.
     pub async fn write_version(
         &self,
         symbol_key: &str,
         content: &VersionContent,
         created_by: &str,
     ) -> Result<WriteOutcome> {
-        let trx = self.db.begin(Self::VERSION_WRITE, &[]).await?;
-        let res = self
-            .write_version_in(symbol_key, content, created_by, &trx, true)
-            .await;
-        match res {
-            Ok(o) => {
-                self.db.commit(&trx).await?;
-                Ok(o)
-            }
-            Err(e) => {
-                let _ = self.db.abort(&trx).await;
-                Err(e)
-            }
-        }
-    }
-
-    /// Versioning rule inside an existing transaction.
-    pub async fn write_version_in(
-        &self,
-        symbol_key: &str,
-        content: &VersionContent,
-        created_by: &str,
-        trx: &str,
-        refresh: bool,
-    ) -> Result<WriteOutcome> {
-        let sym = self.db.get("symbols", symbol_key, Some(trx)).await?;
-        if sym["kind"] != json!(content.kind) || sym["language"] != json!(content.language) {
-            return Err(StoreError::Invalid(format!(
-                "version kind/language must match symbol `{symbol_key}`"
-            )));
-        }
-        let (hash, vdoc) = Self::version_doc(content, created_by);
-        let sym_id = format!("symbols/{symbol_key}");
-        let current = self.stable_version_in(&sym_id, Some(trx)).await?;
-        if current.is_none() {
-            return Err(StoreError::Invariant(format!(
-                "symbol {symbol_key} has no stable version"
-            )));
-        }
-        if current.as_deref() == Some(hash.as_str()) {
+        let node_id = self.symbol_id(symbol_key).await?;
+        let pv = self.current_version().await?;
+        let tree = self.tree(Some(&pv)).await?;
+        let (vid, doc) = self.leaf_version_doc(&node_id, content, created_by)?;
+        let _ = doc;
+        if tree.version(&node_id) == Some(vid.as_str()) {
             return Ok(WriteOutcome {
-                symbol: symbol_key.into(),
-                version: hash,
+                symbol: key_of(&node_id).to_string(),
+                version: key_of(&vid).to_string(),
                 created_version: false,
                 changed: false,
             });
         }
-        let created = self.insert_version(&vdoc, trx).await?;
-        self.promote_in(&sym_id, "versions", &hash, None, created_by, trx)
+        let (vid, created) = self
+            .put_leaf_version(&node_id, content, created_by, None, None)
             .await?;
-        if refresh {
-            self.refresh_closure_hashes(Some(trx)).await?;
-        }
+        let mut ch = crate::tree::TreeChanges::default();
+        ch.leaves.insert(node_id.clone(), Some(vid.clone()));
+        self.apply_tree_changes(Some(&pv), &ch, created_by, None)
+            .await?;
         Ok(WriteOutcome {
-            symbol: symbol_key.into(),
-            version: hash,
+            symbol: key_of(&node_id).to_string(),
+            version: key_of(&vid).to_string(),
             created_version: created,
             changed: true,
         })
     }
 
-    /// Attempt to add a second stable `has_version` edge directly. Exists so the invariant can
-    /// be demonstrated and tested; the database refuses it when the node already has one.
-    pub async fn force_add_stable_version(&self, version: &str, symbol_key: &str) -> Result<()> {
-        let sid = format!("symbols/{symbol_key}");
-        self.db
-            .insert(
-                "has_version",
-                &json!({"_from": sid, "_to": format!("versions/{version}"), "seq": 0,
-                        "state": "stable", "validFrom": now_iso(), "validTo": null, "stable_of": sid}),
-                None,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| {
-                if e.is_unique_violation() {
-                    StoreError::Invariant(format!(
-                        "symbol {symbol_key} already has a stable version"
-                    ))
-                } else {
-                    e
+    /// Bring the current project version in line with the identity graph: place every node
+    /// that has a parent but is not in the tree yet (code and tests with their newest version,
+    /// C4 nodes with their definition), and give C4 nodes whose definition changed a new
+    /// version. Used after a seed or an import. Returns how many nodes changed.
+    pub async fn sync_tree(&self, by: &str) -> Result<usize> {
+        let pv = self.current_version().await?;
+        let tree = self.tree(Some(&pv)).await?;
+        let mut ch = crate::tree::TreeChanges::default();
+        for coll in crate::tree::LEAF_LEVELS {
+            let rows = self
+                .aql(
+                    "FOR n IN @@c
+                       LET placed = LENGTH(FOR e IN @@contains FILTER e._to == n._id RETURN 1) > 0
+                       FILTER placed
+                       LET v = FIRST(FOR e IN @@has_version FILTER e._from == n._id AND e.state != 'discarded'
+                                       AND e.work_item == null SORT e.seq DESC LIMIT 1 RETURN e._to)
+                       FILTER v != null
+                       RETURN {n: n._id, v}",
+                    json!({"@c": coll}),
+                )
+                .await?;
+            for r in rows {
+                let (Some(n), Some(v)) = (r["n"].as_str(), r["v"].as_str()) else {
+                    continue;
+                };
+                if tree.version(n) != Some(v) {
+                    ch.leaves.insert(n.to_string(), Some(v.to_string()));
                 }
-            })
+            }
+        }
+        for coll in crate::tree::C4_LEVELS {
+            let rows = self
+                .aql(
+                    "FOR n IN @@c
+                       LET placed = LENGTH(FOR e IN @@contains FILTER e._to == n._id RETURN 1) > 0
+                       FILTER placed RETURN n",
+                    json!({"@c": coll}),
+                )
+                .await?;
+            for n in rows {
+                let id = n["_id"].as_str().unwrap_or_default().to_string();
+                let def = crate::c4::c4_definition(coll, &n);
+                let hash = crate::c4::c4_hash(&def);
+                let current = tree
+                    .version(&id)
+                    .and_then(|v| tree.content_hash.get(v))
+                    .cloned();
+                if current.as_deref() != Some(hash.as_str()) {
+                    ch.defs.insert(id, def);
+                }
+            }
+        }
+        let n = ch.leaves.len() + ch.defs.len();
+        self.apply_tree_changes(Some(&pv), &ch, by, None).await?;
+        Ok(n)
     }
 
-    /// Load the code graph (current versions) for closure computation and rendering.
-    pub async fn load_code_graph_in(&self, trx: Option<&str>) -> Result<CodeGraph> {
-        let syms = self
+    /// Load the code graph of a project version (`None` = current) for closures, rendering
+    /// and testing: every code and test node in its tree at the version the tree holds.
+    pub async fn load_code_graph_at(&self, pv: Option<&str>) -> Result<CodeGraph> {
+        let tree = self.tree(pv).await?;
+        self.code_graph_of(&tree, None).await
+    }
+
+    /// The code graph of a resolved tree (inside `trx` when given, e.g. to check a change
+    /// before committing it).
+    pub async fn code_graph_of(
+        &self,
+        tree: &crate::tree::TreeIndex,
+        trx: Option<&str>,
+    ) -> Result<CodeGraph> {
+        let mut pairs: Vec<Value> = Vec::new();
+        for coll in crate::tree::LEAF_LEVELS {
+            for n in tree.nodes_in(coll) {
+                pairs.push(json!({"n": n, "v": tree.version(n)}));
+            }
+        }
+        let rows = self
             .db
             .aql(
-                "FOR s IN @@symbols
-                   LET cv = FIRST(FOR e IN @@has_version FILTER e._from == s._id AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key)
-                   FILTER cv != null
-                   RETURN {id: s._key, display_name: s.display_name, kind: s.kind, language: s.language,
-                           visibility: s.visibility, tags: s.tags || [], version: cv}",
-                json!({}),
+                "FOR p IN @pairs LET s = DOCUMENT(p.n) LET v = DOCUMENT(p.v)
+                   RETURN {s: {id: s._key, display_name: s.display_name, kind: s.kind,
+                               language: s.language, visibility: s.visibility, tags: s.tags || [],
+                               version: v._key},
+                           v: v}",
+                json!({"pairs": pairs}),
                 trx,
             )
             .await?;
         let mut g = CodeGraph::default();
-        // planned symbols (no stable version yet) are not part of the code graph
-        for s in syms {
-            let cs: CodeSymbol = serde_json::from_value(s)
-                .map_err(|e| StoreError::Invalid(format!("bad symbol doc: {e}")))?;
+        for r in rows {
+            let cs: CodeSymbol = serde_json::from_value(r["s"].clone())
+                .map_err(|e| StoreError::Invalid(format!("bad code node: {e}")))?;
+            g.versions
+                .insert(cs.version.clone(), version_content_from_doc(&r["v"])?);
             g.symbols.insert(cs.id.clone(), cs);
         }
         for coll in CODE_EDGES {
             let rows = self
                 .db
                 .aql(
-                    "FOR e IN @@c FILTER STARTS_WITH(e._from, CONCAT(@pfx, 'symbols/')) AND STARTS_WITH(e._to, CONCAT(@pfx, 'symbols/'))
-                     RETURN {from: PARSE_IDENTIFIER(e._from).key, to: PARSE_IDENTIFIER(e._to).key, pinned_version: e.pinned_version}",
+                    "FOR e IN @@c FILTER PARSE_IDENTIFIER(e._from).collection IN ['code', 'tests']
+                       AND PARSE_IDENTIFIER(e._to).collection IN ['code', 'tests']
+                     RETURN {from: PARSE_IDENTIFIER(e._from).key, to: PARSE_IDENTIFIER(e._to).key,
+                             pinned_version: e.pinned_version}",
                     json!({"@c": coll}),
                     trx,
                 )
                 .await?;
             for r in rows {
+                let (from, to) = (
+                    r["from"].as_str().unwrap_or_default().to_string(),
+                    r["to"].as_str().unwrap_or_default().to_string(),
+                );
+                // edges to nodes outside this project version (planned, removed) are not part
+                // of its graph
+                if !g.symbols.contains_key(&from) || !g.symbols.contains_key(&to) {
+                    continue;
+                }
                 g.edges.push(CodeEdge {
-                    from: r["from"].as_str().unwrap_or_default().into(),
-                    to: r["to"].as_str().unwrap_or_default().into(),
+                    from,
+                    to,
                     kind: CodeEdgeKind::from_collection(coll).expect("code edge"),
-                    pinned_version: r["pinned_version"].as_str().map(String::from),
+                    pinned_version: r["pinned_version"].as_str().map(|p| key_of(p).to_string()),
                 });
             }
         }
         g.edges.sort();
-        let mut needed: Vec<String> = g.symbols.values().map(|s| s.version.clone()).collect();
-        needed.extend(g.edges.iter().filter_map(|e| e.pinned_version.clone()));
-        needed.sort();
-        needed.dedup();
-        let versions = self
-            .db
-            .aql(
-                "FOR v IN @@versions FILTER v._key IN @keys RETURN v",
-                json!({"keys": needed}),
-                trx,
-            )
-            .await?;
-        for v in versions {
-            let key = v["_key"].as_str().unwrap_or_default().to_string();
-            g.versions.insert(key, version_content_from_doc(&v)?);
+        let pinned: Vec<String> = g
+            .edges
+            .iter()
+            .filter_map(|e| e.pinned_version.clone())
+            .filter(|p| !g.versions.contains_key(p))
+            .collect();
+        if !pinned.is_empty() {
+            for (k, v) in self.load_versions(&pinned).await? {
+                g.versions.insert(k, v);
+            }
         }
         Ok(g)
     }
 
+    /// The current project version's code graph.
     pub async fn load_code_graph(&self) -> Result<CodeGraph> {
-        self.load_code_graph_in(None).await
+        self.load_code_graph_at(None).await
     }
 
-    /// Load arbitrary versions by hash.
+    /// Load code and test versions by key or id.
     pub async fn load_versions(&self, keys: &[String]) -> Result<BTreeMap<String, VersionContent>> {
+        let keys: Vec<String> = keys.iter().map(|k| key_of(k).to_string()).collect();
         let rows = self
             .aql(
-                "FOR v IN @@versions FILTER v._key IN @keys RETURN v",
+                "FOR v IN UNION((FOR x IN @@code_versions FILTER x._key IN @keys RETURN x),
+                                (FOR x IN @@test_versions FILTER x._key IN @keys RETURN x))
+                 RETURN v",
                 json!({"keys": keys}),
             )
             .await?;
@@ -790,125 +841,133 @@ impl Store {
             .collect()
     }
 
-    /// Recompute closure hashes for every symbol and store the changed ones.
-    pub async fn refresh_closure_hashes(&self, trx: Option<&str>) -> Result<usize> {
-        let g = self.load_code_graph_in(trx).await?;
-        // A pin conflict in one closure must not block every write: that symbol's closure hash
-        // becomes null (its tests show as not run) until the conflict is resolved.
-        let pairs: Vec<Value> = g
-            .symbols
-            .keys()
-            .map(|k| json!({"k": k, "h": g.closure_hash(k).ok()}))
-            .collect();
-        let updated = self
-            .db
-            .aql(
-                "FOR p IN @pairs LET s = DOCUMENT(@@symbols, p.k)
-                   FILTER s.closure_hash != p.h
-                   UPDATE p.k WITH {closure_hash: p.h} IN @@symbols RETURN 1",
-                json!({"pairs": pairs}),
-                trx,
-            )
-            .await?;
-        Ok(updated.len())
-    }
-
-    /// Invariant report. Empty means healthy.
+    /// Invariant report for the current project version. Empty means healthy.
     pub async fn check_invariants(&self) -> Result<Vec<String>> {
         let mut problems = Vec::new();
+        let pv = self.current_version().await?;
+        // a node appears at most once in a tree (hard rule 1, D-057)
         let rows = self
             .aql(
-                "FOR n IN UNION(
-                    (FOR s IN @@symbols RETURN s._id), (FOR c IN @@components RETURN c._id),
-                    (FOR c IN @@containers RETURN c._id), (FOR c IN @@contexts RETURN c._id))
-                   LET k = LENGTH(FOR e IN @@has_version FILTER e._from == n AND e.state == 'stable' RETURN 1)
-                   FILTER k > 1 RETURN {n, k}",
-                json!({}),
+                "FOR v IN 1..8 OUTBOUND @pv @@contains
+                   COLLECT node = v.node WITH COUNT INTO n FILTER n > 1 RETURN {node, n}",
+                json!({"pv": pv}),
             )
             .await?;
         for r in rows {
             problems.push(format!(
-                "{} has {} stable versions (expected at most 1)",
-                r["n"], r["k"]
+                "{} appears {} times in {pv} (expected at most once)",
+                r["node"], r["n"]
             ));
         }
+        // every version in the tree is a version of its node
         let rows = self
             .aql(
-                "FOR s IN @@symbols
-                   LET k = LENGTH(FOR e IN @@has_version FILTER e._from == s._id AND e.state == 'stable' RETURN 1)
-                   FILTER k == 0 AND s.lifecycle != 'planned' RETURN s._key",
-                json!({}),
+                "FOR v IN 1..8 OUTBOUND @pv @@contains
+                   LET ok = LENGTH(FOR e IN @@has_version FILTER e._from == v.node AND e._to == v._id RETURN 1) > 0
+                   FILTER !ok RETURN v._id",
+                json!({"pv": pv}),
             )
             .await?;
         for r in rows {
-            problems.push(format!(
-                "symbol {r} has no stable version and is not planned"
-            ));
+            problems.push(format!("{r} is in the tree but not a version of its node"));
         }
+        // every C4 version lists exactly the children its edges hold
         let rows = self
             .aql(
-                "FOR e1 IN @@has_version FILTER e1.validFrom != null
-                   FOR e2 IN @@has_version FILTER e2._from == e1._from AND e2._key > e1._key AND e2.validFrom != null
-                     FILTER e1.validFrom < (e2.validTo || '9999') AND e2.validFrom < (e1.validTo || '9999')
-                     RETURN {n: e1._from, a: e1.seq, b: e2.seq}",
-                json!({}),
+                "FOR v IN 1..7 OUTBOUND @pv @@contains
+                   FILTER v.children != null
+                   LET kids = (FOR c IN 1..1 OUTBOUND v @@contains SORT c._id RETURN c._id)
+                   FILTER kids != v.children RETURN v._id",
+                json!({"pv": pv}),
             )
             .await?;
         for r in rows {
-            problems.push(format!(
-                "{} has overlapping validity for versions {} and {}",
-                r["n"], r["a"], r["b"]
-            ));
-        }
-        // invariant 5: a release is in at most one environment; single-slot environments hold one
-        let rows = self
-            .aql(
-                "FOR e IN @@in_environment FILTER e.validTo == null COLLECT r = e._from WITH COUNT INTO n
-                   FILTER n > 1 RETURN {r, n}",
-                json!({}),
-            )
-            .await?;
-        for r in rows {
-            problems.push(format!("release {} is in {} environments", r["r"], r["n"]));
-        }
-        let rows = self
-            .aql(
-                "FOR env IN @@environments FILTER env.max_releases != null
-                   LET n = LENGTH(FOR e IN @@in_environment FILTER e._to == env._id AND e.validTo == null RETURN 1)
-                   FILTER n > env.max_releases RETURN {env: env._key, n, max: env.max_releases}",
-                json!({}),
-            )
-            .await?;
-        for r in rows {
-            problems.push(format!(
-                "environment {} holds {} releases (max {})",
-                r["env"], r["n"], r["max"]
-            ));
+            problems.push(format!("{r}: child edges differ from its children list"));
         }
         Ok(problems)
     }
 
-    /// Version history of a symbol, newest first.
+    /// Versions of a code or test node, newest first, with the project versions holding each.
     pub async fn version_history(&self, symbol_key: &str) -> Result<Vec<Value>> {
-        self.aql(
-            "LET sid = CONCAT(@pfx, 'symbols/', @k)
-             FOR e IN @@has_version FILTER e._from == sid AND e.state IN ['stable', 'retired', 'candidate']
-               SORT e.seq DESC
-               RETURN MERGE(UNSET(DOCUMENT(e._to), '_id', '_rev'),
-                            {seq: e.seq, state: e.state, current: e.state == 'stable',
-                             since: e.validFrom, until: e.validTo, changeset: e.changeset})",
-            json!({"k": symbol_key}),
-        )
-        .await
+        let node = self.symbol_id(symbol_key).await?;
+        let rows = self
+            .aql(
+                "FOR e IN @@has_version FILTER e._from == @n SORT e.seq DESC
+                   RETURN MERGE(UNSET(DOCUMENT(e._to), '_id', '_rev'),
+                                {seq: e.seq, state: e.state, work_item: e.work_item,
+                                 version_id: e._to, created_at: e.created_at})",
+                json!({"n": node}),
+            )
+            .await?;
+        let cur = self.tree(None).await?.version(&node).map(str::to_string);
+        let mut out = Vec::new();
+        let mut in_versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for pv in self.list_project_versions().await? {
+            let id = pv["_id"].as_str().unwrap_or_default().to_string();
+            if let Some(v) = self.tree(Some(&id)).await?.version(&node) {
+                in_versions
+                    .entry(v.to_string())
+                    .or_default()
+                    .push(pv["name"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        for mut r in rows {
+            let vid = r["version_id"].as_str().unwrap_or_default().to_string();
+            r["current"] = json!(cur.as_deref() == Some(vid.as_str()));
+            r["project_versions"] = json!(in_versions.get(&vid).cloned().unwrap_or_default());
+            out.push(r);
+        }
+        Ok(out)
     }
 
-    /// Namespaces with their exposed symbols: (name, [(symbol key, public name)]).
+    /// Record a test execution (or, with `kind: run`, an ad-hoc run) as an immutable
+    /// `test_logs` entry, with `logs_to` edges from the version it ran (`test_version` /
+    /// `version` key) and from the build that produced its artifact, when known.
+    pub async fn record_test_log(&self, mut doc: Value, build: Option<&str>) -> Result<Value> {
+        if doc.get("kind").is_none() {
+            doc["kind"] = json!("test");
+        }
+        if doc.get("ran_at").is_none() {
+            doc["ran_at"] = json!(now_iso());
+        }
+        if let Some(k) = doc.get("_key").and_then(Value::as_str) {
+            doc["_key"] = json!(self.db.pkey(k)?);
+        }
+        let created = self.db.insert("test_logs", &doc, None).await?;
+        let id = created["_id"].as_str().unwrap_or_default().to_string();
+        let from = if doc["kind"] == "run" {
+            doc["version"]
+                .as_str()
+                .map(|v| format!("code_versions/{}", key_of(v)))
+        } else {
+            doc["test_version"]
+                .as_str()
+                .map(|v| format!("test_versions/{}", key_of(v)))
+        };
+        for f in from.into_iter().chain(build.map(str::to_string)) {
+            if self.get_node(&f).await.is_ok() {
+                self.db
+                    .insert_ignore(
+                        "logs_to",
+                        &json!({"_key": edge_key("logs_to", &f, &id), "_from": f, "_to": id}),
+                        None,
+                    )
+                    .await?;
+            }
+        }
+        Ok(created)
+    }
+
+    /// Namespaces with their exposed symbols: (name, [(symbol key, public name)]). The
+    /// projection lives on the code nodes (`namespace`, `public_name`).
     pub async fn namespaces(&self) -> Result<Vec<(String, Vec<(String, String)>)>> {
         let rows = self
             .aql(
-                "FOR n IN @@namespaces SORT n.name
-                 RETURN {name: n.name, exposes: (FOR e IN @@exposes FILTER e._from == n._id
-                          RETURN [PARSE_IDENTIFIER(e._to).key, e.public_name])}",
+                "FOR s IN @@code FILTER s.namespace != null
+                   COLLECT ns = s.namespace INTO g
+                   SORT ns
+                   RETURN {name: ns, exposes: (FOR x IN g SORT x.s._key
+                            RETURN [x.s._key, x.s.public_name || x.s.display_name])}",
                 json!({}),
             )
             .await?;
@@ -930,9 +989,10 @@ impl Store {
     pub async fn symbol_by_name(&self, language: Option<Language>, name: &str) -> Result<Value> {
         let rows = self
             .aql(
-                "FOR s IN @@symbols FILTER (s.display_name == @n OR s._key == @n) AND (@l == null OR s.language == @l)
+                "FOR s IN UNION((FOR x IN @@code RETURN x), (FOR x IN @@tests RETURN x))
+                   FILTER (s.display_name == @n OR s._key == @k) AND (@l == null OR s.language == @l)
                  RETURN s",
-                json!({"n": name, "l": language}),
+                json!({"n": name, "k": self.db.pkey(name)?, "l": language}),
             )
             .await?;
         match rows.len() {
@@ -946,6 +1006,97 @@ impl Store {
 
     // ---------------------------------------------------------------- requirements & decisions
 
+    /// Requirement fields that are versioned content (the rest is identity and bookkeeping).
+    pub const REQUIREMENT_CONTENT: &'static [&'static str] = &[
+        "title",
+        "statement",
+        "intent",
+        "constraints",
+        "examples",
+        "edge_cases",
+        "out_of_scope",
+        "kind",
+        "tags",
+        "rationale",
+        "alternatives",
+    ];
+
+    fn requirement_content(doc: &Value) -> Value {
+        let mut c = serde_json::Map::new();
+        for f in Self::REQUIREMENT_CONTENT {
+            if let Some(v) = doc.get(*f) {
+                c.insert((*f).into(), v.clone());
+            }
+        }
+        Value::Object(c)
+    }
+
+    /// Write a requirement version (immutable) with its `has_version` edge.
+    #[allow(clippy::too_many_arguments)]
+    async fn put_requirement_version(
+        &self,
+        req_id: &str,
+        revision: i64,
+        content: &Value,
+        state: &str,
+        by: &str,
+        extra: Value,
+        trx: Option<&str>,
+    ) -> Result<Value> {
+        let key = self.db.pkey(&format!(
+            "{}-r{revision}-{}",
+            crate::arango::local_key(key_of(req_id)),
+            &uuid::Uuid::new_v4().simple().to_string()[..6]
+        ))?;
+        let mut doc = json!({
+            "_key": key, "requirement": req_id, "revision": revision, "state": state,
+            "content": content, "content_hash": kodehub_core::canonical::hash_value(content),
+            "created_at": now_iso(), "created_by": by,
+        });
+        if let (Some(d), Some(e)) = (doc.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                d.insert(k.clone(), v.clone());
+            }
+        }
+        let v = self.db.insert("requirement_versions", &doc, trx).await?;
+        let vid = v["_id"].as_str().unwrap_or_default().to_string();
+        self.db
+            .insert(
+                "has_version",
+                &json!({"_key": edge_key("has_version", req_id, &vid), "_from": req_id, "_to": vid,
+                        "seq": revision,
+                        "state": if state == "accepted" { "accepted" } else if state == "proposed" { "candidate" } else { "discarded" },
+                        "created_at": now_iso(), "created_by": by}),
+                trx,
+            )
+            .await?;
+        Ok(v)
+    }
+
+    /// `put_requirement_version` for other modules (governance).
+    pub(crate) async fn put_requirement_version_pub(
+        &self,
+        req_id: &str,
+        revision: i64,
+        doc: &Value,
+        state: &str,
+        by: &str,
+        extra: Value,
+    ) -> Result<Value> {
+        self.put_requirement_version(
+            req_id,
+            revision,
+            &Self::requirement_content(doc),
+            state,
+            by,
+            extra,
+            None,
+        )
+        .await
+    }
+
+    /// Create a requirement: its node (holding the current content for fast reads) and its
+    /// first version. `state: proposed` creates one waiting for a human (see `governance`).
     pub async fn create_requirement(&self, mut doc: Value) -> Result<Value> {
         if doc
             .get("statement")
@@ -956,9 +1107,17 @@ impl Store {
             return Err(StoreError::Invalid("requirement needs a statement".into()));
         }
         if doc.get("_key").is_none() {
-            doc["_key"] = json!(new_key("req"));
+            doc["_key"] = json!(self.db.pkey(&new_key("req"))?);
+        } else if let Some(k) = doc["_key"].as_str() {
+            doc["_key"] = json!(self.db.pkey(k)?);
         }
-        for f in ["constraints", "examples", "edge_cases", "out_of_scope"] {
+        for f in [
+            "constraints",
+            "examples",
+            "edge_cases",
+            "out_of_scope",
+            "tags",
+        ] {
             if doc.get(f).is_none() {
                 doc[f] = json!([]);
             }
@@ -969,23 +1128,51 @@ impl Store {
             || !kind.chars().all(|c| c.is_ascii_lowercase() || c == '_')
         {
             return Err(StoreError::Invalid(
-                "requirement kind is a lower-case word (business, technical, …)".into(),
+                "requirement kind is a lower-case word (business, technical, decision, …)".into(),
             ));
         }
         doc["kind"] = json!(kind);
         doc["revision"] = json!(1);
         doc["at_risk"] = json!(false);
-        // nothing is covered until a merged changeset brings a verifying test (final review #7)
+        if doc.get("state").is_none() {
+            doc["state"] = json!("accepted");
+        }
+        // nothing is covered until an accepted proposal brings a verifying test (final review #7)
         if doc.get("covered_revision").is_none() {
             doc["covered_revision"] = json!(0);
         }
         doc["created_at"] = json!(now_iso());
         doc["updated_at"] = doc["created_at"].clone();
-        self.db.insert("requirements", &doc, None).await
+        let by = doc["created_by"].as_str().unwrap_or("human").to_string();
+        let created = self
+            .db
+            .insert("requirements", &doc, None)
+            .await
+            .map_err(|e| {
+                if e.is_unique_violation() {
+                    StoreError::Conflict(format!("requirement `{}` exists", doc["_key"]))
+                } else {
+                    e
+                }
+            })?;
+        let id = created["_id"].as_str().unwrap_or_default().to_string();
+        let state = doc["state"].as_str().unwrap_or("accepted").to_string();
+        self.put_requirement_version(
+            &id,
+            1,
+            &Self::requirement_content(&doc),
+            &state,
+            &by,
+            json!({}),
+            None,
+        )
+        .await?;
+        self.own(&id).await?;
+        Ok(created)
     }
 
-    /// Edit a requirement: snapshot the prior revision into `requirement_history`, bump
-    /// `revision`. Returns the new document. A patch that changes nothing is a no-op.
+    /// Edit a requirement: a new accepted version (revision + 1) and the node's current
+    /// content updated. Returns the new document. A patch that changes nothing is a no-op.
     pub async fn update_requirement(
         &self,
         key: &str,
@@ -993,27 +1180,24 @@ impl Store {
         edited_by: &str,
         mark_at_risk: bool,
     ) -> Result<(Value, bool)> {
-        const EDITABLE: &[&str] = &[
-            "title",
-            "statement",
-            "intent",
-            "constraints",
-            "examples",
-            "edge_cases",
-            "out_of_scope",
-            "kind",
-        ];
         let obj = patch
             .as_object()
             .ok_or_else(|| StoreError::Invalid("patch must be an object".into()))?;
-        if let Some(bad) = obj.keys().find(|k| !EDITABLE.contains(&k.as_str())) {
+        if let Some(bad) = obj
+            .keys()
+            .find(|k| !Self::REQUIREMENT_CONTENT.contains(&k.as_str()))
+        {
             return Err(StoreError::Invalid(format!(
                 "requirement field `{bad}` is not editable"
             )));
         }
+        let key = &self.db.pkey(key_of(key))?;
         let trx = self
             .db
-            .begin(&["requirements", "requirement_history"], &[])
+            .begin(
+                &["requirements", "requirement_versions", "has_version"],
+                &[],
+            )
             .await?;
         let res: Result<(Value, bool)> = async {
             let cur = self.db.get("requirements", key, Some(&trx)).await?;
@@ -1021,26 +1205,24 @@ impl Store {
             if !changed {
                 return Ok((cur, false));
             }
-            let rev = cur["revision"].as_i64().unwrap_or(1);
-            let mut snapshot = cur.clone();
-            for f in ["_id", "_rev"] {
-                snapshot.as_object_mut().unwrap().remove(f);
+            let rev = cur["revision"].as_i64().unwrap_or(1) + 1;
+            let mut next = cur.clone();
+            for (k, v) in obj {
+                next[k] = v.clone();
             }
-            self.db
-                .insert(
-                    "requirement_history",
-                    &json!({
-                        "requirement": key,
-                        "revision": rev,
-                        "snapshot": snapshot,
-                        "superseded_at": now_iso(),
-                        "superseded_by": edited_by,
-                    }),
-                    Some(&trx),
-                )
-                .await?;
+            let id = cur["_id"].as_str().unwrap_or_default().to_string();
+            self.put_requirement_version(
+                &id,
+                rev,
+                &Self::requirement_content(&next),
+                "accepted",
+                edited_by,
+                json!({}),
+                Some(&trx),
+            )
+            .await?;
             let mut p = patch.clone();
-            p["revision"] = json!(rev + 1);
+            p["revision"] = json!(rev);
             p["updated_at"] = json!(now_iso());
             p["updated_by"] = json!(edited_by);
             if mark_at_risk {
@@ -1069,40 +1251,60 @@ impl Store {
             .map(|_| ())
     }
 
+    /// Every version of a requirement, newest first (accepted, proposed and rejected).
     pub async fn requirement_history(&self, key: &str) -> Result<Vec<Value>> {
         self.aql(
-            "FOR h IN @@requirement_history FILTER h.requirement == @k SORT h.revision DESC RETURN h",
-            json!({"k": key}),
+            "FOR v IN @@requirement_versions FILTER v.requirement == CONCAT('requirements/', @k)
+               SORT v.revision DESC, v.created_at DESC
+               RETURN MERGE(v, {snapshot: v.content})",
+            json!({"k": self.db.pkey(key_of(key))?}),
         )
         .await
     }
 
-    pub async fn create_decision(&self, mut doc: Value, justifies: &[String]) -> Result<Value> {
-        if doc
+    /// Record a decision: a requirement of kind `decision` (docs/ontology.md), applying to the
+    /// nodes it justifies.
+    pub async fn create_decision(&self, doc: Value, justifies: &[String]) -> Result<Value> {
+        let title = doc
             .get("title")
             .and_then(Value::as_str)
             .unwrap_or("")
-            .is_empty()
-        {
+            .to_string();
+        if title.is_empty() {
             return Err(StoreError::Invalid("decision needs a title".into()));
         }
-        if doc.get("_key").is_none() {
-            doc["_key"] = json!(new_key("dec"));
+        let mut r = json!({
+            "kind": "decision",
+            "title": title,
+            "statement": doc["choice"].as_str().or(doc["statement"].as_str()).unwrap_or(&title),
+            "rationale": doc["rationale"],
+            "alternatives": doc.get("alternatives").cloned().unwrap_or(json!([])),
+            "made_by": doc.get("made_by").cloned().unwrap_or(json!("human")),
+            "tags": doc.get("tags").cloned().unwrap_or(json!([])),
+            "covered_revision": 1,
+        });
+        if let Some(k) = doc.get("_key") {
+            r["_key"] = k.clone();
+        } else {
+            r["_key"] = json!(self.db.pkey(&new_key("dec"))?);
         }
-        if doc.get("made_by").is_none() {
-            doc["made_by"] = json!("human");
-        }
-        if doc.get("alternatives").is_none() {
-            doc["alternatives"] = json!([]);
-        }
-        doc["created_at"] = json!(now_iso());
-        let d = self.db.insert("decisions", &doc, None).await?;
+        let d = self.create_requirement(r).await?;
         let did = d["_id"].as_str().unwrap_or_default().to_string();
-        for from in justifies {
-            self.insert_edge("justified_by", from, &did, json!({}))
-                .await?;
+        for n in justifies {
+            self.insert_edge("applies_to", &did, n, json!({})).await?;
         }
         Ok(d)
+    }
+
+    /// Decisions (requirements of kind `decision`) with the nodes they apply to.
+    pub async fn list_decisions(&self) -> Result<Vec<Value>> {
+        self.aql(
+            "FOR r IN @@requirements FILTER r.kind == 'decision' SORT r.created_at DESC
+               RETURN MERGE(r, {choice: r.statement,
+                                justifies: (FOR e IN @@applies_to FILTER e._from == r._id RETURN e._to)})",
+            json!({}),
+        )
+        .await
     }
 }
 

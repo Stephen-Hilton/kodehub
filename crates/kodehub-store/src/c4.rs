@@ -1,10 +1,11 @@
-//! The C4 layer of v0.1 (spec §5.1–5.2, §7, §14.4, §15): the philosophy document, versions of
-//! contexts / containers / components, requirement kinds and inheritance, per-node requirement
-//! counts, use cases, and node lifecycle states with roll-up.
+//! The C4 layer (spec §5.1–5.2, §7, §14.4, §15; docs/ontology.md): the philosophy document,
+//! C4 node definitions (versioned through the tree, `tree.rs`), requirement kinds and
+//! inheritance, per-node requirement and test counts, use cases, and node lifecycle states with
+//! roll-up.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kodehub_core::model::now_iso;
+use kodehub_core::model::{now_iso, Kind};
 use serde_json::{json, Value};
 
 use crate::store::{edge_key, key_of};
@@ -13,11 +14,27 @@ use crate::{Result, Store, StoreError};
 /// C4 levels above code, top first.
 pub const C4_COLLECTIONS: &[&str] = &["contexts", "containers", "components"];
 
-/// The singular philosophy node of a project; also the root of its C4 graph.
-pub const PHILOSOPHY_ID: &str = "philosophy/philosophy";
+/// Local key of the singular philosophy node of a project (its id is
+/// `philosophy/<project>.philosophy`, see `Store::philosophy_id`).
+pub const PHILOSOPHY_KEY: &str = "philosophy";
 
-/// Requirement kinds known today; the field is open so the list can grow (spec §7.1).
-pub const REQUIREMENT_KINDS: &[&str] = &["business", "technical"];
+/// The philosophy node's id in `project`.
+pub fn philosophy_id_of(project: &str) -> String {
+    format!(
+        "philosophy/{}",
+        crate::arango::qualify(project, PHILOSOPHY_KEY)
+    )
+}
+
+/// The project's own node (`projects/<id>`): the root of its C4 hierarchy and the target of
+/// project-level work.
+pub fn project_node_of(project: &str) -> String {
+    format!("{}/{project}", crate::schema::PROJECTS)
+}
+
+/// Requirement kinds known today; the field is open so the list can grow (spec §7.1). A
+/// `decision` is a recorded choice with its rationale (D-062 / ontology mapping).
+pub const REQUIREMENT_KINDS: &[&str] = &["business", "technical", "decision"];
 
 /// Lifecycle states in order (spec §14.4).
 pub const LIFECYCLE: &[&str] = &["planned", "in_build", "ready_for_test", "live"];
@@ -28,11 +45,12 @@ fn rank(s: &str) -> usize {
 
 pub fn level_of(id: &str) -> &'static str {
     match id.split_once('/').map(|x| x.0) {
-        Some("philosophy") => "project",
+        Some("projects") | Some("philosophy") => "project",
         Some("contexts") => "context",
         Some("containers") => "container",
         Some("components") => "component",
-        Some("symbols") => "code",
+        Some("code") => "code",
+        Some("tests") => "test",
         _ => "other",
     }
 }
@@ -82,10 +100,37 @@ pub fn roll_up(states: &[&str]) -> &'static str {
 }
 
 impl Store {
+    /// The active project's node (`projects/<id>`).
+    pub fn project_node(&self) -> Result<String> {
+        Ok(project_node_of(&self.db.require_project()?))
+    }
+
+    /// Record that the project owns a top-level node (`owns`, for traversal from the project).
+    pub async fn own(&self, id: &str) -> Result<()> {
+        let p = self.project_node()?;
+        self.db
+            .insert_ignore(
+                "owns",
+                &json!({"_key": edge_key("owns", &p, id), "_from": p, "_to": id,
+                        "created_at": now_iso()}),
+                None,
+            )
+            .await
+    }
+
     // ------------------------------------------------------------------ philosophy
 
+    /// The philosophy node's id in the active project.
+    pub fn philosophy_id(&self) -> Result<String> {
+        self.db.pid("philosophy", PHILOSOPHY_KEY)
+    }
+
     pub async fn get_philosophy(&self) -> Result<Option<Value>> {
-        match self.db.get("philosophy", "philosophy", None).await {
+        match self
+            .db
+            .get("philosophy", &self.db.pkey(PHILOSOPHY_KEY)?, None)
+            .await
+        {
             Ok(v) => Ok(Some(v)),
             Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e),
@@ -124,135 +169,94 @@ impl Store {
                     patch["raw_transcript"] = json!(r);
                 }
                 self.db
-                    .patch("philosophy", "philosophy", &patch, None)
+                    .patch("philosophy", &self.db.pkey(PHILOSOPHY_KEY)?, &patch, None)
                     .await
             }
             None => {
                 self.db
                     .insert(
                         "philosophy",
-                        &json!({"_key": "philosophy", "title": title.unwrap_or("Philosophy"),
+                        &json!({"_key": self.db.pkey(PHILOSOPHY_KEY)?, "title": title.unwrap_or("Philosophy"),
                                 "text": text.trim(), "raw_transcript": raw_transcript,
                                 "revision": 1, "history": [], "created_at": now,
                                 "updated_at": now, "updated_by": by}),
                         None,
                     )
                     .await?;
-                self.db.get("philosophy", "philosophy", None).await
+                self.own(&self.philosophy_id()?).await?;
+                self.db
+                    .get("philosophy", &self.db.pkey(PHILOSOPHY_KEY)?, None)
+                    .await
             }
         }
     }
 
-    // ------------------------------------------------------------------ C4 versions
+    // ------------------------------------------------------------------ C4 definitions
 
-    /// Make the node's stable C4 version match its current definition, creating an immutable
-    /// `c4_versions` node and moving the SCD edge when it changed. Returns the version hash.
-    pub async fn sync_c4_version(&self, collection: &str, key: &str, by: &str) -> Result<String> {
+    /// Give a C4 node a version matching its current definition in the current project
+    /// version (the node must be placed: a `contains` edge from its parent). Returns the
+    /// version id, or `None` while the node is not placed.
+    pub async fn sync_c4_version(
+        &self,
+        collection: &str,
+        key: &str,
+        by: &str,
+    ) -> Result<Option<String>> {
         if !C4_COLLECTIONS.contains(&collection) {
             return Err(StoreError::Invalid(format!(
                 "{collection} is not a C4 level"
             )));
         }
+        let key = &self.db.pkey(key)?;
         let doc = self.db.get(collection, key, None).await?;
-        let def = c4_definition(collection, &doc);
-        let hash = c4_hash(&def);
         let node_id = format!("{collection}/{key}");
-        if self.stable_version_in(&node_id, None).await?.as_deref() == Some(hash.as_str()) {
-            return Ok(hash);
+        let placed = !self
+            .aql(
+                "FOR e IN @@contains FILTER e._to == @n LIMIT 1 RETURN 1",
+                json!({"n": node_id}),
+            )
+            .await?
+            .is_empty();
+        if !placed {
+            return Ok(None);
         }
-        let trx = self.db.begin(&["c4_versions", "has_version"], &[]).await?;
-        let res: Result<()> = async {
-            self.db
-                .insert_ignore(
-                    "c4_versions",
-                    &json!({"_key": hash, "content_hash": hash, "definition": def,
-                            "created_at": now_iso(), "created_by": by}),
-                    Some(&trx),
-                )
-                .await?;
-            self.promote_in(&node_id, "c4_versions", &hash, None, by, &trx)
-                .await?;
-            Ok(())
-        }
-        .await;
-        match res {
-            Ok(()) => {
-                self.db.commit(&trx).await?;
-                Ok(hash)
-            }
-            Err(e) => {
-                let _ = self.db.abort(&trx).await;
-                Err(e)
+        let def = c4_definition(collection, &doc);
+        let tree = self.tree(None).await?;
+        let hash = c4_hash(&def);
+        if let Some(v) = tree.version(&node_id) {
+            if tree.content_hash.get(v) == Some(&hash) {
+                return Ok(Some(v.to_string()));
             }
         }
+        let mut ch = crate::tree::TreeChanges::default();
+        ch.defs.insert(node_id.clone(), def);
+        let t = self.apply_tree_changes(None, &ch, by, None).await?;
+        Ok(t.version(&node_id).map(str::to_string))
     }
 
-    /// Sync every context, container and component (after a seed or import).
+    /// Place every node and refresh every definition in the current project version (after a
+    /// seed or an import).
     pub async fn sync_all_c4_versions(&self, by: &str) -> Result<usize> {
-        let mut n = 0;
-        for coll in C4_COLLECTIONS {
-            let keys = self
-                .aql("FOR d IN @@c RETURN d._key", json!({"@c": coll}))
-                .await?;
-            for k in keys.iter().filter_map(Value::as_str) {
-                self.sync_c4_version(coll, k, by).await?;
-                n += 1;
-            }
-        }
-        Ok(n)
+        self.sync_tree(by).await
     }
 
     // ------------------------------------------------------------------ requirements
 
-    /// Every requirement that applies to a node: its own plus everything inherited from its
-    /// ancestors up to the project (spec §7.2), nearest first. Groups are expanded.
-    pub async fn requirements_for(&self, node_id: &str) -> Result<Value> {
-        let chain = self.ancestors(node_id).await?;
-        let mut seen = BTreeSet::new();
-        let mut rows = Vec::new();
-        for (distance, n) in chain.iter().enumerate() {
-            let direct = self
-                .aql(
-                    "FOR e IN @@satisfies FILTER e._from == @n
-                       LET t = DOCUMENT(e._to)
-                       LET reqs = STARTS_WITH(e._to, CONCAT(@pfx, 'requirement_groups/'))
-                         ? (FOR r IN 1..5 OUTBOUND e._to @@includes
-                              FILTER STARTS_WITH(r._id, CONCAT(@pfx, 'requirements/')) RETURN r)
-                         : [t]
-                       FOR r IN reqs RETURN {r, via: e._to}",
-                    json!({"n": n}),
-                )
-                .await?;
-            for row in direct {
-                let r = &row["r"];
-                let id = r["_id"].as_str().unwrap_or_default().to_string();
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-                rows.push(json!({
-                    "id": id, "key": r["_key"], "title": r["title"], "statement": r["statement"],
-                    "kind": r["kind"].as_str().unwrap_or("technical"),
-                    "attached_to": n, "attached_level": level_of(n),
-                    "inherited": distance > 0, "distance": distance, "via": row["via"],
-                }));
-            }
-        }
-        Ok(json!({
-            "node": node_id, "chain": chain, "requirements": rows,
-            "philosophy": self.get_philosophy().await?.map(|p| p["text"].clone()),
-        }))
-    }
-
-    /// The node itself and its ancestors up to the philosophy root, nearest first.
+    /// The node itself and its ancestors up to the project node, nearest first (identity
+    /// hierarchy, so planned nodes have ancestors too; a method's class comes first).
     pub async fn ancestors(&self, node_id: &str) -> Result<Vec<String>> {
+        let node_id = &self.db.qid(node_id)?;
         let mut chain = vec![node_id.to_string()];
         let mut cur = node_id.to_string();
+        let project = self.project_node()?;
         for _ in 0..12 {
             let parent = self
                 .aql(
-                    "LET p = FIRST(FOR e IN @@contains FILTER e._to == @n RETURN e._from)
-                     LET c = FIRST(FOR e IN @@member_of FILTER e._from == @n RETURN e._to)
-                     RETURN p || c",
+                    "LET c = FIRST(FOR e IN @@member_of FILTER e._from == @n RETURN e._to)
+                     LET p = FIRST(FOR e IN @@contains FILTER e._to == @n
+                                     AND PARSE_IDENTIFIER(e._from).collection IN ['projects', 'contexts', 'containers', 'components']
+                                     RETURN e._from)
+                     RETURN c || p",
                     json!({"n": cur}),
                 )
                 .await?
@@ -267,30 +271,55 @@ impl Store {
                 _ => break,
             }
         }
-        if !chain.iter().any(|c| c == PHILOSOPHY_ID) && self.get_philosophy().await?.is_some() {
-            chain.push(PHILOSOPHY_ID.to_string());
+        if !chain.contains(&project) {
+            chain.push(project);
         }
         Ok(chain)
     }
 
-    /// Requirement counts per node (spec §8.3): own and own-plus-children, by kind.
-    pub async fn requirement_counts(&self) -> Result<BTreeMap<String, Value>> {
-        let sat = self
-            .aql(
-                "FOR e IN @@satisfies
-                   LET reqs = STARTS_WITH(e._to, CONCAT(@pfx, 'requirement_groups/'))
-                     ? (FOR r IN 1..5 OUTBOUND e._to @@includes
-                          FILTER STARTS_WITH(r._id, CONCAT(@pfx, 'requirements/')) RETURN r)
-                     : [DOCUMENT(e._to)]
-                   FOR r IN reqs FILTER r != null
-                   RETURN {n: e._from, r: r._id, kind: r.kind || 'technical'}",
-                json!({}),
-            )
-            .await?;
+    /// Every requirement that applies to a node: its own plus everything inherited from its
+    /// ancestors up to the project (spec §7.2), nearest first.
+    pub async fn requirements_for(&self, node_id: &str) -> Result<Value> {
+        let node_id = &self.db.qid(node_id)?;
+        let chain = self.ancestors(node_id).await?;
+        let mut seen = BTreeSet::new();
+        let mut rows = Vec::new();
+        for (distance, n) in chain.iter().enumerate() {
+            let direct = self
+                .aql(
+                    "FOR e IN @@applies_to FILTER e._to == @n LET r = DOCUMENT(e._from)
+                       FILTER r != null SORT r.title RETURN r",
+                    json!({"n": n}),
+                )
+                .await?;
+            for r in direct {
+                let id = r["_id"].as_str().unwrap_or_default().to_string();
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                rows.push(json!({
+                    "id": id, "key": r["_key"], "title": r["title"], "statement": r["statement"],
+                    "kind": r["kind"].as_str().unwrap_or("technical"), "tags": r["tags"],
+                    "attached_to": n, "attached_level": level_of(n),
+                    "inherited": distance > 0, "distance": distance,
+                }));
+            }
+        }
+        Ok(json!({
+            "node": node_id, "chain": chain, "requirements": rows,
+            "philosophy": self.get_philosophy().await?.map(|p| p["text"].clone()),
+        }))
+    }
+
+    /// Identity children of every node (C4 `contains`, and methods under their class).
+    async fn identity_children(&self) -> Result<BTreeMap<String, Vec<String>>> {
         let kids = self
             .aql(
-                "FOR e IN UNION((FOR x IN @@contains RETURN {p: x._from, c: x._to}),
-                                (FOR x IN @@member_of RETURN {p: x._to, c: x._from}))
+                "FOR e IN UNION(
+                    (FOR x IN @@contains
+                       FILTER PARSE_IDENTIFIER(x._from).collection IN ['projects', 'contexts', 'containers', 'components']
+                       RETURN {p: x._from, c: x._to}),
+                    (FOR x IN @@member_of RETURN {p: x._to, c: x._from}))
                    RETURN e",
                 json!({}),
             )
@@ -301,8 +330,21 @@ impl Store {
                 children.entry(p.into()).or_default().push(c.into());
             }
         }
+        Ok(children)
+    }
+
+    /// Requirement counts per node (spec §8.3): own and own-plus-children, by kind.
+    pub async fn requirement_counts(&self) -> Result<BTreeMap<String, Value>> {
+        let applies = self
+            .aql(
+                "FOR e IN @@applies_to LET r = DOCUMENT(e._from) FILTER r != null
+                   RETURN {n: e._to, r: r._id, kind: r.kind || 'technical'}",
+                json!({}),
+            )
+            .await?;
+        let children = self.identity_children().await?;
         let mut own: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
-        for s in &sat {
+        for s in &applies {
             if let (Some(n), Some(r)) = (s["n"].as_str(), s["r"].as_str()) {
                 own.entry(n.into())
                     .or_default()
@@ -325,10 +367,13 @@ impl Store {
         }
         let count = |set: &BTreeSet<(String, String)>| {
             let mut m = serde_json::Map::new();
-            for k in REQUIREMENT_KINDS {
-                m.insert((*k).into(), json!(0));
+            for k in ["business", "technical"] {
+                m.insert(k.into(), json!(0));
             }
             for (_, kind) in set {
+                if kind == "decision" {
+                    continue;
+                }
                 let e = m.entry(kind.clone()).or_insert(json!(0));
                 *e = json!(e.as_u64().unwrap_or(0) + 1);
             }
@@ -345,100 +390,68 @@ impl Store {
         Ok(out)
     }
 
-    /// Test counts per node (spec §8.3, §14.4): `own` (tests reaching a symbol, or tests a C4
-    /// node directly contains) and `total` (everything beneath, rolled up), each with passed /
-    /// failed / total from the latest formal run at the current closure, plus how many of the
-    /// tests have a built bundle.
+    /// Test counts per node (spec §8.3, §14.4) in the current project version: `own` (tests
+    /// reaching a code node, or tests a C4 node directly holds) and `total` (everything
+    /// beneath), each with passed / failed / total from the latest formal run at the current
+    /// closure, plus how many of the tests are built.
     pub async fn test_counts(&self) -> Result<BTreeMap<String, Value>> {
-        let g = self.load_code_graph().await?;
-        let rows = self
-            .aql(
-                "FOR t IN @@symbols FILTER t.kind == 'test'
-                   LET cv = FIRST(FOR e IN @@has_version FILTER e._from == t._id AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key)
-                   LET run = FIRST(FOR r IN @@test_runs FILTER r.test_version == cv AND r.closure_hash == t.closure_hash
-                                     AND r.formal != false SORT r.ran_at DESC LIMIT 1 RETURN r)
-                   LET built = LENGTH(FOR b IN @@built_from FILTER b._to == CONCAT(@pfx, 'versions/', cv) LIMIT 1 RETURN 1) > 0
-                   RETURN {id: t._key, status: run ? run.status : 'not_run', ran_at: run.ran_at, built}",
-                json!({}),
-            )
-            .await?;
-        let status: BTreeMap<String, Value> = rows
-            .into_iter()
-            .filter_map(|r| Some((r["id"].as_str()?.to_string(), r)))
-            .collect();
+        let v = self.view(None).await?;
         let tally = |set: &BTreeSet<String>| {
             let (mut p, mut f, mut b) = (0u64, 0u64, 0u64);
             let mut last: Option<String> = None;
             for t in set {
-                if let Some(r) = status.get(t) {
-                    match r["status"].as_str() {
-                        Some("pass") => p += 1,
-                        Some("fail") => f += 1,
+                if let Some(r) = v.states.get(t) {
+                    match r.status.as_str() {
+                        "pass" => p += 1,
+                        "fail" => f += 1,
                         _ => {}
                     }
-                    if r["built"] == true {
+                    if r.built {
                         b += 1;
                     }
-                    if let Some(at) = r["ran_at"].as_str() {
-                        if last.as_deref().is_none_or(|l| at > l) {
-                            last = Some(at.to_string());
+                    if let Some(at) = &r.ran_at {
+                        if last.as_deref().is_none_or(|l| at.as_str() > l) {
+                            last = Some(at.clone());
                         }
                     }
                 }
             }
             json!({"passed": p, "failed": f, "total": set.len(), "built": b, "last_run": last})
         };
-        let edges = self
-            .aql(
-                "FOR e IN @@contains RETURN {p: e._from, c: e._to}",
-                json!({}),
-            )
-            .await?;
-        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for e in &edges {
-            if let (Some(p), Some(c)) = (e["p"].as_str(), e["c"].as_str()) {
-                children.entry(p.into()).or_default().push(c.into());
-            }
-        }
+        let mut per_leaf: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut out = BTreeMap::new();
-        let mut per_symbol: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for s in g.symbols.values() {
-            let set: BTreeSet<String> = if status.contains_key(&s.id) {
+        for s in v.g.symbols.values() {
+            let set: BTreeSet<String> = if s.kind == Kind::Test {
                 [s.id.clone()].into()
             } else {
-                g.tests_reaching(&s.id).into_iter().collect()
+                v.g.tests_reaching(&s.id).into_iter().collect()
             };
+            let id = crate::queries::node_id(&v.g, &s.id);
             out.insert(
-                format!("symbols/{}", s.id),
+                id.clone(),
                 json!({"own": tally(&set), "total": tally(&set)}),
             );
-            per_symbol.insert(format!("symbols/{}", s.id), set);
+            per_leaf.insert(id, set);
         }
-        fn beneath(
-            n: &str,
-            children: &BTreeMap<String, Vec<String>>,
-            per_symbol: &BTreeMap<String, BTreeSet<String>>,
-            depth: usize,
-        ) -> BTreeSet<String> {
-            let mut acc = per_symbol.get(n).cloned().unwrap_or_default();
-            if depth < 12 {
-                for c in children.get(n).map(Vec::as_slice).unwrap_or_default() {
-                    acc.extend(beneath(c, children, per_symbol, depth + 1));
+        for n in v
+            .tree
+            .version_of
+            .keys()
+            .filter(|n| !per_leaf.contains_key(*n))
+        {
+            let own: BTreeSet<String> = v
+                .tree
+                .child_nodes(n)
+                .iter()
+                .filter(|c| c.starts_with("tests/"))
+                .map(|c| key_of(c).to_string())
+                .collect();
+            let mut total: BTreeSet<String> = BTreeSet::new();
+            for d in v.tree.descendants(n) {
+                if let Some(s) = per_leaf.get(&d) {
+                    total.extend(s.iter().cloned());
                 }
             }
-            acc
-        }
-        for n in children.keys().filter(|k| !k.contains("symbols/")) {
-            let own: BTreeSet<String> = children[n]
-                .iter()
-                .filter_map(|c| {
-                    c.strip_prefix("symbols/")
-                        .or_else(|| c.split_once("symbols/").map(|x| x.1))
-                })
-                .filter(|k| status.contains_key(*k))
-                .map(str::to_string)
-                .collect();
-            let total = beneath(n, &children, &per_symbol, 0);
             out.insert(
                 n.clone(),
                 json!({"own": tally(&own), "total": tally(&total)}),
@@ -447,52 +460,55 @@ impl Store {
         Ok(out)
     }
 
-    /// The tests covering a node (a symbol: the tests reaching it; a C4 node: every test reaching
-    /// code beneath it) with their latest formal result and recent history (test overlay).
+    /// The tests covering a node (a code node: the tests reaching it; a C4 node: every test
+    /// reaching code beneath it) with their latest formal result and recent history.
     pub async fn tests_for_node(&self, node: &str) -> Result<Vec<Value>> {
-        let g = self.load_code_graph().await?;
-        let mut syms: BTreeSet<String> = BTreeSet::new();
-        if let Some(k) = node.strip_prefix("symbols/") {
-            syms.insert(k.to_string());
+        let node = &self.db.qid(node)?;
+        let v = self.view(None).await?;
+        let mut tests: BTreeSet<String> = BTreeSet::new();
+        let mut leaves: Vec<String> = Vec::new();
+        if node.starts_with("code/") || node.starts_with("tests/") {
+            leaves.push(key_of(node).to_string());
         } else {
-            for v in self
-                .aql(
-                    "FOR v IN 1..10 OUTBOUND @n @@contains FILTER STARTS_WITH(v._id, CONCAT(@pfx, 'symbols/')) RETURN v._key",
-                    json!({"n": node}),
-                )
-                .await?
-            {
-                if let Some(k) = v.as_str() {
-                    syms.insert(k.to_string());
+            for d in v.tree.descendants(node) {
+                if d.starts_with("code/") || d.starts_with("tests/") {
+                    leaves.push(key_of(&d).to_string());
                 }
             }
         }
-        let mut tests: BTreeSet<String> = BTreeSet::new();
-        for s in &syms {
-            match g.symbols.get(s) {
-                Some(x) if x.kind == kodehub_core::model::Kind::Test => {
-                    tests.insert(s.clone());
+        for k in &leaves {
+            match v.g.symbols.get(k) {
+                Some(x) if x.kind == Kind::Test => {
+                    tests.insert(k.clone());
                 }
-                Some(_) => tests.extend(g.tests_reaching(s)),
+                Some(_) => tests.extend(v.g.tests_reaching(k)),
                 None => {}
             }
         }
-        let ids: Vec<String> = tests.into_iter().collect();
-        self.aql(
-            "FOR k IN @ids LET t = DOCUMENT(@@symbols, k)
-               LET cv = FIRST(FOR e IN @@has_version FILTER e._from == t._id AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key)
-               LET runs = (FOR r IN @@test_runs FILTER r.test_symbol == k OR (r.test_version == cv)
-                             SORT r.ran_at DESC LIMIT 6
-                             RETURN {status: r.status, ran_at: r.ran_at, formal: r.formal != false,
-                                     current: r.closure_hash == t.closure_hash, duration_ms: r.duration_ms,
-                                     output: SUBSTRING(r.output || '', 0, 1500)})
-               LET now = FIRST(FOR r IN runs FILTER r.current AND r.formal RETURN r)
-               SORT t.display_name
-               RETURN {id: t._id, key: k, name: t.display_name, language: t.language,
-                       status: now ? now.status : 'not_run', runs}",
-            json!({"ids": ids}),
-        )
-        .await
+        let mut out = Vec::new();
+        for t in &tests {
+            let Some(s) = v.g.symbols.get(t) else {
+                continue;
+            };
+            let st = v.states.get(t);
+            let runs = self
+                .aql(
+                    "FOR r IN @@test_logs FILTER r.test == @t AND r.kind != 'run'
+                       SORT r.ran_at DESC LIMIT 6
+                       RETURN {status: r.status, ran_at: r.ran_at, formal: r.formal != false,
+                               current: r.closure_hash == @c AND r.test_version == @v,
+                               duration_ms: r.duration_ms, output: SUBSTRING(r.output || '', 0, 1500)}",
+                    json!({"t": t, "c": st.and_then(|x| x.closure_hash.clone()), "v": s.version}),
+                )
+                .await?;
+            out.push(json!({
+                "id": format!("tests/{t}"), "key": t, "name": s.display_name,
+                "language": s.language, "status": st.map(|x| x.status.clone()).unwrap_or_else(|| "not_run".into()),
+                "runs": runs,
+            }));
+        }
+        out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(out)
     }
 
     /// Requirements by kind and by level (spec §7.1: queryable by both).
@@ -503,21 +519,21 @@ impl Store {
     ) -> Result<Vec<Value>> {
         let rows = self
             .aql(
+                // decisions only when asked for by kind; proposed or rejected ones never
                 "FOR r IN @@requirements
-                   FILTER @kind == null OR (r.kind || 'technical') == @kind
-                   LET at = (FOR e IN @@satisfies FILTER e._to == r._id RETURN e._from)
-                   LET via_groups = (FOR g IN 1..5 INBOUND r._id @@includes
-                                       FOR e IN @@satisfies FILTER e._to == g._id RETURN e._from)
+                   FILTER r.state == null OR r.state == 'accepted'
+                   FILTER @kind == null ? r.kind != 'decision' : (r.kind || 'technical') == @kind
+                   LET at = (FOR e IN @@applies_to FILTER e._from == r._id RETURN e._to)
                    SORT r.title
                    RETURN {id: r._id, key: r._key, title: r.title, kind: r.kind || 'technical',
-                           attached_to: UNIQUE(APPEND(at, via_groups))}",
+                           tags: r.tags || [], attached_to: at}",
                 json!({"kind": kind}),
             )
             .await?;
         Ok(rows
             .into_iter()
             .map(|mut r| {
-                let levels: Vec<String> = r["attached_to"]
+                let mut levels: Vec<String> = r["attached_to"]
                     .as_array()
                     .map(|a| {
                         a.iter()
@@ -526,6 +542,21 @@ impl Store {
                             .collect()
                     })
                     .unwrap_or_default();
+                let rank = |l: &String| {
+                    [
+                        "project",
+                        "context",
+                        "container",
+                        "component",
+                        "code",
+                        "test",
+                    ]
+                    .iter()
+                    .position(|x| x == l)
+                    .unwrap_or(9)
+                };
+                levels.sort_by_key(rank);
+                levels.dedup();
                 r["levels"] = json!(levels);
                 r
             })
@@ -539,26 +570,60 @@ impl Store {
             .collect())
     }
 
-    /// Spec §7.4: requirements attached high up whose code reach is confined to one child.
+    /// Spec §7.4: requirements attached high up whose verifying tests only reach code under
+    /// one child: suggest attaching them there instead.
     pub async fn push_down_suggestions(&self) -> Result<Vec<Value>> {
-        let rows = self
-            .aql(
-                "FOR e IN @@satisfies
-                   FILTER STARTS_WITH(e._from, CONCAT(@pfx, 'contexts/')) OR STARTS_WITH(e._from, CONCAT(@pfx, 'containers/'))
-                     OR e._from == CONCAT(@pfx, 'philosophy/philosophy')
-                   LET kids = (FOR c IN 1..1 OUTBOUND e._from @@contains RETURN c._id)
-                   FILTER LENGTH(kids) > 1
-                   LET verifying = (FOR v IN @@verifies FILTER v._to == e._to
-                                      FOR t IN @@tested_by FILTER t._to == v._from RETURN t._from)
-                   LET used = UNIQUE(FOR k IN kids
-                                FOR x IN 0..10 OUTBOUND k @@contains
-                                  FILTER x._id IN verifying RETURN k)
-                   FILTER LENGTH(used) == 1
-                   RETURN {requirement: e._to, attached_to: e._from, suggest: FIRST(used)}",
-                json!({}),
-            )
-            .await?;
-        Ok(rows)
+        let v = self.view(None).await?;
+        let mut out = Vec::new();
+        for (rid, nodes) in &v.applies {
+            let verifying: BTreeSet<String> = v
+                .verified_by
+                .get(rid)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if verifying.is_empty() {
+                continue;
+            }
+            for n in nodes {
+                let lvl = level_of(n);
+                if !matches!(lvl, "project" | "context" | "container") {
+                    continue;
+                }
+                let kids: Vec<String> = if n == &v.project_node {
+                    v.tree
+                        .parent
+                        .iter()
+                        .filter(|(_, p)| *p == n)
+                        .map(|(c, _)| c.clone())
+                        .collect()
+                } else {
+                    v.tree.child_nodes(n)
+                };
+                if kids.len() < 2 {
+                    continue;
+                }
+                let used: Vec<&String> = kids
+                    .iter()
+                    .filter(|k| {
+                        let beneath = v.reach(std::slice::from_ref(*k), false);
+                        let tw: BTreeSet<String> = v
+                            .tested_with(&beneath)
+                            .into_iter()
+                            .map(|t| format!("tests/{t}"))
+                            .collect();
+                        verifying
+                            .iter()
+                            .any(|t| beneath.contains(t) || tw.contains(t))
+                    })
+                    .collect();
+                if used.len() == 1 {
+                    out.push(json!({"requirement": rid, "attached_to": n, "suggest": used[0]}));
+                }
+            }
+        }
+        Ok(out)
     }
 
     // ------------------------------------------------------------------ use cases
@@ -571,7 +636,9 @@ impl Store {
             .ok_or_else(|| StoreError::Invalid("a use case needs a name".into()))?
             .to_string();
         if doc.get("_key").is_none() {
-            doc["_key"] = json!(crate::slug(&name));
+            doc["_key"] = json!(self.db.pkey(&crate::slug(&name))?);
+        } else if let Some(k) = doc["_key"].as_str() {
+            doc["_key"] = json!(self.db.pkey(k)?);
         }
         doc["state"] = json!("draft");
         doc["created_at"] = json!(now_iso());
@@ -604,28 +671,41 @@ impl Store {
             }
         })?;
         let id = created["_id"].as_str().unwrap_or_default().to_string();
+        self.own(&id).await?;
         for r in rels {
-            self.link_use_case(&id, "relates_to", &format!("requirements/{}", key_of(&r)))
+            self.link_use_case(&id, "relates_to", &self.db.pid("requirements", key_of(&r))?)
                 .await?;
         }
         for t in tests {
-            self.link_use_case(&id, "expected_by", &format!("symbols/{}", key_of(&t)))
-                .await?;
+            let tid = self.symbol_id(&t).await?;
+            self.link_use_case(&id, "verified_by", &tid).await?;
         }
         self.get_use_case(key_of(&id)).await
     }
 
+    /// Link a use case to a requirement it exercises (`relates_to`) or a test that proves it
+    /// (`verified_by`).
     pub async fn link_use_case(&self, uc_id: &str, coll: &str, to: &str) -> Result<()> {
-        if !matches!(coll, "relates_to" | "expected_by") {
+        let coll = if coll == "expected_by" {
+            "verified_by"
+        } else {
+            coll
+        };
+        if !matches!(coll, "relates_to" | "verified_by") {
             return Err(StoreError::Invalid(format!(
                 "{coll} is not a use-case edge"
             )));
         }
-        self.get_node(to).await?;
+        let to = if coll == "verified_by" {
+            self.symbol_id(to).await?
+        } else {
+            self.db.qid(to)?
+        };
+        self.get_node(&to).await?;
         self.db
             .insert_ignore(
                 coll,
-                &json!({"_key": edge_key(coll, uc_id, to), "_from": uc_id, "_to": to}),
+                &json!({"_key": edge_key(coll, uc_id, &to), "_from": uc_id, "_to": to}),
                 None,
             )
             .await
@@ -643,7 +723,7 @@ impl Store {
             .await?;
         let tests = self
             .aql(
-                "FOR e IN @@expected_by FILTER e._from == @u LET t = DOCUMENT(e._to)
+                "FOR e IN @@verified_by FILTER e._from == @u LET t = DOCUMENT(e._to)
                    RETURN {id: t._id, key: t._key, name: t.display_name}",
                 json!({"u": id}),
             )
@@ -695,7 +775,7 @@ impl Store {
         let uc = self.get_use_case(key).await?;
         if state == "live" && uc["tests"].as_array().is_none_or(|a| a.is_empty()) {
             return Err(StoreError::Invalid(
-                "a use case goes live only with at least one expected-outcome test".into(),
+                "a use case goes live only with at least one test that proves it".into(),
             ));
         }
         let project = self.project_id().unwrap_or_default();
@@ -726,7 +806,7 @@ impl Store {
                 project,
                 agent_type: "architect".into(),
                 kind: "check_use_case".into(),
-                target: Some(format!("use_cases/{key}")),
+                target: Some(uc["_id"].as_str().unwrap_or_default().to_string()),
                 priority: crate::queue::PRIORITY_NORMAL,
                 task: json!({"use_case": uc, "live_use_cases": live,
                              "note": "check for contradictions with the live use cases; answer with use_case_verdict"}),
@@ -767,72 +847,69 @@ impl Store {
     }
 
     /// Apply an import agent's C4 mapping (spec §13.1).
-    pub async fn apply_import_mapping(&self, mapping: &Value, by: &str) -> Result<Value> {
-        crate::import::apply_mapping(self, mapping, by).await
+    pub async fn apply_import_mapping(
+        &self,
+        mapping: &Value,
+        work_item: &str,
+        by: &str,
+    ) -> Result<Value> {
+        crate::import::apply_mapping(self, mapping, work_item, by).await
     }
 
     // ------------------------------------------------------------------ lifecycle
 
-    /// Lifecycle per node with roll-up (spec §14.4).
+    /// Lifecycle per node with roll-up (spec §14.4), against the current project version.
     ///
-    /// Code: planned (no stable version) → in_build (a candidate exists or work is active) →
-    /// ready_for_test (stable, tests exist) → live (stable and its tests pass). An explicit
-    /// `lifecycle: in_build` on the node (rework started) wins over the derived state.
-    /// Parents roll up their children (`roll_up`), and a parent is not ready for test while a
-    /// child is planned or in build unless `parent_ready_requires_children` is false.
+    /// Code: planned (not in the current project version) → in_build (a candidate version is
+    /// pending or work is active) → ready_for_test (in the project version, tests exist) →
+    /// live (its tests pass). An explicit `lifecycle: in_build` on the node (rework started)
+    /// wins over the derived state. Parents roll up their children (`roll_up`), and a parent is
+    /// not ready for test while a child is planned or in build unless
+    /// `parent_ready_requires_children` is false.
     pub async fn node_lifecycle(&self) -> Result<BTreeMap<String, Value>> {
-        let health = self.node_health().await?;
-        let syms = self
+        let v = self.view(None).await?;
+        let health = crate::queries::health_of(&v);
+        let leaves = self
             .aql(
-                "FOR s IN @@symbols
-                   LET stable = LENGTH(FOR e IN @@has_version FILTER e._from == s._id AND e.state == 'stable' RETURN 1) > 0
-                   LET cand = LENGTH(FOR e IN @@has_version FILTER e._from == s._id AND e.state == 'candidate' RETURN 1)
-                   RETURN {id: s._id, stable, cand, explicit: s.lifecycle, test: s.kind == 'test'}",
+                "FOR s IN UNION((FOR x IN @@code RETURN x), (FOR x IN @@tests RETURN x))
+                   LET cand = LENGTH(FOR e IN @@has_version FILTER e._from == s._id AND e.state == 'candidate'
+                                       AND e.work_item != null RETURN 1)
+                   RETURN {id: s._id, cand, explicit: s.lifecycle, test: s.kind == 'test'}",
                 json!({}),
             )
             .await?;
         let mut state: BTreeMap<String, String> = BTreeMap::new();
-        // tests are not built code: a component holding only tests is still planned
-        let tests: BTreeSet<String> = syms
+        let tests: BTreeSet<String> = leaves
             .iter()
             .filter(|s| s["test"] == true)
             .filter_map(|s| s["id"].as_str().map(str::to_string))
             .collect();
-        for s in &syms {
+        for s in &leaves {
             let id = s["id"].as_str().unwrap_or_default().to_string();
+            let in_tree = v.tree.version(&id).is_some();
             let h = health
                 .get(&id)
                 .map(|h| h["health"].clone())
                 .unwrap_or(Value::Null);
-            let tests = health
+            let n_tests = health
                 .get(&id)
                 .and_then(|h| h["tests"].as_u64())
                 .unwrap_or(0);
             let derived = if s["explicit"] == "in_build" || s["cand"].as_u64().unwrap_or(0) > 0 {
                 "in_build"
-            } else if s["stable"] != true {
+            } else if !in_tree {
                 "planned"
             } else if h == "pass" {
                 "live"
-            } else if tests > 0 {
+            } else if n_tests > 0 {
                 "ready_for_test"
             } else {
                 "in_build"
             };
             state.insert(id, derived.to_string());
         }
-        let edges = self
-            .aql(
-                "FOR e IN @@contains FILTER !STARTS_WITH(e._from, CONCAT(@pfx, 'philosophy/')) RETURN {p: e._from, c: e._to}",
-                json!({}),
-            )
-            .await?;
-        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for e in &edges {
-            if let (Some(p), Some(c)) = (e["p"].as_str(), e["c"].as_str()) {
-                children.entry(p.into()).or_default().push(c.into());
-            }
-        }
+        let mut children = self.identity_children().await?;
+        children.retain(|p, _| !p.starts_with("projects/"));
         let explicit = self
             .aql(
                 "FOR n IN UNION((FOR x IN @@contexts RETURN x), (FOR x IN @@containers RETURN x),
@@ -841,13 +918,13 @@ impl Store {
                 json!({}),
             )
             .await?;
-        let strict = self
-            .project_id()
-            .map(|p| async move { self.setting(&p, "parent_ready_requires_children").await })
-            .ok_or(())
-            .ok();
-        let strict = match strict {
-            Some(f) => f.await.ok().and_then(|v| v.as_bool()).unwrap_or(true),
+        let strict = match self.project_id() {
+            Some(p) => self
+                .setting(&p, "parent_ready_requires_children")
+                .await
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
             None => true,
         };
         #[allow(clippy::too_many_arguments)]
@@ -903,7 +980,7 @@ impl Store {
             resolve(&id, &children, &mut state, &exp, &tests, strict, 0);
         }
         for (id, s) in &state {
-            let own = if level_of(id) == "code" {
+            let own = if matches!(level_of(id), "code" | "test") {
                 s.clone()
             } else {
                 exp.get(id).cloned().unwrap_or_else(|| s.clone())
@@ -915,10 +992,11 @@ impl Store {
 
     /// Mark a node as in build (rework started) or clear the flag.
     pub async fn set_lifecycle_flag(&self, node_id: &str, in_build: bool) -> Result<()> {
+        let node_id = &self.db.qid(node_id)?;
         let (coll, key) = node_id
             .split_once('/')
             .ok_or_else(|| StoreError::Invalid(format!("bad node id {node_id}")))?;
-        if !(C4_COLLECTIONS.contains(&coll) || coll == "symbols") {
+        if !(C4_COLLECTIONS.contains(&coll) || coll == "code" || coll == "tests") {
             return Err(StoreError::Invalid(format!("{coll} has no lifecycle")));
         }
         self.db
@@ -964,7 +1042,8 @@ mod tests {
 
     #[test]
     fn levels() {
-        assert_eq!(level_of("symbols/x"), "code");
-        assert_eq!(level_of(PHILOSOPHY_ID), "project");
+        assert_eq!(level_of("code/p.x"), "code");
+        assert_eq!(level_of("tests/p.t"), "test");
+        assert_eq!(level_of("projects/p"), "project");
     }
 }

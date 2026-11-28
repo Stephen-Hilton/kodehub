@@ -58,6 +58,8 @@ impl From<StoreError> for ApiError {
         let (status, kind) = match &e {
             StoreError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             StoreError::Arango { num: 1202, .. } => (StatusCode::NOT_FOUND, "not_found"),
+            // an unknown collection (e.g. a v0.1 name)
+            StoreError::Arango { num: 1203, .. } => (StatusCode::NOT_FOUND, "not_found"),
             StoreError::Invalid(_) | StoreError::Seed(_) | StoreError::Graph(_) => {
                 (StatusCode::BAD_REQUEST, "invalid")
             }

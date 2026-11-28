@@ -173,32 +173,55 @@ pub async fn invariants(State(s): State<AppState>) -> ApiResult<Value> {
     Ok(Json(json!({"ok": p.is_empty(), "problems": p})))
 }
 
+/// Code and test nodes of the current project version, with their version there.
 pub async fn list_symbols(State(s): State<AppState>) -> ApiResult<Vec<Value>> {
+    let tree = s.store.tree(None).await?;
+    let mut pairs = Vec::new();
+    for coll in ["code", "tests"] {
+        for n in tree.nodes_in(coll) {
+            pairs.push(json!({"n": n, "v": tree.version(n)}));
+        }
+    }
     Ok(Json(
         s.store
             .aql(
-                "FOR s IN @@symbols LET e1 = FIRST(FOR e IN @@has_version FILTER e._from == s._id AND e.state == 'stable' RETURN e)
-                 LET v = e1 ? DOCUMENT(e1._to) : null
+                "FOR p IN @pairs LET s = DOCUMENT(p.n) LET v = DOCUMENT(p.v)
                  SORT s.language, s.display_name
-                 RETURN MERGE(s, {version: v._key, signature: v.signature, seq: e1.seq,
-                                  lifecycle: s.lifecycle || (v ? 'live' : 'planned')})",
-                json!({}),
+                 RETURN MERGE(s, {version: v._key, signature: v.signature,
+                                  lifecycle: s.lifecycle || 'live'})",
+                json!({"pairs": pairs}),
             )
             .await?,
     ))
 }
 
+/// A code or test version by key.
 pub async fn get_version(State(s): State<AppState>, Path(h): Path<String>) -> ApiResult<Value> {
-    Ok(Json(s.store.db.get("versions", &h, None).await?))
+    let k = s.store.db.pkey(key_of(&h))?;
+    for c in ["code_versions", "test_versions"] {
+        match s.store.db.get(c, &k, None).await {
+            Ok(v) => return Ok(Json(v)),
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::not_found(format!("version {h}")))
 }
 
-/// Everything the node panel needs for one symbol.
+/// Everything the node panel needs for one code or test node.
 pub async fn symbol_detail(State(s): State<AppState>, Path(key): Path<String>) -> ApiResult<Value> {
-    let key = key_of(&key).to_string();
-    let sym = s.store.db.get("symbols", &key, None).await?;
+    let id = s.store.symbol_id(&key).await?;
+    let key = key_of(&id).to_string();
+    let (coll, _) = id.split_once('/').unwrap_or_default();
+    let sym = s.store.db.get(coll, &key, None).await?;
     let g = s.store.load_code_graph().await?;
     let cs = g.symbol(&key)?.clone();
-    let version = s.store.db.get("versions", &cs.version, None).await?;
+    let vcoll = if coll == "tests" {
+        "test_versions"
+    } else {
+        "code_versions"
+    };
+    let version = s.store.db.get(vcoll, &cs.version, None).await?;
     let history = s.store.version_history(&key).await?;
     let parsed = parse_signature(cs.language, version["signature"].as_str().unwrap_or(""));
     let (runnable, reason) = match kodehub_render::runnable(&g, &key) {
@@ -214,126 +237,185 @@ pub async fn symbol_detail(State(s): State<AppState>, Path(key): Path<String>) -
         })
         .collect();
     let impact = s.store.impact(&key).await?;
+    let node_ref = |k: &str| kodehub_store::queries::node_id(&g, k);
     let deps: Vec<Value> = g
         .out_edges(&key)
-        .filter(|e| e.kind != kodehub_core::model::CodeEdgeKind::TestedBy)
-        .filter_map(|e| g.symbols.get(&e.to).map(|t| json!({"id": t.id, "display_name": t.display_name, "kind": t.kind, "edge": e.kind.collection()})))
+        .filter(|e| e.kind != kodehub_core::model::CodeEdgeKind::TestedWith)
+        .filter_map(|e| g.symbols.get(&e.to).map(|t| json!({"id": node_ref(&t.id), "key": t.id, "display_name": t.display_name, "kind": t.kind, "edge": e.kind.collection()})))
         .collect();
     let dependents: Vec<Value> = g
         .in_edges(&key)
-        .filter(|e| e.kind != kodehub_core::model::CodeEdgeKind::TestedBy)
-        .filter_map(|e| g.symbols.get(&e.from).map(|t| json!({"id": t.id, "display_name": t.display_name, "kind": t.kind, "edge": e.kind.collection()})))
+        .filter(|e| e.kind != kodehub_core::model::CodeEdgeKind::TestedWith)
+        .filter_map(|e| g.symbols.get(&e.from).map(|t| json!({"id": node_ref(&t.id), "key": t.id, "display_name": t.display_name, "kind": t.kind, "edge": e.kind.collection()})))
         .collect();
-    let tests: Vec<String> = g.tests_reaching(&key).into_iter().collect();
-    let test_rows = s
-        .store
-        .aql(
-            "FOR k IN @tests LET t = DOCUMENT(@@symbols, k)
-               LET cv = FIRST(FOR e IN @@has_version FILTER e._from == t._id AND e.state == 'stable' RETURN PARSE_IDENTIFIER(e._to).key)
-               LET run = FIRST(FOR r IN @@test_runs FILTER r.test_version == cv AND r.closure_hash == t.closure_hash SORT r.ran_at DESC LIMIT 1 RETURN r)
-               SORT t.display_name
-               RETURN {id: t._key, name: t.display_name, language: t.language, status: run ? run.status : 'not_run', output: run.output, ran_at: run.ran_at}",
-            json!({"tests": tests}),
-        )
-        .await?;
+    let tests: std::collections::BTreeSet<String> = g.tests_reaching(&key).into_iter().collect();
+    let states = s.store.test_states(&g).await?;
+    let mut test_rows: Vec<Value> = tests
+        .iter()
+        .filter_map(|t| {
+            let ts = g.symbols.get(t)?;
+            let st = states.get(t);
+            Some(
+                json!({"id": t, "node": format!("tests/{t}"), "name": ts.display_name,
+                        "language": ts.language,
+                        "status": st.map(|x| x.status.clone()).unwrap_or_else(|| "not_run".into()),
+                        "ran_at": st.and_then(|x| x.ran_at.clone())}),
+            )
+        })
+        .collect();
+    test_rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    // decisions: requirements of kind decision applying to this node or what contains it
+    let tree = s.store.tree(None).await?;
+    let anc = tree.ancestors(&id);
     let decisions = s
         .store
         .aql(
-            "FOR e IN @@justified_by FILTER e._from == @s RETURN DOCUMENT(e._to)",
-            json!({"s": format!("symbols/{key}")}),
+            "FOR e IN @@applies_to FILTER e._to IN @anc LET d = DOCUMENT(e._from)
+               FILTER d.kind == 'decision' RETURN DISTINCT d",
+            json!({"anc": anc}),
         )
         .await?;
     let runs = s
         .store
         .aql(
-            "FOR r IN @@runs FILTER r.symbol == @k SORT r.ran_at DESC LIMIT 8 RETURN r",
-            json!({"k": key}),
+            "FOR r IN @@test_logs FILTER r.kind == 'run' AND (r.symbol == @k OR r.node == @id)
+               SORT r.ran_at DESC LIMIT 8 RETURN r",
+            json!({"k": key, "id": id}),
         )
         .await?;
-    let component = s
-        .store
-        .aql(
-            "FOR e IN @@contains FILTER e._to == @s RETURN DOCUMENT(e._from)",
-            json!({"s": format!("symbols/{key}")}),
-        )
-        .await?;
+    let component = match tree.parent.get(&id) {
+        Some(p) => Some(s.store.get_node(p).await?),
+        None => None,
+    };
     let health = s.store.node_health().await?;
     Ok(Json(json!({
         "symbol": sym,
+        "node": id,
         "version": version,
         "closure_hash": g.closure_hash(&key)?,
         "history": history,
         "signature": parsed,
         "form": {"runnable": runnable, "reason": reason, "params": params, "returns": parsed.returns},
         "requirements": impact["requirements"],
-        "groups": impact["groups"],
+        "tags": impact["tags"],
         "dependencies": deps,
         "dependents": dependents,
         "tests": test_rows,
         "decisions": decisions,
         "runs": runs,
-        "component": component.first(),
-        "health": health.get(&format!("symbols/{key}")).map(|h| h["health"].clone()).unwrap_or(json!("uncovered")),
+        "component": component,
+        "health": health.get(&id).map(|h| h["health"].clone()).unwrap_or(json!("uncovered")),
     })))
 }
 
 #[derive(Deserialize)]
 pub struct MapQuery {
-    /// ISO timestamp: show the system as it was then.
+    /// A project version (key or id): show the system as it is there. Default: the current one.
     pub at: Option<String>,
 }
 
-/// The system map: C4 nodes + symbols with health, structural and code edges, ghost nodes.
+/// Map level of a node collection (code and tests draw as `symbol`).
+fn map_level(coll: &str) -> &'static str {
+    match coll {
+        "contexts" => "context",
+        "containers" => "container",
+        "components" => "component",
+        _ => "symbol",
+    }
+}
+
+/// The system map of a project version: C4 nodes + code and tests with health, structural and
+/// code edges, and (live view) ghost nodes from open proposals and C4 nodes awaiting placement.
 pub async fn map(State(s): State<AppState>, Query(q): Query<MapQuery>) -> ApiResult<Value> {
     let store = &s.store;
-    let health = store.node_health().await?;
-    let rows = store
+    let current = store.current_version().await?;
+    let pv = match &q.at {
+        Some(a) => store.pv_id(a)?,
+        None => current.clone(),
+    };
+    let live = pv == current;
+    let tree = store.tree(Some(&pv)).await?;
+    let cur_tree = if live {
+        tree.clone()
+    } else {
+        store.tree(None).await?
+    };
+    let health = if live {
+        store.node_health().await?
+    } else {
+        Default::default()
+    };
+    let project_node = store.project_node()?;
+    let docs = store
         .aql(
-            "LET parents = (FOR e IN @@contains RETURN {child: e._to, parent: e._from})
-             FOR n IN UNION(
-                (FOR x IN @@contexts RETURN MERGE(x, {level: 'context'})),
-                (FOR x IN @@containers RETURN MERGE(x, {level: 'container'})),
-                (FOR x IN @@components RETURN MERGE(x, {level: 'component'})),
-                (FOR x IN @@symbols RETURN MERGE(x, {level: 'symbol'})))
-               FILTER @at == null OR n.created_at == null OR n.created_at <= @at
-               LET parent = FIRST(FOR p IN parents FILTER p.child == n._id AND !STARTS_WITH(p.parent, CONCAT(@pfx, 'missions/')) AND !STARTS_WITH(p.parent, CONCAT(@pfx, 'philosophy/')) RETURN p.parent)
-               LET cv = FIRST(FOR e IN @@has_version FILTER e._from == n._id AND e.state == 'stable' RETURN e)
+            "FOR n IN UNION(
+                (FOR x IN @@contexts RETURN x), (FOR x IN @@containers RETURN x),
+                (FOR x IN @@components RETURN x), (FOR x IN @@code RETURN x),
+                (FOR x IN @@tests RETURN x))
                LET cand = LENGTH(FOR e IN @@has_version FILTER e._from == n._id AND e.state == 'candidate' RETURN 1)
-               LET at_v = (@at == null || n.level != 'symbol') ? null : FIRST(
-                    FOR e IN @@has_version FILTER e._from == n._id AND e.validFrom != null
-                      AND e.validFrom <= @at AND (e.validTo == null OR e.validTo > @at) RETURN e._to)
-               RETURN {id: n._id, key: n._key, level: n.level, label: n.display_name || n.title || n._key,
-                       parent, kind: n.kind, language: n.language, tags: n.tags, description: n.description,
-                       version: (cv && n.level == 'symbol') ? PARSE_IDENTIFIER(cv._to).key : null,
-                       seq: cv.seq, candidates: cand, lifecycle_raw: n.lifecycle,
-                       version_at: at_v ? PARSE_IDENTIFIER(at_v).key : null}",
-            json!({"at": q.at}),
+               RETURN MERGE(n, {candidates: cand})",
+            json!({}),
         )
         .await?;
-    let ids: BTreeSet<String> = rows
-        .iter()
-        .filter_map(|r| r["id"].as_str().map(String::from))
-        .collect();
-    let mut nodes: Vec<Value> = rows
-        .into_iter()
-        .map(|mut r| {
-            let id = r["id"].as_str().unwrap_or_default().to_string();
-            let h = health.get(&id);
-            // history mode shows structure and what changed, not today's health (review M6 #21)
-            r["health"] = if q.at.is_some() {
-                json!("history")
-            } else {
-                h.map(|h| h["health"].clone()).unwrap_or(json!("uncovered"))
-            };
-            r["tests"] = h.map(|h| h["tests"].clone()).unwrap_or(json!(0));
-            if q.at.is_some() && r["level"] == "symbol" {
-                r["changed_since"] = json!(r["version_at"] != r["version"]);
-            }
-            r
-        })
-        .collect();
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    let mut nodes: Vec<Value> = Vec::new();
+    for n in docs {
+        let id = n["_id"].as_str().unwrap_or_default().to_string();
+        let coll = id.split_once('/').map(|x| x.0).unwrap_or_default();
+        let level = map_level(coll);
+        let in_tree = tree.version(&id).is_some();
+        // C4 nodes awaiting a human (planned, unplaced) show in the live view only
+        let planned = !in_tree && level != "symbol" && live;
+        if !in_tree && !planned {
+            continue;
+        }
+        let parent = tree
+            .parent
+            .get(&id)
+            .filter(|p| **p != project_node)
+            .cloned()
+            .or_else(|| {
+                n["planned_parent"]
+                    .as_str()
+                    .filter(|p| !p.starts_with("projects/"))
+                    .map(str::to_string)
+            });
+        let version = (level == "symbol")
+            .then(|| tree.version(&id).map(|v| key_of(v).to_string()))
+            .flatten();
+        let mut r = json!({
+            "id": id, "key": n["_key"], "level": level,
+            "label": n["display_name"].as_str().or(n["title"].as_str()).or(n["name"].as_str()).unwrap_or(key_of(&id)),
+            "parent": parent, "kind": n["kind"], "language": n["language"], "tags": n["tags"],
+            "description": n["description"], "version": version,
+            "candidates": n["candidates"], "lifecycle_raw": n["lifecycle"],
+        });
+        if planned {
+            r["planned"] = json!(true);
+        }
+        let h = health.get(&id);
+        // history mode shows structure and what changed, not today's health (review M6 #21)
+        r["health"] = if !live {
+            json!("history")
+        } else {
+            h.map(|h| h["health"].clone()).unwrap_or(json!("uncovered"))
+        };
+        r["tests"] = h.map(|h| h["tests"].clone()).unwrap_or(json!(0));
+        if !live && level == "symbol" {
+            r["version_at"] = r["version"].clone();
+            r["changed_since"] = json!(tree.version(&id) != cur_tree.version(&id));
+        }
+        ids.insert(id);
+        nodes.push(r);
+    }
     let mut out_edges = Vec::new();
-    for coll in ["calls", "depends_on", "member_of", "tested_by", "binds_to"] {
+    for coll in [
+        "calls",
+        "depends_on",
+        "member_of",
+        "tested_with",
+        "binds_to",
+    ] {
         let es = store
             .aql(
                 "FOR e IN @@c RETURN {id: e._id, source: e._from, target: e._to, kind: @c2}",
@@ -345,37 +427,38 @@ pub async fn map(State(s): State<AppState>, Query(q): Query<MapQuery>) -> ApiRes
                 && ids.contains(e["target"].as_str().unwrap_or(""))
         }));
     }
-    // ghost nodes from open changesets (live view only)
-    let open = if q.at.is_some() {
-        vec![]
+    // ghost nodes from open proposals (live view only)
+    let open = if live {
+        store.list_proposals(true).await?
     } else {
-        store.list_changesets(true).await?
+        vec![]
     };
     let mut ghosts = Vec::new();
     let mut proposed: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for cs in &open {
-        let csk = cs["_key"].as_str().unwrap_or_default().to_string();
-        if cs["state"] == "escalated" {
+    for wp in &open {
+        let wi = wp["work_item"].as_str().unwrap_or_default().to_string();
+        if wp["state"] == "escalated" {
             continue;
         }
+        let comp_id = |c: &Value| {
+            c.as_str()
+                .and_then(|c| store.db.pid("components", key_of(c)).ok())
+        };
         let mut seen_new: BTreeSet<String> = BTreeSet::new();
-        for (pk, p) in cs["proposals"].as_object().cloned().unwrap_or_default() {
+        for (pk, p) in wp["proposals"].as_object().cloned().unwrap_or_default() {
             if p["new"] == json!(true) {
                 seen_new.insert(p["display_name"].as_str().unwrap_or("").to_string());
                 ghosts.push(json!({
-                    "id": format!("ghost:{csk}:{pk}"), "key": pk, "level": "symbol", "ghost": true,
+                    "id": format!("ghost:{wi}:{pk}"), "key": pk, "level": "symbol", "ghost": true,
                     "label": p["display_name"], "kind": p["kind"], "language": p["language"],
-                    "parent": p["component"].as_str().map(|c| format!("components/{}", key_of(c))),
-                    "changeset": csk, "health": "ghost", "action": "add",
+                    "parent": comp_id(&p["component"]),
+                    "work_item": wi, "health": "ghost", "action": "add",
                 }));
-            } else {
-                proposed
-                    .entry(format!("symbols/{pk}"))
-                    .or_default()
-                    .push(csk.clone());
+            } else if let Some(n) = p["node"].as_str() {
+                proposed.entry(n.to_string()).or_default().push(wi.clone());
             }
         }
-        for ch in cs["plan"]["changes"]
+        for ch in wp["plan"]["changes"]
             .as_array()
             .cloned()
             .unwrap_or_default()
@@ -384,22 +467,21 @@ pub async fn map(State(s): State<AppState>, Query(q): Query<MapQuery>) -> ApiRes
             let action = ch["action"].as_str().unwrap_or("modify");
             if action == "add" && !seen_new.contains(&name) {
                 ghosts.push(json!({
-                    "id": format!("ghost:{csk}:plan:{name}"), "key": name, "level": "symbol", "ghost": true,
+                    "id": format!("ghost:{wi}:plan:{name}"), "key": name, "level": "symbol", "ghost": true,
                     "label": name, "kind": ch["kind"], "language": ch["language"],
-                    "parent": ch["component"].as_str().map(|c| format!("components/{}", key_of(c))),
-                    "changeset": csk, "health": "ghost", "action": "add", "description": ch["description"],
+                    "parent": comp_id(&ch["component"]),
+                    "work_item": wi, "health": "ghost", "action": "add", "description": ch["description"],
                 }));
             } else if let Some(sym) = ch["symbol"].as_str() {
-                proposed
-                    .entry(format!("symbols/{}", key_of(sym)))
-                    .or_default()
-                    .push(csk.clone());
+                if let Ok(n) = store.symbol_id(sym).await {
+                    proposed.entry(n).or_default().push(wi.clone());
+                }
             }
         }
     }
     for n in nodes.iter_mut() {
-        if let Some(cs) = n["id"].as_str().and_then(|id| proposed.get(id)) {
-            let mut v = cs.clone();
+        if let Some(ws) = n["id"].as_str().and_then(|id| proposed.get(id)) {
+            let mut v = ws.clone();
             v.sort();
             v.dedup();
             n["proposed_in"] = json!(v);
@@ -432,25 +514,31 @@ pub async fn map(State(s): State<AppState>, Query(q): Query<MapQuery>) -> ApiRes
             n["in_progress"] = json!(busy.get(&id).copied().unwrap_or(0));
         }
     }
-    Ok(Json(
-        json!({"mission": mission, "nodes": nodes, "edges": out_edges, "at": q.at}),
-    ))
+    let pv_doc = store.get_project_version(&pv).await?;
+    Ok(Json(json!({
+        "mission": mission, "nodes": nodes, "edges": out_edges,
+        "at": q.at, "project_version": {"id": pv, "name": pv_doc["name"], "state": pv_doc["state"],
+                                         "current": live},
+    })))
 }
 
-/// Merged changesets, releases and seed imports, oldest first — the time slider's stops.
+/// Project versions (opened, frozen) and accepted proposals, oldest first — the time slider's
+/// stops. Each stop names the project version to show.
 pub async fn timeline(State(s): State<AppState>) -> ApiResult<Value> {
     let rows = s
         .store
         .aql(
-            "LET seed = (FOR x IN @@symbols FILTER x.created_by == 'seed' COLLECT AGGREGATE t = MAX(x.created_at) RETURN t)
-             LET merges = (FOR c IN @@changesets FILTER c.state == 'merged'
-                           RETURN {kind: 'merge', id: c._id, key: c._key, label: c.title, at: c.merged_at,
-                                   symbols: ATTRIBUTES(c.merged_versions || {})})
-             LET rels = (FOR r IN @@releases RETURN {kind: 'release', id: r._id, key: r._key, label: r.name, at: r.created_at,
-                                   symbols: []})
-             LET s0 = seed[0] ? [{kind: 'seed', id: 'seed', key: 'seed', label: 'Seed imported', at: seed[0], symbols: []}] : []
-             FOR e IN UNION(s0, merges, rels) SORT e.at RETURN e",
-            json!({}),
+            "LET pvs = (FOR v IN @@project_versions
+                          RETURN {kind: v.state == 'frozen' ? 'frozen' : 'version', id: v._id, key: v._key,
+                                  label: v.name, at: v.frozen_at || v.created_at, project_version: v._id,
+                                  symbols: []})
+             LET accepts = (FOR w IN @@w FILTER w.project == @p AND w.proposal.state == 'accepted'
+                              RETURN {kind: 'accept', id: w._id, key: w._key,
+                                      label: w.proposal.title || w.title || w.kind, at: w.proposal.accepted_at,
+                                      project_version: w.proposal.accepted_into,
+                                      symbols: ATTRIBUTES(w.proposal.accepted_versions || {})})
+             FOR e IN UNION(pvs, accepts) SORT e.at RETURN e",
+            json!({"@w": "work_items", "p": s.store.db.require_project()?}),
         )
         .await?;
     Ok(Json(json!({"events": rows})))
@@ -503,31 +591,36 @@ pub async fn node_health(State(s): State<AppState>) -> ApiResult<Value> {
     ))
 }
 
-/// Accept a symbol key or a display name.
+/// Accept a code/test key, id or a display name; returns the (qualified) key.
 pub async fn resolve_symbol(s: &AppState, name: &str) -> Result<String, ApiError> {
-    let k = key_of(name);
-    if s.store.db.get("symbols", k, None).await.is_ok() {
-        return Ok(k.to_string());
+    if let Ok(id) = s.store.symbol_id(name).await {
+        return Ok(key_of(&id).to_string());
     }
+    let k = key_of(name);
     let doc = s.store.symbol_by_name(None, k).await?;
     Ok(doc["_key"].as_str().unwrap_or_default().to_string())
 }
 
 /// Code and trace edges change what is built and what counts as tested, so through the API they
-/// only change inside a changeset (`propose_edge`), never directly on main (final review #9).
+/// only change in a work item's proposal (`propose_edge`), never directly (final review #9).
+/// Structure and versions belong to the version tree and are never written as raw edges.
 fn guard_api_edge(collection: &str) -> Result<(), ApiError> {
-    const CHANGESET_ONLY: &[&str] = &[
+    const PROPOSAL_ONLY: &[&str] = &[
         "calls",
         "depends_on",
         "member_of",
-        "tested_by",
+        "tested_with",
         "binds_to",
-        "verifies",
-        "satisfies",
+        "verified_by",
     ];
-    if CHANGESET_ONLY.contains(&collection) {
+    if PROPOSAL_ONLY.contains(&collection) {
         return Err(ApiError::bad_request(format!(
-            "`{collection}` edges change code or coverage — propose them in a changeset (propose_edge)"
+            "`{collection}` edges change code or coverage — propose them in a work item's proposal (propose_edge)"
+        )));
+    }
+    if matches!(collection, "has_version" | "based_on") {
+        return Err(ApiError::bad_request(format!(
+            "`{collection}` edges belong to the version tree and are written by the orchestrator"
         )));
     }
     Ok(())

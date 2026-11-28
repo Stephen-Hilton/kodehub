@@ -359,7 +359,7 @@ pub async fn mcp(
     let opts = kodehub_cli::mcp::McpOptions {
         read_only: false,
         allow: None,
-        changeset: None,
+        work_item: None,
     };
     let reply = match &msg {
         Value::Array(batch) => {

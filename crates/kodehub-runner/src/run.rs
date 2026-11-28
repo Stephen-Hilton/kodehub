@@ -20,8 +20,8 @@ pub struct RunRequest {
     pub symbol: String,
     pub args: Value,
     pub environment: String,
-    /// Release the code came from (non-dev environments).
-    pub release: Option<String>,
+    /// Project version the code came from (non-dev environments).
+    pub project_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,7 +33,7 @@ pub struct RunRecord {
     pub version: String,
     pub closure_hash: String,
     pub environment: String,
-    pub release: Option<String>,
+    pub project_version: Option<String>,
     pub args: Value,
     pub result: Value,
     pub ok: bool,
@@ -71,7 +71,7 @@ impl Runner {
             version: sym.version.clone(),
             closure_hash: b.closure_hash.clone(),
             environment: req.environment.clone(),
-            release: req.release.clone(),
+            project_version: req.project_version.clone(),
             args: req.args.clone(),
             result: Value::Null,
             ok: false,
@@ -131,8 +131,10 @@ impl Runner {
 
     /// Store a run in `runs`.
     pub async fn record_run(&self, store: &Store, r: &RunRecord) -> Result<Value> {
-        let doc = serde_json::to_value(r).unwrap_or(json!({}));
-        Ok(store.db.insert("runs", &doc, None).await?)
+        let mut doc = serde_json::to_value(r).unwrap_or(json!({}));
+        doc["_key"] = json!(store.db.pkey(&r.key)?);
+        doc["kind"] = json!("run");
+        Ok(store.record_test_log(doc, None).await?)
     }
 }
 

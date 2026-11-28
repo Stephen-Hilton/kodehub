@@ -150,6 +150,19 @@ pub fn require_ui(state: &AppState, headers: &axum::http::HeaderMap) -> Result<(
     }
 }
 
+/// A person directing the project: a human in the app, or a remote agent acting for one
+/// (D-061). Internal agents never pass: they propose requirement changes for human approval.
+pub fn require_person(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    who: &kodehub_store::Principal,
+) -> Result<(), ApiError> {
+    if who.is_remote_agent() {
+        return Ok(());
+    }
+    require_ui(state, headers)
+}
+
 /// Serve index.html (sign-in happens in the UI; no secret is injected).
 async fn index_with_token(
     axum::extract::State(state): axum::extract::State<AppState>,
@@ -274,7 +287,7 @@ pub fn install_agents(state: &mut AppState, server_url: &str, opts: kodehub_agen
 
 impl AppState {
     /// A requirement was edited by a human: queue the coding work (spec §4.4). The agent
-    /// dispatcher opens and drives the changeset.
+    /// dispatcher opens and drives the work item's proposal.
     pub fn requirement_edited(&self, key: &str, by: &str) {
         if self.engine.is_none() {
             return;
@@ -292,10 +305,13 @@ impl AppState {
         kodehub_store::spawn_scoped(async move {
             let w = store
                 .enqueue(&kodehub_store::queue::NewWorkItem {
+                    target: Some(format!(
+                        "requirements/{}",
+                        kodehub_store::arango::qualify(&project, kodehub_store::key_of(&k))
+                    )),
                     project,
                     agent_type: "coding".into(),
                     kind: "requirement_changed".into(),
-                    target: Some(format!("requirements/{k}")),
                     priority: kodehub_store::queue::PRIORITY_HIGH,
                     task: serde_json::json!({"requirement": k, "edited_by": b}),
                     requested_by: Some(b.clone()),
@@ -309,29 +325,30 @@ impl AppState {
         });
     }
 
-    /// Run (or resume) a changeset's workflow in the background.
-    pub fn execute_changeset(&self, key: &str) {
+    /// Run (or resume) a work item's proposal workflow in the background.
+    pub fn execute_proposal(&self, key: &str) {
         if let Some(e) = self.engine.clone() {
             let (k, ev) = (key.to_string(), self.events.clone());
             let store = self.store.clone();
             kodehub_store::spawn_scoped(async move {
                 match e.execute(&k).await {
                     Err(err) => {
-                        ev.emit("agent.activity", serde_json::json!({"role": "orchestrator", "error": err.to_string(), "changeset": k}));
+                        ev.emit("agent.activity", serde_json::json!({"role": "orchestrator", "error": err.to_string(), "work_item": k}));
                     }
                     Ok(_) => {
-                        // a work item parked on this changeset (a human-approved plan) settles now
-                        if let Ok(cs) = store.get_changeset(&k).await {
-                            match cs["state"].as_str() {
-                                Some("merged") => {
-                                    let _ = store.settle_changeset_item(&k, true, "merged").await;
+                        // a work item parked on its proposal (a human-approved plan, a manual
+                        // edit) settles now
+                        if let Ok(p) = store.get_proposal(&k).await {
+                            match p["state"].as_str() {
+                                Some("accepted") => {
+                                    let _ = store.settle_proposal_item(&k, true, "accepted").await;
                                 }
                                 Some("rejected") | Some("escalated") => {
                                     let _ = store
-                                        .settle_changeset_item(
+                                        .settle_proposal_item(
                                             &k,
                                             false,
-                                            cs["state"].as_str().unwrap_or(""),
+                                            p["state"].as_str().unwrap_or(""),
                                         )
                                         .await;
                                 }

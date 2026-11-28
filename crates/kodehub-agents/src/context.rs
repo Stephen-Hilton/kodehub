@@ -119,13 +119,19 @@ pub async fn relevant_symbols(
     g: &CodeGraph,
     reqs: &[String],
 ) -> Result<BTreeSet<String>> {
-    let ids: Vec<String> = reqs.iter().map(|r| format!("requirements/{r}")).collect();
+    let ids: Vec<String> = reqs
+        .iter()
+        .map(|r| store.db.pid("requirements", kodehub_store::key_of(r)))
+        .collect::<std::result::Result<_, _>>()?;
+    // what the requirements apply to (and everything beneath, in the identity hierarchy and
+    // over build edges), plus the tests verifying them
     let rows = store
         .aql(
-            "LET sat = (FOR e IN @@satisfies FILTER e._to IN @r RETURN e._from)
-             LET reach = UNIQUE(FOR s IN sat FOR v IN 0..30 OUTBOUND s @@contains, @@calls, @@depends_on, @@member_of
-                                  OPTIONS {uniqueVertices: 'global', order: 'bfs'} FILTER STARTS_WITH(v._id, CONCAT(@pfx, 'symbols/')) RETURN v._key)
-             LET tests = (FOR e IN @@verifies FILTER e._to IN @r RETURN PARSE_IDENTIFIER(e._from).key)
+            "LET at = (FOR e IN @@applies_to FILTER e._from IN @r RETURN e._to)
+             LET reach = UNIQUE(FOR s IN at FOR v IN 0..30 OUTBOUND s @@contains, @@calls, @@depends_on, @@member_of
+                                  OPTIONS {uniqueVertices: 'global', order: 'bfs'}
+                                  FILTER PARSE_IDENTIFIER(v._id).collection IN ['code', 'tests'] RETURN v._key)
+             LET tests = (FOR e IN @@verified_by FILTER e._from IN @r RETURN PARSE_IDENTIFIER(e._to).key)
              RETURN UNIQUE(APPEND(reach, tests))",
             json!({"r": ids}),
         )

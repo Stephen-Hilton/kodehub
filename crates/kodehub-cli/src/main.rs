@@ -54,21 +54,24 @@ enum Cmd {
     Duplicates,
     /// List requirements.
     Requirements,
-    /// List changesets.
-    Changesets,
-    /// Releases: cut | list | diff A B
-    Release {
-        #[command(subcommand)]
-        cmd: ReleaseCmd,
-    },
-    /// Promote a release to an environment (prod needs --approve).
-    Promote {
-        release: String,
-        env: String,
+    /// List work-item proposals (code changes in flight).
+    Proposals {
+        /// Only open ones.
         #[arg(long)]
-        approve: bool,
+        open: bool,
     },
-    /// Roll an environment back to its previous release.
+    /// Project versions (the releases): new | list | freeze KEY | diff A B
+    Version {
+        #[command(subcommand)]
+        cmd: VersionCmd,
+    },
+    /// Deploy a project version into an environment (production waits for a human approval
+    /// in the app).
+    Deploy {
+        project_version: String,
+        env: String,
+    },
+    /// Roll an environment back to the project version it ran before.
     Rollback { env: String },
     /// Call any graph API tool: kodehub tool coverage '{}'
     Tool {
@@ -84,21 +87,26 @@ enum Cmd {
         /// Comma-separated allowlist of tool names.
         #[arg(long)]
         tools: Option<String>,
-        /// Default changeset for write tools.
+        /// Work item whose proposal write tools act on (agent sessions).
         #[arg(long)]
-        changeset: Option<String>,
+        work_item: Option<String>,
     },
 }
 
 #[derive(Subcommand)]
-enum ReleaseCmd {
-    Cut {
+enum VersionCmd {
+    /// Open a new project version from the current one and make it current.
+    New {
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, default_value = "")]
-        notes: String,
     },
     List,
+    /// Freeze a project version (it never changes again).
+    Freeze {
+        key: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
     Diff {
         from: String,
         to: String,
@@ -130,7 +138,7 @@ async fn real_main() -> anyhow::Result<()> {
         Cmd::Mcp {
             read_only,
             tools,
-            changeset,
+            work_item,
         } => {
             let allow = tools.map(|t| {
                 t.split(',')
@@ -142,7 +150,7 @@ async fn real_main() -> anyhow::Result<()> {
                 McpOptions {
                     read_only,
                     allow,
-                    changeset,
+                    work_item,
                 },
             )
             .await?;
@@ -247,12 +255,12 @@ async fn real_main() -> anyhow::Result<()> {
             if cli.json {
                 pretty(&v)
             } else {
-                for g in v["groups"].as_array().cloned().unwrap_or_default() {
+                for g in v["tags"].as_array().cloned().unwrap_or_default() {
                     println!(
-                        "{} {} [{}]",
+                        "{} #{} ({} requirements)",
                         icon(g["status"].as_str().unwrap_or("")),
-                        g["title"].as_str().unwrap_or(""),
-                        g["logic"].as_str().unwrap_or("")
+                        g["tag"].as_str().unwrap_or(""),
+                        g["members"].as_array().map(|a| a.len()).unwrap_or(0)
                     );
                 }
                 for r in v["requirements"].as_array().cloned().unwrap_or_default() {
@@ -270,26 +278,39 @@ async fn real_main() -> anyhow::Result<()> {
         Cmd::Impact { symbol } => pretty(&c.tool("impact", &json!({"symbol": symbol})).await?),
         Cmd::Duplicates => pretty(&c.tool("duplicates", &json!({})).await?),
         Cmd::Requirements => pretty(&c.tool("list_requirements", &json!({})).await?),
-        Cmd::Changesets => pretty(&c.tool("list_changesets", &json!({})).await?),
-        Cmd::Release { cmd } => match cmd {
-            ReleaseCmd::Cut { name, notes } => pretty(
-                &c.tool("cut_release", &json!({"name": name, "notes": notes}))
+        Cmd::Proposals { open } => pretty(&c.tool("list_proposals", &json!({"open": open})).await?),
+        Cmd::Version { cmd } => match cmd {
+            VersionCmd::New { name } => pretty(
+                &c.tool("new_project_version", &json!({"name": name}))
                     .await?,
             ),
-            ReleaseCmd::List => pretty(&c.call("GET", "/api/releases", None).await?),
-            ReleaseCmd::Diff { from, to } => pretty(
-                &c.call("GET", &format!("/api/releases/{from}/diff/{to}"), None)
-                    .await?,
+            VersionCmd::List => pretty(&c.tool("list_project_versions", &json!({})).await?),
+            VersionCmd::Freeze { key, reason } => pretty(
+                &c.tool(
+                    "freeze_project_version",
+                    &json!({"project_version": key, "reason": reason}),
+                )
+                .await?,
+            ),
+            VersionCmd::Diff { from, to } => pretty(
+                &c.call(
+                    "GET",
+                    &format!("/api/project-versions/{from}/diff/{to}"),
+                    None,
+                )
+                .await?,
             ),
         },
-        Cmd::Promote {
-            release,
+        Cmd::Deploy {
+            project_version,
             env,
-            approve,
-        } => {
-            let body = json!({"release": release, "environment": env, "approved_by": if approve { Some("human") } else { None }});
-            pretty(&c.tool("promote", &body).await?)
-        }
+        } => pretty(
+            &c.tool(
+                "deploy",
+                &json!({"project_version": project_version, "environment": env}),
+            )
+            .await?,
+        ),
         Cmd::Rollback { env } => pretty(&c.tool("rollback", &json!({"environment": env})).await?),
         Cmd::Tool { name, args } => {
             let a: Value = serde_json::from_str(&args)?;

@@ -56,6 +56,7 @@ export function SettingsScreen({ project, me }: { project: string; me: Json }) {
           ))}
           <div className="row"><span className="spacer" /><button className="btn sm" onClick={() => api.replanSchedules().then(load)}>Re-plan from settings</button></div>
         </div>
+        <AgentTypes editable={!!s?.can_edit} />
         <Credentials project={project} me={me} />
         <AgentUsers project={project} />
         <GitAndBackups />
@@ -153,6 +154,67 @@ function Credentials({ project, me }: { project: string; me: Json }) {
   );
 }
 
+/** The project's agent types (D-062): each has a start-up prompt and the actions it may take.
+ *  Defaults are wide; review and test writing stay with their own agents. */
+function AgentTypes({ editable }: { editable: boolean }) {
+  const toast = useToast();
+  const [agents, setAgents] = useState<Json[]>([]);
+  const [catalogue, setCatalogue] = useState<{ name: string; description: string }[]>([]);
+  const [open, setOpen] = useState<string | null>(null);
+  const [draft, setDraft] = useState<{ prompt: string; permissions: string[] }>({ prompt: "", permissions: [] });
+  const [custom, setCustom] = useState("");
+  const load = () => api.agentTypes().then((r) => { setAgents(r.agents); setCatalogue(r.permissions); }).catch(() => {});
+  useEffect(() => { load(); }, []);
+  const edit = (a: Json) => {
+    if (open === a.name) { setOpen(null); return; }
+    setOpen(a.name);
+    setDraft({ prompt: a.prompt ?? "", permissions: [...(a.permissions ?? [])] });
+  };
+  const save = (name: string) => api.putAgentType(name, draft)
+    .then(() => { toast("success", `${name} saved`); setOpen(null); load(); })
+    .catch((e) => toast("error", e.message));
+  return (
+    <div className="card" data-testid="agent-types">
+      <div className="section-title">Agent types</div>
+      <div className="faint" style={{ fontSize: 12 }}>What each kind of agent may do in this project, and how it starts. Whatever is allowed here, an agent never reviews its own work.</div>
+      {agents.map((a) => (
+        <div key={a._key}>
+          <div className="row" data-testid={`agent-type-${a.name}`}>
+            <b>{a.name}</b>{!a.builtin && <span className="chip">custom</span>}
+            <span className="faint" style={{ fontSize: 11.5 }}>{(a.permissions ?? []).length} permission{(a.permissions ?? []).length === 1 ? "" : "s"}</span>
+            <span className="spacer" />
+            <button className="btn sm ghost-btn" onClick={() => edit(a)}>{open === a.name ? "Close" : editable ? "Edit" : "View"}</button>
+          </div>
+          {open === a.name && (
+            <div style={{ padding: "4px 0 10px" }}>
+              <label className="label">Start-up prompt{a.builtin ? " (added to the built-in role prompt)" : ""}</label>
+              <textarea className="textarea" value={draft.prompt} disabled={!editable} onChange={(e) => setDraft({ ...draft, prompt: e.target.value })} />
+              <label className="label">Permissions</label>
+              <div className="perm-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: 4 }}>
+                {catalogue.map((p) => (
+                  <label key={p.name} className="row" style={{ fontSize: 12, gap: 6 }} title={p.description}>
+                    <input type="checkbox" disabled={!editable} checked={draft.permissions.includes(p.name)}
+                      onChange={(e) => setDraft({ ...draft, permissions: e.target.checked ? [...draft.permissions, p.name] : draft.permissions.filter((x) => x !== p.name) })} />
+                    <span className="mono">{p.name}</span>
+                  </label>
+                ))}
+              </div>
+              {editable && <div className="row"><span className="spacer" /><button className="btn sm primary" onClick={() => save(a.name)} data-testid={`save-agent-${a.name}`}>Save</button></div>}
+            </div>
+          )}
+        </div>
+      ))}
+      {editable && (
+        <div className="row">
+          <input className="input" placeholder="New custom agent, e.g. policy" value={custom} onChange={(e) => setCustom(e.target.value)} />
+          <button className="btn sm" disabled={!custom.trim()} onClick={() => api.putAgentType(`custom:${custom.trim()}`, { prompt: `You are the ${custom.trim()} agent.`, permissions: ["create_work_items"] })
+            .then(() => { setCustom(""); load(); }).catch((e) => toast("error", e.message))}>Add</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AgentUsers({ project }: { project: string }) {
   const toast = useToast();
   const [agents, setAgents] = useState<Json[]>([]);
@@ -164,7 +226,7 @@ function AgentUsers({ project }: { project: string }) {
   return (
     <div className="card" data-testid="agent-users">
       <div className="section-title">External agents (MCP)</div>
-      <div className="faint" style={{ fontSize: 12 }}>An assistant such as Claude Code acts as its own agent user, linked to you — never as you.</div>
+      <div className="faint" style={{ fontSize: 12 }}>An assistant such as Claude Code acts as its own remote agent, linked to you — never as you. Remote agents may add work items, edit requirements and start tests; they never change code or deploy.</div>
       {agents.map((a) => (
         <div key={a.key} className="row">
           <b>{a.display_name}</b><span className="faint mono">{a.key}</span><span className="spacer" />

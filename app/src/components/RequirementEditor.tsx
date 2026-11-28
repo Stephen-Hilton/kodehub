@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type Example, type Group, type Json, type Requirement } from "../lib/api";
+import { api, type Example, type Json, type Requirement, type TagCoverage } from "../lib/api";
 import { relTime } from "../lib/health";
 import { Clock, Plus, Save, X } from "./icons";
 import { StatusBadge } from "./RequirementsPanel";
@@ -60,8 +60,8 @@ function ExampleList({ items, onChange, testid }: { items: Ex[]; onChange: (v: E
 }
 
 /** Editable requirement anatomy (doc 05). `focusEdgeCase` opens with a fresh edge-case row. */
-export function RequirementEditor({ reqKey, groups, focusEdgeCase, onClose, onCreated }: {
-  reqKey: string | null; groups: Group[]; focusEdgeCase: boolean; onClose: () => void; onCreated?: (key: string) => void;
+export function RequirementEditor({ reqKey, tags, focusEdgeCase, onClose, onCreated }: {
+  reqKey: string | null; tags: TagCoverage[]; focusEdgeCase: boolean; onClose: () => void; onCreated?: (key: string) => void;
 }) {
   const toast = useToast();
   const creating = reqKey === null;
@@ -73,10 +73,13 @@ export function RequirementEditor({ reqKey, groups, focusEdgeCase, onClose, onCr
   const [examples, setExamples] = useState<Ex[]>([]);
   const [edgeCases, setEdgeCases] = useState<Ex[]>([]);
   const [outOfScope, setOutOfScope] = useState<string[]>([]);
-  const [group, setGroup] = useState(groups[0]?.key ?? "");
+  const [tagText, setTagText] = useState("");
   const [history, setHistory] = useState<Json[]>([]);
   const [saving, setSaving] = useState(false);
   const [tab, setTab] = useState<"anatomy" | "history">("anatomy");
+  // every version but the current one (requirement versions are immutable; proposed and
+  // rejected changes show with their state)
+  const earlier = history.filter((h) => !(h.revision === orig?.revision && h.state === "accepted"));
   const edgeRef = useRef<HTMLDivElement>(null);
   // fields are initialised once per requirement: a late/repeated load never clobbers edits
   const initFor = useRef<string | null>(null);
@@ -120,13 +123,14 @@ export function RequirementEditor({ reqKey, groups, focusEdgeCase, onClose, onCr
     try {
       if (creating) {
         const r = await api.createRequirement({ title, statement, intent, constraints, out_of_scope: outOfScope,
-          examples: examples.map(fromEx), edge_cases: edgeCases.map(fromEx), group: group || undefined });
+          examples: examples.map(fromEx), edge_cases: edgeCases.map(fromEx),
+          tags: tagText.split(",").map((t) => t.trim()).filter(Boolean) });
         toast("success", `Created “${title || statement}”`);
         onCreated?.(r._key);
         onClose();
       } else {
         await api.updateRequirement(reqKey!, patch);
-        toast("success", `${title} updated — everything beneath it is now at risk and the orchestrator is planning a changeset.`);
+        toast("success", `${title} updated — everything beneath it is now at risk and the orchestrator is planning the change.`);
         onClose();
       }
     } catch (e) {
@@ -154,7 +158,7 @@ export function RequirementEditor({ reqKey, groups, focusEdgeCase, onClose, onCr
           <div className="tabs">
             <button className={`tab ${tab === "anatomy" ? "active" : ""}`} onClick={() => setTab("anatomy")}>Anatomy</button>
             <button className={`tab ${tab === "history" ? "active" : ""}`} onClick={() => setTab("history")}>
-              <Clock size={12} /> History <span className="count">{history.length}</span>
+              <Clock size={12} /> History <span className="count">{earlier.length}</span>
             </button>
           </div>
         )}
@@ -169,13 +173,12 @@ export function RequirementEditor({ reqKey, groups, focusEdgeCase, onClose, onCr
               <textarea className="textarea" value={statement} onChange={(e) => setStatement(e.target.value)} placeholder="What must be true" data-testid="req-statement" />
               <label className="label">Intent</label>
               <textarea className="textarea" value={intent} onChange={(e) => setIntent(e.target.value)} placeholder="Why it exists" />
-              {creating && groups.length > 0 && (
+              {creating && (
                 <>
-                  <label className="label">Group</label>
-                  <select className="select" value={group} onChange={(e) => setGroup(e.target.value)}>
-                    <option value="">(none)</option>
-                    {groups.map((g) => <option key={g.key} value={g.key}>{g.title}</option>)}
-                  </select>
+                  <label className="label">Tags</label>
+                  <input className="input" list="req-tags" value={tagText} onChange={(e) => setTagText(e.target.value)}
+                    placeholder="comma separated, e.g. secure-authentication" data-testid="req-tags" />
+                  <datalist id="req-tags">{tags.map((g) => <option key={g.tag} value={g.tag} />)}</datalist>
                 </>
               )}
               <h4>Constraints</h4>
@@ -213,10 +216,10 @@ export function RequirementEditor({ reqKey, groups, focusEdgeCase, onClose, onCr
             </>
           ) : (
             <div style={{ marginTop: 12 }}>
-              {history.length === 0 && <div className="empty">No earlier revisions.</div>}
-              {history.map((h) => (
+              {earlier.length === 0 && <div className="empty">No earlier revisions.</div>}
+              {earlier.map((h) => (
                 <div key={h._key} className="card" style={{ padding: 12, marginBottom: 8 }}>
-                  <div className="row"><b>Revision {h.revision}</b><span className="spacer" /><span className="faint">{relTime(h.superseded_at)} · by {h.superseded_by}</span></div>
+                  <div className="row"><b>Revision {h.revision}</b>{h.state !== "accepted" && <span className="badge ghost">{h.state}</span>}<span className="spacer" /><span className="faint">{relTime(h.created_at)} · by {h.created_by}</span></div>
                   <div className="muted" style={{ marginTop: 6 }}>{h.snapshot?.statement}</div>
                   <div className="faint" style={{ marginTop: 4, fontSize: 12 }}>{h.snapshot?.edge_cases?.length ?? 0} edge cases · {h.snapshot?.examples?.length ?? 0} examples</div>
                 </div>

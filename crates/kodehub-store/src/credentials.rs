@@ -23,7 +23,22 @@ use crate::identity::{Owner, Principal};
 use crate::settings::{human_of, parse_scope};
 use crate::{Result, Store, StoreError};
 
-pub const CREDENTIALS: &str = "kodehub_credentials";
+pub const CREDENTIALS: &str = "secrets";
+/// Edges from a secret to what it unlocks (D-061): `secrets → users | orgs | projects |
+/// remote_agents | deployers`.
+pub const SECURES: &str = "secures";
+
+/// The holder a credential scope names (`user:x` → `users/x`).
+fn holder_of(scope: &str) -> Option<String> {
+    let (k, id) = scope.split_once(':')?;
+    let coll = match k {
+        "user" => crate::identity::USERS,
+        "org" => crate::identity::ORGS,
+        "project" => crate::schema::PROJECTS,
+        _ => return None,
+    };
+    Some(format!("{coll}/{id}"))
+}
 
 pub const KINDS: &[&str] = &["api_key", "subscription_token", "git_token"];
 
@@ -192,6 +207,17 @@ impl Store {
                 Some(&doc),
             )
             .await?;
+        if let Some(holder) = holder_of(scope) {
+            let from = format!("{CREDENTIALS}/{}", cred_key(scope, provider, kind));
+            self.db
+                .db_raw(
+                    Method::POST,
+                    &format!("/_api/document/{SECURES}?overwriteMode=ignore"),
+                    Some(&json!({"_key": crate::edge_key(SECURES, &from, &holder),
+                                 "_from": from, "_to": holder, "created_at": now_iso()})),
+                )
+                .await?;
+        }
         Ok(public(&v["new"]))
     }
 
@@ -213,6 +239,11 @@ impl Store {
                 None,
             )
             .await?;
+        self.g_aql(
+            "FOR e IN @@s FILTER e._from == @f REMOVE e IN @@s",
+            json!({"@s": SECURES, "f": format!("{CREDENTIALS}/{id}")}),
+        )
+        .await?;
         Ok(())
     }
 

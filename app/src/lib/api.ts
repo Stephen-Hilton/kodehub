@@ -18,7 +18,10 @@ export interface MapNode {
   tags?: string[];
   description?: string;
   ghost?: boolean;
-  changeset?: string;
+  /** Ghost nodes: the work item whose proposal adds them. */
+  work_item?: string;
+  /** C4 nodes awaiting a human approval (not yet in any project version). */
+  planned?: boolean;
   action?: string;
   proposed_in?: string[];
   version?: string | null;
@@ -53,6 +56,8 @@ export interface MapData {
   nodes: MapNode[];
   edges: MapEdge[];
   at: string | null;
+  /** The project version shown (the current one unless `at` names another). */
+  project_version?: { id: string; name: string; state: string; current: boolean };
 }
 
 export interface Requirement {
@@ -69,7 +74,10 @@ export interface Requirement {
   at_risk: boolean;
   status: string;
   tests: { test: string; name: string; status: string; language: string }[];
-  satisfiers: string[];
+  /** Nodes the requirement applies to (inherited by everything beneath them). */
+  applies_to: string[];
+  tags: string[];
+  kind?: string;
   path?: Json;
   history_count?: number;
 }
@@ -80,17 +88,20 @@ export interface Example {
   expected: Json;
 }
 
-export interface Group {
-  id: string;
-  key: string;
-  title: string;
-  logic: string;
+/** Coverage of the requirements sharing a tag (tags replace v0.1 requirement groups). */
+export interface TagCoverage {
+  tag: string;
   status: string;
   members: string[];
 }
 
-export interface Changeset {
+/** A work item's proposal (D-058; v0.1 changesets). `_key` is the work item key. */
+export interface Proposal {
   _key: string;
+  work_item: string;
+  project_version?: string;
+  agent_type?: string;
+  work_state?: string;
   title: string;
   intent: string;
   state: string;
@@ -106,8 +117,41 @@ export interface Changeset {
   transcripts?: Json[];
   error?: string | null;
   created_at: string;
-  merged_at?: string;
+  accepted_at?: string;
+  accepted_versions?: Record<string, string>;
+  checks?: Json;
 }
+
+/** A project version: the release (D-059). */
+export interface ProjectVersion {
+  _key: string;
+  _id: string;
+  name: string;
+  number: number;
+  state: "open" | "frozen";
+  based_on: string | null;
+  hotfix_of?: string | null;
+  current: boolean;
+  running_in: string[];
+  created_at: string;
+  frozen_at?: string;
+}
+
+/** The key of a project version id (paths take keys). */
+export const pvKey = (id: string) => id.split("/").pop() ?? id;
+
+/** A node key without its project prefix (`<project>.<local>` → `<local>`), for display. */
+export const localKey = (idOrKey: string) => {
+  const k = idOrKey.split("/").pop() ?? idOrKey;
+  const i = k.indexOf(".");
+  return i >= 0 ? k.slice(i + 1) : k;
+};
+
+/** A node id without its project prefix (`code/<project>.x` → `code/x`), for test ids. */
+export const localId = (id: string) => {
+  const i = id.indexOf("/");
+  return i >= 0 ? `${id.slice(0, i)}/${localKey(id)}` : localKey(id);
+};
 
 /** Base URL: same origin in the browser (Vite proxy / static serving); explicit in Tauri. */
 export function apiBase(): string {
@@ -234,7 +278,8 @@ export const api = {
   decide: (key: string, approve: boolean, note = "") => call<Json>("POST", `/api/approvals/${key}/decide`, { approve, note }),
   notifications: () => call<Json[]>("GET", "/api/notifications?unread=true"),
   readNotification: (key: string) => call<Json>("POST", `/api/notifications/${key}/read`),
-  agentTypes: () => call<Json[]>("GET", "/api/agent-types"),
+  agentTypes: () => call<{ agents: Json[]; permissions: { name: string; description: string }[] }>("GET", "/api/agent-types"),
+  putAgentType: (name: string, patch: Json) => call<Json>("PUT", `/api/agent-types/${encodeURIComponent(name)}`, patch),
   // layered settings, credentials, agent users and tokens
   scopeSettings: (scope: string) => call<Json>("GET", `/api/scopes/${scope}/settings`),
   setSetting: (scope: string, key: string, value: Json) => call<Json>("PUT", `/api/scopes/${scope}/settings/${key}`, { value }),
@@ -253,7 +298,7 @@ export const api = {
   backup: () => call<Json>("POST", "/api/backups"),
   seed: (path: string) => call("POST", "/api/seed", { path }),
   map: (at?: string | null) => call<MapData>("GET", "/api/map" + (at ? `?at=${encodeURIComponent(at)}` : "")),
-  requirements: () => call<{ requirements: Requirement[]; groups: Group[]; summary: Record<string, number> }>("GET", "/api/requirements"),
+  requirements: () => call<{ requirements: Requirement[]; tags: TagCoverage[]; summary: Record<string, number> }>("GET", "/api/requirements"),
   requirement: (key: string) => call<Requirement>("GET", `/api/requirements/${key}`),
   requirementHistory: (key: string) => call<Json[]>("GET", `/api/requirements/${key}/history`),
   updateRequirement: (key: string, patch: Json) => call("PATCH", `/api/requirements/${key}`, { patch }),
@@ -265,22 +310,22 @@ export const api = {
   run: (symbol: string, args: Json, environment: string, token?: string) =>
     call<Json>("POST", "/api/run", { symbol, args, environment, token }),
   runTests: (scope?: Json) => call<Json>("POST", "/api/tests/run", { scope: scope ?? { kind: "all" } }),
-  changesets: () => call<Changeset[]>("GET", "/api/changesets"),
-  changeset: (key: string) => call<Changeset>("GET", `/api/changesets/${key}`),
-  openChangeset: (b: Json) => call<Changeset>("POST", "/api/changesets", b),
-  proposeVersion: (key: string, b: Json) => call("POST", `/api/changesets/${key}/versions`, b),
+  // work-item proposals (D-058)
+  proposals: (open = false) => call<Proposal[]>("GET", `/api/proposals${open ? "?open=true" : ""}`),
+  proposal: (key: string) => call<Proposal>("GET", `/api/work-items/${key}/proposal`),
+  openProposal: (b: Json) => call<Proposal>("POST", "/api/proposals", b),
+  proposeVersion: (key: string, b: Json) => call("POST", `/api/work-items/${key}/proposal/versions`, b),
   manualEdit: (symbol: string, body: string) => call("POST", "/api/manual-edit", { symbol, body }),
   resolve: (key: string, choice: string, rationale: string, to: "building" | "testing") =>
-    call("POST", `/api/changesets/${key}/resolve`, { choice, rationale, to }),
+    call("POST", `/api/work-items/${key}/proposal/resolve`, { choice, rationale, to }),
   applyChat: (key: string, apply: boolean) => call("POST", `/api/chat/${key}/apply`, { apply }),
-  approveProd: (release: string, env = "prod") => call<{ approval: string }>("POST", `/api/environments/${env}/approvals`, { release }),
-  plan: (key: string, plan: Json) => call("POST", `/api/changesets/${key}/plan`, { plan, by: "human" }),
-  approve: (key: string) => call("POST", `/api/changesets/${key}/approve`, { by: "human" }),
-  reject: (key: string, reason: string) => call("POST", `/api/changesets/${key}/reject`, { by: "human", reason }),
-  merge: (key: string) => call("POST", `/api/changesets/${key}/merge`, { by: "human" }),
-  resume: (key: string) => call("POST", `/api/changesets/${key}/run`),
-  replan: (key: string) => call("POST", `/api/changesets/${key}/replan`),
-  transition: (key: string, to: string, note = "") => call("POST", `/api/changesets/${key}/transition`, { to, note, by: "human" }),
+  plan: (key: string, plan: Json) => call("POST", `/api/work-items/${key}/proposal/plan`, { plan, by: "human" }),
+  approve: (key: string) => call("POST", `/api/work-items/${key}/proposal/approve`, { by: "human" }),
+  reject: (key: string, reason: string) => call("POST", `/api/work-items/${key}/proposal/reject`, { by: "human", reason }),
+  accept: (key: string) => call("POST", `/api/work-items/${key}/proposal/accept`, { by: "human" }),
+  resume: (key: string) => call("POST", `/api/work-items/${key}/proposal/run`),
+  replan: (key: string) => call("POST", `/api/work-items/${key}/proposal/replan`),
+  transition: (key: string, to: string, note = "") => call("POST", `/api/work-items/${key}/proposal/transition`, { to, note, by: "human" }),
   agents: () => call<Json>("GET", "/api/agents"),
   chatHistory: () => call<Json[]>("GET", "/api/chat"),
   chat: (message: string, references: string[]) => call<Json>("POST", "/api/chat", { message, references }),
@@ -292,15 +337,19 @@ export const api = {
   nearDuplicates: (t: number) => call<{ exact: Json[]; near: Json[] }>("GET", `/api/duplicates?near=${t}`),
   settings: () => call<Json>("GET", "/api/settings"),
   patchAgents: (p: Json) => call<Json>("PATCH", "/api/settings/agents", p),
-  releases: () => call<Json[]>("GET", "/api/releases"),
-  cutRelease: (name: string, notes: string, rule?: Json) => call<Json>("POST", "/api/releases", { name, notes, rule }),
-  diff: (a: string, b: string) => call<Json>("GET", `/api/releases/${a}/diff/${b}`),
+  // project versions are the releases; deployments carry them into environments (D-059, D-060)
+  projectVersions: () => call<ProjectVersion[]>("GET", "/api/project-versions"),
+  newProjectVersion: (name: string, based_on?: string) => call<ProjectVersion>("POST", "/api/project-versions", { name, based_on }),
+  freezeVersion: (id: string, reason: string) => call<ProjectVersion>("POST", `/api/project-versions/${pvKey(id)}/freeze`, { reason }),
+  makeCurrent: (id: string) => call<ProjectVersion>("POST", `/api/project-versions/${pvKey(id)}/current`),
+  hotfix: (id: string, name?: string) => call<ProjectVersion>("POST", `/api/project-versions/${pvKey(id)}/hotfix`, { name }),
+  diff: (a: string, b: string) => call<Json>("GET", `/api/project-versions/${pvKey(a)}/diff/${pvKey(b)}`),
   environments: () => call<Json[]>("GET", "/api/environments"),
-  promote: (env: string, release: string, approval?: string) =>
-    call<Json>("POST", `/api/environments/${env}/promote`, { release, approval }),
-  rollback: (env: string, approval?: string) => call<Json>("POST", `/api/environments/${env}/rollback`, { approval }),
-  cloneRelease: (key: string, environment: string) => call<Json>("POST", `/api/releases/${key}/clone`, { environment }),
-  patchRelease: (key: string, swaps: { symbol: string; version: string }[], approval?: string) =>
-    call<Json>("POST", `/api/releases/${key}/patch`, { swaps, approval }),
+  deployments: (environment?: string) => call<Json[]>("GET", `/api/deployments${environment ? `?environment=${environment}` : ""}`),
+  deploy: (project_version: string, environment: string, reason = "promote") =>
+    call<Json>("POST", "/api/deployments", { project_version, environment, reason }),
+  approveDeployment: (key: string) => call<Json>("POST", `/api/deployments/${key}/approve`),
+  retryDeployment: (key: string) => call<Json>("POST", `/api/deployments/${key}/retry`),
+  rollback: (env: string) => call<Json>("POST", `/api/environments/${env}/rollback`),
   mcpCommand: () => call<{ command: string }>("GET", "/api/terminal/mcp-command"),
 };

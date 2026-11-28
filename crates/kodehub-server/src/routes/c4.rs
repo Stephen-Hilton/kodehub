@@ -44,7 +44,7 @@ pub async fn put_philosophy(
         )
         .await?;
     s.events
-        .emit("node.changed", json!({"id": "philosophy/philosophy"}));
+        .emit("node.changed", json!({"id": s.store.philosophy_id()?}));
     Ok(Json(doc))
 }
 
@@ -85,27 +85,38 @@ pub async fn requirement_counts(State(s): State<AppState>) -> ApiResult<Value> {
     Ok(Json(json!(s.store.requirement_counts().await?)))
 }
 
+/// Every version of a node (C4, code or test), newest first: `accepted` (written into a
+/// project version), `candidate` (a work item's proposal) or `discarded`; `current` marks the
+/// one in the current project version, `project_versions` names every version holding it.
 pub async fn versions(State(s): State<AppState>, Query(q): Query<NodeQ>) -> ApiResult<Value> {
-    let rows = s
+    let node = s.store.db.qid(&q.node)?;
+    let mut rows = s
         .store
         .aql(
-            "FOR e IN @@has_version FILTER e._from == @n SORT e.seq DESC
-               RETURN {version: PARSE_IDENTIFIER(e._to).key, collection: PARSE_IDENTIFIER(e._to).collection,
-                       seq: e.seq, state: e.state, validFrom: e.validFrom, validTo: e.validTo,
-                       changeset: e.changeset}",
-            json!({"n": q.node}),
+            "FOR e IN @@has_version FILTER e._from == @n SORT e.seq DESC, e.created_at DESC
+               RETURN {version: PARSE_IDENTIFIER(e._to).key, id: e._to,
+                       collection: PARSE_IDENTIFIER(e._to).collection,
+                       seq: e.seq, state: e.state, work_item: e.work_item,
+                       created_at: e.created_at, created_by: e.created_by}",
+            json!({"n": node}),
         )
         .await?;
-    let rows: Vec<Value> = rows
-        .into_iter()
-        .map(|mut r| {
-            if let Some(c) = r["collection"].as_str() {
-                let logical = c.rsplit("__").next().unwrap_or(c).to_string();
-                r["collection"] = json!(logical);
-            }
-            r
-        })
-        .collect();
+    let cur = s.store.tree(None).await?.version(&node).map(str::to_string);
+    let mut holding: std::collections::BTreeMap<String, Vec<Value>> = Default::default();
+    for pv in s.store.list_project_versions().await? {
+        let id = pv["_id"].as_str().unwrap_or_default().to_string();
+        if let Some(v) = s.store.tree(Some(&id)).await?.version(&node) {
+            holding
+                .entry(v.to_string())
+                .or_default()
+                .push(json!({"id": id, "name": pv["name"], "state": pv["state"]}));
+        }
+    }
+    for r in rows.iter_mut() {
+        let id = r["id"].as_str().unwrap_or_default().to_string();
+        r["current"] = json!(cur.as_deref() == Some(id.as_str()));
+        r["project_versions"] = json!(holding.get(&id).cloned().unwrap_or_default());
+    }
     Ok(Json(json!(rows)))
 }
 
@@ -151,7 +162,11 @@ pub async fn link_use_case(
     Json(b): Json<UcLink>,
 ) -> ApiResult<Value> {
     s.store
-        .link_use_case(&format!("use_cases/{k}"), &b.edge, &b.to)
+        .link_use_case(
+            &s.store.db.pid("use_cases", &k)?,
+            &b.edge,
+            &s.store.db.qid(&b.to)?,
+        )
         .await?;
     Ok(Json(s.store.get_use_case(&k).await?))
 }

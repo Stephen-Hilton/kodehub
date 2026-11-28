@@ -200,7 +200,7 @@ async fn remote_mcp_with_oauth_and_transcription() {
         .contains("R1 — Generic failure"));
     let me = t.store.authenticate(&access).await.unwrap();
     assert!(!me.is_human());
-    assert_eq!(me.on_behalf_of().as_deref(), Some("kodehub_users/tester"));
+    assert_eq!(me.on_behalf_of().as_deref(), Some("users/tester"));
     let audit = t.uok("GET", "/api/audit?class=external_agent", None).await;
     assert!(audit
         .as_array()

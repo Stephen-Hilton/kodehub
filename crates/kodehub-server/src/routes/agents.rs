@@ -18,17 +18,22 @@ pub async fn status(State(s): State<AppState>) -> ApiResult<Value> {
     v["backend"] = json!(cfg.agents.backend);
     v["token_env"] = json!(cfg.agents.token_env);
     v["model"] = json!(cfg.agents.model);
-    let open = s.store.list_changesets(true).await?;
-    v["open_changesets"] = json!(open.len());
+    let open = s.store.list_proposals(true).await?;
+    v["open_proposals"] = json!(open.len());
     Ok(Json(v))
 }
 
+/// The conversation with the orchestrator (an `agent_chats` thread), oldest first.
 pub async fn history(State(s): State<AppState>) -> ApiResult<Vec<Value>> {
+    let chat = kodehub_agents::engine::main_chat(&s.store)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(
         s.store
             .aql(
-                "FOR m IN @@chat_messages SORT m.created_at DESC LIMIT 100 RETURN m",
-                json!({}),
+                "FOR e IN @@has_message FILTER e._from == @c LET m = DOCUMENT(e._to)
+                   SORT m.created_at DESC LIMIT 100 RETURN MERGE(m, m.data)",
+                json!({"c": chat}),
             )
             .await?
             .into_iter()

@@ -123,7 +123,7 @@ export function computeLayout(data: MapData, showTests: boolean, aspect = 1.6): 
       children.set(n.parent, arr);
     } else roots.push(n);
   }
-  const edges = data.edges.filter((e) => ids.has(e.source) && ids.has(e.target) && e.kind !== "tested_by");
+  const edges = data.edges.filter((e) => ids.has(e.source) && ids.has(e.target) && e.kind !== "tested_with");
   const out = new Map<string, Pos>();
 
   // size of a laid-out box, positions relative to its top-left

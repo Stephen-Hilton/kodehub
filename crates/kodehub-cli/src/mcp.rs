@@ -13,8 +13,8 @@ const SUPPORTED: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 pub struct McpOptions {
     pub read_only: bool,
     pub allow: Option<BTreeSet<String>>,
-    /// Changeset key injected into write tools that need one (agent sessions).
-    pub changeset: Option<String>,
+    /// Work item key injected into proposal tools (agent sessions).
+    pub work_item: Option<String>,
 }
 
 pub fn tool_list(opts: &McpOptions) -> Vec<Value> {
@@ -43,7 +43,7 @@ pub async fn handle(client: &Client, opts: &McpOptions, msg: &Value) -> Option<V
                 "protocolVersion": v,
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "kodehub", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "Kodehub graph API: code lives as symbol/version nodes linked to requirements, tests and decisions. Use list_requirements, coverage, get_symbol, impact, traverse to read; changeset tools to propose changes.",
+                "instructions": "Kodehub graph API: code lives as code/test nodes with immutable versions, organised in C4 and project versions, linked to requirements and tests. Use list_requirements, coverage, get_symbol, impact, traverse to read; proposal tools (on a work item) to propose changes.",
             }))
         }
         "ping" => Ok(json!({})),
@@ -60,14 +60,14 @@ pub async fn handle(client: &Client, opts: &McpOptions, msg: &Value) -> Option<V
                     json!({"content": [{"type": "text", "text": format!("tool `{name}` is not available in this session")}], "isError": true}),
                 )
             } else {
-                // A session scoped to a changeset can only act on that changeset.
-                if let (Some(cs), Some(o)) = (&opts.changeset, args.as_object_mut()) {
-                    let scoped = o.contains_key("changeset")
-                        || name.contains("changeset")
+                // A session scoped to a work item can only act on that work item's proposal.
+                if let (Some(wi), Some(o)) = (&opts.work_item, args.as_object_mut()) {
+                    let scoped = o.contains_key("work_item")
+                        || name.contains("proposal")
                         || name.starts_with("propose")
                         || name == "submit_review";
                     if scoped {
-                        o.insert("changeset".into(), json!(cs));
+                        o.insert("work_item".into(), json!(wi));
                     }
                 }
                 match client.tool(&name, &args).await {

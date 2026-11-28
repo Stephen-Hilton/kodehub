@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use crate::identity::{Owner, Permission, Principal};
 use crate::{Result, Store, StoreError};
 
-pub const SETTINGS: &str = "kodehub_settings";
+pub const SETTINGS: &str = "settings";
 
 /// A known setting: key, application default, per-actor flag, description.
 pub struct SettingDef {
@@ -123,12 +123,12 @@ pub fn registry() -> Vec<SettingDef> {
                     {"name": "dev", "max_releases": null},
                     {"name": "test", "max_releases": null},
                     {"name": "qa", "max_releases": null},
-                    {"name": "preprod", "max_releases": 1},
-                    {"name": "prod", "max_releases": 1, "requires_human_approval": true},
+                    {"name": "preprod", "max_releases": null},
+                    {"name": "prod", "max_releases": null, "requires_human_approval": true},
                 ])
             },
             per_actor: false,
-            description: "Ordered environments, lowest first, with their release limits.",
+            description: "Ordered environments, lowest first. A deployment supersedes earlier ones serving the same deploy targets; max_releases optionally caps how many project versions an environment holds (D-060).",
         },
         SettingDef {
             key: "lease_secs",

@@ -40,7 +40,7 @@ pub struct TestOutcome {
     pub cached: bool,
 }
 
-/// Tests whose closure includes `symbol`, plus tests attached via `tested_by`.
+/// Tests whose closure includes `symbol`, plus tests attached via `tested_with`.
 pub fn tests_for_symbol(g: &CodeGraph, symbol: &str) -> BTreeSet<String> {
     g.tests_reaching(symbol)
 }
@@ -59,11 +59,11 @@ impl Runner {
                 .filter(|s| s.kind == Kind::Test)
                 .map(|s| s.id.clone())
                 .collect(),
-            TestScope::Symbol(s) => tests_for_symbol(g, kodehub_store::key_of(s)),
+            TestScope::Symbol(s) => tests_for_symbol(g, &store.db.pkey(kodehub_store::key_of(s))?),
             TestScope::Tests(t) => t
                 .iter()
-                .map(|x| kodehub_store::key_of(x).to_string())
-                .collect(),
+                .map(|x| store.db.pkey(kodehub_store::key_of(x)))
+                .collect::<std::result::Result<_, _>>()?,
             TestScope::Requirement(r) => {
                 let cov = store.coverage(Some(kodehub_store::key_of(r))).await?;
                 cov.requirements
@@ -106,7 +106,8 @@ impl Runner {
             if !force {
                 let cached = store
                     .aql(
-                        "FOR r IN @@test_runs FILTER r.test_version == @v AND r.closure_hash == @c AND r.status == 'pass'
+                        "FOR r IN @@test_logs FILTER r.test_version == @v AND r.closure_hash == @c AND r.status == 'pass'
+                           AND r.kind != 'run'
                          SORT r.ran_at DESC LIMIT 1 RETURN r",
                         json!({"v": s.version, "c": closure}),
                     )
@@ -132,11 +133,9 @@ impl Runner {
             let results = self.run_batch(g, lang, &ids, stream.clone()).await?;
             for o in results {
                 store
-                    .db
-                    .insert(
-                        "test_runs",
-                        &json!({
-                            "test_symbol": o.test,
+                    .record_test_log(
+                        json!({
+                            "test": o.test,
                             "test_name": o.name,
                             "test_version": o.version,
                             "closure_hash": o.closure_hash,
@@ -144,7 +143,7 @@ impl Runner {
                             "output": o.output,
                             "duration_ms": o.duration_ms,
                             "ran_at": now_iso(),
-                            "changeset": changeset,
+                            "work_item": changeset,
                         }),
                         None,
                     )
@@ -440,7 +439,7 @@ impl Runner {
     pub async fn latest_results(store: &Store, limit: usize) -> Result<Vec<Value>> {
         Ok(store
             .aql(
-                "FOR r IN @@test_runs SORT r.ran_at DESC LIMIT @n RETURN r",
+                "FOR r IN @@test_logs FILTER r.kind != 'run' SORT r.ran_at DESC LIMIT @n RETURN r",
                 json!({"n": limit}),
             )
             .await?)

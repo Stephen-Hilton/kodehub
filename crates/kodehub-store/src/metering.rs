@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use crate::{Result, Store};
 
-pub const USAGE: &str = "kodehub_usage";
+pub const USAGE: &str = "usage";
 
 /// Estimated USD per million tokens (input, output) for a model family. Pilot estimates; the
 /// recorded backend costs nothing.

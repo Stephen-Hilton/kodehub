@@ -1,6 +1,9 @@
-//! Requirements (the main human input), missions and decisions.
+//! Requirements (the main human input), the philosophy (as the v0.05 mission) and decisions
+//! (requirements of kind `decision`). Requirements attach with `applies_to` and group by
+//! `tags` (docs/ontology.md).
 
 use axum::extract::{Path, State};
+use axum::Extension;
 use axum::Json;
 use kodehub_store::key_of;
 use serde::Deserialize;
@@ -25,12 +28,16 @@ pub async fn missions(State(s): State<AppState>) -> ApiResult<Vec<Value>> {
     ))
 }
 
-/// Requirements with anatomy and coverage, plus the group tree.
+/// Requirements with anatomy and coverage, plus coverage per tag.
 pub async fn list(State(s): State<AppState>) -> ApiResult<Value> {
     let cov = s.store.coverage(None).await?;
     let docs = s
         .store
-        .aql("FOR r IN @@requirements SORT r.title RETURN r", json!({}))
+        .aql(
+            "FOR r IN @@requirements FILTER r.kind != 'decision' AND (r.state == null OR r.state == 'accepted')
+               SORT r.title RETURN r",
+            json!({}),
+        )
         .await?;
     let reqs: Vec<Value> = docs
         .into_iter()
@@ -42,46 +49,46 @@ pub async fn list(State(s): State<AppState>) -> ApiResult<Value> {
             {
                 d["status"] = json!(c.status);
                 d["tests"] = serde_json::to_value(&c.tests).unwrap();
-                d["satisfiers"] = json!(c.satisfiers);
+                d["applies_to"] = json!(c.applies_to);
             }
             d
         })
         .collect();
-    let groups: Vec<Value> = cov
-        .groups
+    let tags: Vec<Value> = cov
+        .tags
         .iter()
         .map(|g| serde_json::to_value(g).unwrap())
         .collect();
     let mut summary = json!(cov.summary);
     summary["total"] = json!(reqs.len());
     Ok(Json(
-        json!({"requirements": reqs, "groups": groups, "summary": summary}),
+        json!({"requirements": reqs, "tags": tags, "summary": summary}),
     ))
 }
 
 pub async fn get(State(s): State<AppState>, Path(key): Path<String>) -> ApiResult<Value> {
-    let key = key_of(&key).to_string();
+    let key = s.store.db.pkey(key_of(&key))?;
     let mut doc = s.store.db.get("requirements", &key, None).await?;
     let cov = s.store.coverage(Some(&key)).await?;
     if let Some(c) = cov.requirements.first() {
         doc["status"] = json!(c.status);
         doc["tests"] = serde_json::to_value(&c.tests).unwrap();
-        doc["satisfiers"] = json!(c.satisfiers);
+        doc["applies_to"] = json!(c.applies_to);
     }
-    // the full path for map highlighting: satisfiers, everything beneath them, tests, decisions
+    // the full path for map highlighting: what it applies to, everything beneath, tests,
+    // decisions about the same nodes
     let path = s
         .store
         .aql(
-            "LET r = CONCAT(@pfx, 'requirements/', @k)
-             LET sat = (FOR e IN @@satisfies FILTER e._to == r RETURN e._from)
-             LET groups = (FOR e IN @@includes FILTER e._to == r RETURN e._from)
-             LET gsat = (FOR g IN groups FOR e IN @@satisfies FILTER e._to == g RETURN e._from)
-             LET beneath = UNIQUE(FOR x IN sat FOR v IN 0..30 OUTBOUND x @@contains, @@calls, @@depends_on, @@member_of
+            "LET r = CONCAT('requirements/', @k)
+             LET at = (FOR e IN @@applies_to FILTER e._from == r RETURN e._to)
+             LET beneath = UNIQUE(FOR x IN at FOR v IN 0..30 OUTBOUND x @@contains, @@calls, @@depends_on, @@member_of
                                     OPTIONS {uniqueVertices: 'global', order: 'bfs'} RETURN v._id)
-             LET tests = UNIQUE(APPEND((FOR e IN @@verifies FILTER e._to == r RETURN e._from),
-                                       (FOR id IN beneath FOR e IN @@tested_by FILTER e._from == id RETURN e._to)))
-             LET decisions = UNIQUE(FOR id IN APPEND(beneath, sat) FOR e IN @@justified_by FILTER e._from == id RETURN e._to)
-             RETURN {satisfiers: sat, beneath, tests, decisions, groups, group_satisfiers: gsat}",
+             LET tests = UNIQUE(APPEND((FOR e IN @@verified_by FILTER e._from == r RETURN e._to),
+                                       (FOR id IN beneath FOR e IN @@tested_with FILTER e._from == id RETURN e._to)))
+             LET decisions = UNIQUE(FOR id IN APPEND(beneath, at) FOR e IN @@applies_to FILTER e._to == id
+                                      LET d = DOCUMENT(e._from) FILTER d.kind == 'decision' RETURN d._id)
+             RETURN {applies_to: at, beneath, tests, decisions}",
             json!({"k": key}),
         )
         .await?;
@@ -97,32 +104,33 @@ pub async fn history(State(s): State<AppState>, Path(key): Path<String>) -> ApiR
 
 pub async fn create(
     State(s): State<AppState>,
+    Extension(who): Extension<kodehub_store::Principal>,
     headers: axum::http::HeaderMap,
     Json(mut body): Json<Value>,
 ) -> ApiResult<Value> {
-    crate::require_ui(&s, &headers)?;
-    let group = body.as_object_mut().and_then(|o| o.remove("group"));
-    let satisfied_by = body.as_object_mut().and_then(|o| o.remove("satisfied_by"));
+    crate::require_person(&s, &headers, &who)?;
+    // nodes it applies to (`applies_to`; `satisfied_by` is the v0.1 name)
+    let applies_to = body
+        .as_object_mut()
+        .and_then(|o| o.remove("applies_to").or_else(|| o.remove("satisfied_by")));
+    body["created_by"] = json!(who.id());
     let doc = s.store.create_requirement(body).await?;
     let id = doc["_id"].as_str().unwrap_or_default().to_string();
-    if let Some(g) = group.as_ref().and_then(Value::as_str) {
-        s.store
-            .insert_edge(
-                "includes",
-                &format!("requirement_groups/{}", key_of(g)),
-                &id,
-                json!({}),
-            )
-            .await?;
-    }
-    for sat in satisfied_by
+    for n in applies_to
         .as_ref()
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
     {
-        if let Some(n) = sat.as_str() {
-            s.store.insert_edge("satisfies", n, &id, json!({})).await?;
+        if let Some(n) = n.as_str() {
+            let n = if n == "project" {
+                s.store.project_node()?
+            } else {
+                n.to_string()
+            };
+            s.store
+                .insert_edge("applies_to", &id, &n, json!({}))
+                .await?;
         }
     }
     s.events
@@ -134,7 +142,7 @@ pub async fn create(
 pub struct EditMeta {
     #[serde(default)]
     pub by: Option<String>,
-    /// Skip auto-opening a changeset (e.g. typo fixes).
+    /// Skip queueing coding work (e.g. typo fixes).
     #[serde(default)]
     pub no_changeset: bool,
 }
@@ -161,11 +169,12 @@ async fn apply_edit(
 
 pub async fn update(
     State(s): State<AppState>,
+    Extension(who): Extension<kodehub_store::Principal>,
     headers: axum::http::HeaderMap,
     Path(key): Path<String>,
     Json(mut body): Json<Value>,
 ) -> ApiResult<Value> {
-    crate::require_ui(&s, &headers)?;
+    crate::require_person(&s, &headers, &who)?;
     let meta: EditMeta = body
         .as_object_mut()
         .and_then(|o| o.remove("_meta"))
@@ -214,34 +223,29 @@ async fn append(s: &AppState, key: &str, field: &str, b: ExampleBody) -> Result<
 
 pub async fn add_edge_case(
     State(s): State<AppState>,
+    Extension(who): Extension<kodehub_store::Principal>,
     headers: axum::http::HeaderMap,
     Path(key): Path<String>,
     Json(b): Json<ExampleBody>,
 ) -> ApiResult<Value> {
-    crate::require_ui(&s, &headers)?;
+    crate::require_person(&s, &headers, &who)?;
     Ok(Json(append(&s, key_of(&key), "edge_cases", b).await?))
 }
 
 pub async fn add_example(
     State(s): State<AppState>,
+    Extension(who): Extension<kodehub_store::Principal>,
     headers: axum::http::HeaderMap,
     Path(key): Path<String>,
     Json(b): Json<ExampleBody>,
 ) -> ApiResult<Value> {
-    crate::require_ui(&s, &headers)?;
+    crate::require_person(&s, &headers, &who)?;
     Ok(Json(append(&s, key_of(&key), "examples", b).await?))
 }
 
+/// Decisions: requirements of kind `decision`, with the nodes they apply to.
 pub async fn list_decisions(State(s): State<AppState>) -> ApiResult<Vec<Value>> {
-    Ok(Json(
-        s.store
-            .aql(
-                "FOR d IN @@decisions SORT d.created_at DESC
-                 RETURN MERGE(d, {justifies: (FOR e IN @@justified_by FILTER e._to == d._id RETURN e._from)})",
-                json!({}),
-            )
-            .await?,
-    ))
+    Ok(Json(s.store.list_decisions().await?))
 }
 
 pub async fn create_decision(

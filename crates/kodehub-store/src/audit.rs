@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use crate::identity::{AuthVia, Principal, UserKind};
 use crate::{Result, Store};
 
-pub const AUDIT: &str = "kodehub_audit";
+pub const AUDIT: &str = "audit_log";
 
 /// `human` | `external_agent` | `containerized_agent` — the three kinds admins filter by.
 pub fn actor_class(p: &Principal) -> &'static str {

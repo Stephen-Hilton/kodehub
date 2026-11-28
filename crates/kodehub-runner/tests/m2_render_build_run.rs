@@ -79,10 +79,10 @@ async fn second_run_is_a_cache_hit_under_one_second_and_helpers_rebuild_only_dep
     let r = runner();
     let g = s.load_code_graph().await.unwrap();
     let req = |sym: &str, args| RunRequest {
-        symbol: sym.into(),
+        symbol: s.db.pkey(sym).unwrap(),
         args,
         environment: "dev".into(),
-        release: None,
+        project_version: None,
     };
     let store_args = json!({"store": {"users": {}}, "username": "bob", "password": "x"});
 
@@ -165,13 +165,14 @@ async fn runaway_functions_are_killed_after_ten_seconds() {
     let r = runner();
     s.create_symbol(
         &NewSymbol {
-            key: Some("spin".into()),
+            key: Some(s.db.pkey("spin").unwrap()),
             display_name: "spin".into(),
             kind: Kind::Function,
             language: Language::Python,
             visibility: Default::default(),
             tags: vec![],
             description: None,
+            parent: Some(s.db.qid("components/password-hashing").unwrap()),
         },
         &VersionContent {
             kind: Kind::Function,
@@ -190,10 +191,10 @@ async fn runaway_functions_are_killed_after_ten_seconds() {
         .run_now(
             &g,
             &RunRequest {
-                symbol: "spin".into(),
+                symbol: s.db.pkey("spin").unwrap(),
                 args: json!({}),
                 environment: "dev".into(),
-                release: None,
+                project_version: None,
             },
             None,
         )
@@ -215,10 +216,10 @@ async fn methods_and_unsupported_params_are_not_runnable() {
         .run_now(
             &g,
             &RunRequest {
-                symbol: "UserStore-find_user".into(),
+                symbol: s.db.pkey("UserStore-find_user").unwrap(),
                 args: json!({}),
                 environment: "dev".into(),
-                release: None,
+                project_version: None,
             },
             None,
         )

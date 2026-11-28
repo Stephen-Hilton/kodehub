@@ -159,7 +159,7 @@ impl Orchestrator {
                 project: project.into(),
                 agent_type: "import".into(),
                 kind: "map_import".into(),
-                target: Some("philosophy/philosophy".into()),
+                target: Some(kodehub_store::c4::project_node_of(project)),
                 priority: kodehub_store::queue::PRIORITY_NORMAL,
                 task: json!({"import": key, "repo_url": out["repo_url"], "commit": out["commit"],
                              "summary": out["summary"], "units": brief,
@@ -237,9 +237,9 @@ impl Orchestrator {
         let tree = self
             .store
             .aql(
-                "FOR v, e, p IN 1..6 OUTBOUND CONCAT(@pfx, 'philosophy/philosophy') @@contains
+                "FOR v, e, p IN 1..6 OUTBOUND @root @@contains
                    RETURN {depth: LENGTH(p.edges), id: v._id, name: v.title || v.name || v.display_name}",
-                json!({}),
+                json!({"root": self.store.project_node()?}),
             )
             .await?;
         let mut md = format!(
@@ -270,7 +270,10 @@ impl Orchestrator {
         g: &CodeGraph,
         target: &str,
     ) -> anyhow::Result<Vec<String>> {
-        if target == "project" || target == "philosophy/philosophy" {
+        if target == "project"
+            || target.starts_with("projects/")
+            || target.starts_with("philosophy/")
+        {
             return Ok(g
                 .symbols
                 .values()
@@ -279,13 +282,17 @@ impl Orchestrator {
                 .collect());
         }
         let mut syms: BTreeSet<String> = BTreeSet::new();
-        if let Some(k) = target.strip_prefix("symbols/") {
+        if let Some(k) = target
+            .strip_prefix("code/")
+            .or_else(|| target.strip_prefix("tests/"))
+        {
             syms.insert(k.to_string());
         } else {
             let rows = self
                 .store
                 .aql(
-                    "FOR v IN 1..10 OUTBOUND @n @@contains FILTER STARTS_WITH(v._id, CONCAT(@pfx, 'symbols/')) RETURN v._key",
+                    "FOR v IN 1..10 OUTBOUND @n @@contains
+                       FILTER PARSE_IDENTIFIER(v._id).collection IN ['code', 'tests'] RETURN v._key",
                     json!({"n": target}),
                 )
                 .await?;
@@ -430,18 +437,25 @@ impl Orchestrator {
                         regressions.push(r["id"].clone());
                     }
                 }
-                self.store
+                let build = self
+                    .store
                     .db
-                    .insert(
-                        "test_runs",
-                        &json!({
-                            "test_symbol": r["id"], "test_name": r["name"], "test_version": r["version"],
+                    .pkey(
+                        &blake3::hash(format!("{bkey}|{}-test", lang.as_str()).as_bytes()).to_hex()
+                            [..24],
+                    )
+                    .map(|k| format!("builds/{k}"))
+                    .ok();
+                self.store
+                    .record_test_log(
+                        json!({
+                            "test": r["id"], "test_name": r["name"], "test_version": r["version"],
                             "closure_hash": r["closure_hash"], "status": r["status"],
                             "output": r["output"], "duration_ms": r["duration_ms"], "ran_at": now_iso(),
                             "formal": true, "run_by": "test-container", "work_item": work_item,
                             "bundle": bkey, "scope": target,
                         }),
-                        None,
+                        build.as_deref(),
                     )
                     .await?;
             }
@@ -469,7 +483,7 @@ impl Orchestrator {
         let prev = self
             .store
             .aql(
-                "FOR t IN @@test_runs FILTER t.test_symbol == @s AND t.formal != false
+                "FOR t IN @@test_logs FILTER t.test == @s AND t.formal != false AND t.kind != 'run'
                    SORT t.ran_at DESC LIMIT 1 RETURN t.status",
                 json!({"s": r["id"]}),
             )
@@ -503,14 +517,16 @@ impl Orchestrator {
             .edges
             .iter()
             .find(|e| e.from == test && e.kind.is_build_dependency())
-            .map(|e| format!("symbols/{}", e.to))
+            .map(|e| kodehub_store::queries::node_id(g, &e.to))
             .or_else(|| {
                 g.edges
                     .iter()
-                    .find(|e| e.to == test && e.kind == kodehub_core::model::CodeEdgeKind::TestedBy)
-                    .map(|e| format!("symbols/{}", e.from))
+                    .find(|e| {
+                        e.to == test && e.kind == kodehub_core::model::CodeEdgeKind::TestedWith
+                    })
+                    .map(|e| kodehub_store::queries::node_id(g, &e.from))
             })
-            .unwrap_or_else(|| format!("symbols/{test}"));
+            .unwrap_or_else(|| format!("tests/{test}"));
         let w = self
             .store
             .enqueue(&NewWorkItem {
@@ -528,7 +544,8 @@ impl Orchestrator {
         Ok(Some(w["_key"].clone()))
     }
 
-    /// Artifact node, linked to the versions it was built from (spec §5.2).
+    /// A build (docs/ontology.md `builds`) of a test bundle, linked to the versions it was
+    /// built from (spec §5.2): the tests and everything in their closures.
     async fn record_artifact(
         &self,
         bkey: &str,
@@ -539,31 +556,20 @@ impl Orchestrator {
         ids: &[String],
     ) -> anyhow::Result<()> {
         let target = format!("{}-test", lang.as_str());
-        let k = blake3::hash(format!("{bkey}|{target}").as_bytes()).to_hex()[..24].to_string();
+        let members: Vec<String> = g
+            .closure(ids, false)
+            .map(|m| m.into_values().collect())
+            .unwrap_or_default();
         self.store
-            .db
-            .upsert(
-                "artifacts",
-                &json!({"_key": k, "closure_hash": bkey, "build_target": target, "status": "ok",
-                        "storage_key": akey, "built_at": now_iso(), "tests": manifest["tests"].as_array().map(|a| a.len()),
-                        "toolchain": manifest["toolchain"], "path": akey}),
+            .record_build(
+                bkey,
+                &target,
+                json!({"status": "ok", "storage_key": akey, "tests": manifest["tests"].as_array().map(|a| a.len()),
+                       "toolchain": manifest["toolchain"], "path": akey}),
+                &members,
                 None,
             )
             .await?;
-        for t in ids {
-            if let Some(s) = g.symbols.get(t) {
-                let from = format!("artifacts/{k}");
-                let to = format!("versions/{}", s.version);
-                self.store
-                    .db
-                    .insert_ignore(
-                        "built_from",
-                        &json!({"_key": kodehub_store::edge_key("built_from", &from, &to), "_from": from, "_to": to}),
-                        None,
-                    )
-                    .await?;
-            }
-        }
         Ok(())
     }
 
@@ -585,7 +591,7 @@ impl Orchestrator {
             .store
             .db
             .aql_raw(
-                "FOR w IN kodehub_work_items FILTER w.state == 'queued' AND w.agent_type IN @types
+                "FOR w IN work_items FILTER w.state == 'queued' AND w.agent_type IN @types
                    COLLECT p = w.project, t = w.agent_type WITH COUNT INTO n RETURN {p, t, n}",
                 json!({"types": kodehub_store::queue::AGENT_TYPES}),
             )
@@ -621,10 +627,10 @@ impl Orchestrator {
         let w = self
             .store
             .enqueue(&NewWorkItem {
+                target: Some(kodehub_store::c4::project_node_of(&project)),
                 project,
                 agent_type: "sysadmin".into(),
                 kind: "tune_caps".into(),
-                target: Some("philosophy/philosophy".into()),
                 priority: kodehub_store::queue::PRIORITY_LOW,
                 task: json!({
                     "cpus": cpus, "load1": load1, "overloaded": overloaded,
@@ -710,8 +716,8 @@ impl AgentDispatcher {
         let kind = w["kind"].as_str().unwrap_or("").to_string();
         let target = w["target"]
             .as_str()
-            .unwrap_or("philosophy/philosophy")
-            .to_string();
+            .map(str::to_string)
+            .unwrap_or_else(|| kodehub_store::c4::project_node_of(&project));
         self.events.emit(
             "agent.activity",
             json!({"role": agent_type, "work_item": key, "message": format!("claimed {kind} on {target}")}),
@@ -734,9 +740,9 @@ impl AgentDispatcher {
         let outcome = if agent_type == "coding" {
             self.coding(w, &kind, &target).await
         } else if agent_type == "review" {
-            // reviews run inside the changeset engine; a standalone review item is informational
+            // reviews run inside a work item's proposal; a standalone review item is informational
             Ok(Outcome::Done(
-                json!({"note": "reviews run inside changesets"}),
+                json!({"note": "reviews run inside work item proposals"}),
             ))
         } else {
             self.role(w, &agent_type).await
@@ -748,8 +754,8 @@ impl AgentDispatcher {
                     .complete_work_item(&key, &self.owner, log, result)
                     .await?;
             }
-            Ok(Outcome::Waiting(cs)) => {
-                self.store.park_work_item(&key, &self.owner, &cs).await?;
+            Ok(Outcome::Waiting) => {
+                self.store.park_work_item(&key, &self.owner).await?;
             }
             Ok(Outcome::Failed(reason, log)) => {
                 self.store
@@ -777,13 +783,25 @@ impl AgentDispatcher {
         Ok(())
     }
 
-    /// Coding work: a changeset driven through plan → tests → code → blind review → formal
-    /// tests → promotion. Requirement edits reuse the engine's requirement path.
+    /// Coding work: the work item's proposal driven through plan → tests → code → blind review
+    /// → formal tests → acceptance. Requirement edits reuse the engine's requirement path.
     async fn coding(&self, w: &Value, kind: &str, target: &str) -> kodehub_agents::Result<Outcome> {
+        let key = w["_key"].as_str().unwrap_or_default().to_string();
         let cs_key = if kind == "requirement_changed" {
             let req = kodehub_store::key_of(target).to_string();
             let by = w["requested_by"].as_str().unwrap_or("human").to_string();
-            self.engine.on_requirement_edited(&req, &by).await?
+            let k = self.engine.on_requirement_edited(&req, &by, &key).await?;
+            if k != key {
+                // another open proposal already addresses this edit: this item folds into it
+                return Ok(Outcome::Done(
+                    json!({"addressed_by": k, "change_log": format!("requirement {req} is addressed by work item {k}")}),
+                ));
+            }
+            k
+        } else if w["proposal"].is_object() {
+            // the item already carries its proposal (opened by hand or in chat): resume it
+            self.engine.execute(&key).await?;
+            key.clone()
         } else {
             let reqs: Vec<String> = self
                 .store
@@ -797,13 +815,12 @@ impl AgentDispatcher {
                 .filter_map(|r| r["key"].as_str().map(str::to_string))
                 .collect();
             let failing = w["failing_tests"].clone();
-            let cs = self
-                .store
-                .open_changeset(
+            self.store
+                .open_proposal(
+                    &key,
                     &format!("{} {}", kind.replace('_', " "), target),
                     &format!(
-                        "Work item {}: {kind} on {target}. Task: {}. Failing tests: {failing}. Earlier attempts: {}",
-                        w["_key"].as_str().unwrap_or(""),
+                        "Work item {key}: {kind} on {target}. Task: {}. Failing tests: {failing}. Earlier attempts: {}",
                         w["task"],
                         w["history"]
                     ),
@@ -811,29 +828,25 @@ impl AgentDispatcher {
                     "orchestrator",
                 )
                 .await?;
-            let k = cs["_key"].as_str().unwrap_or_default().to_string();
             self.store
-                .patch_changeset(&k, json!({"work_item": w["_key"], "origin": kind}))
+                .patch_proposal(&key, json!({"origin": kind}))
                 .await?;
-            self.engine.plan(&k).await?;
-            k
+            self.engine.plan(&key).await?;
+            key.clone()
         };
-        self.store
-            .patch_changeset(&cs_key, json!({"work_item": w["_key"]}))
-            .await?;
-        let cs = self.store.get_changeset(&cs_key).await?;
+        let cs = self.store.get_proposal(&cs_key).await?;
         Ok(match cs["state"].as_str() {
-            Some("merged") => Outcome::Done(json!({"changeset": cs_key, "merged": true,
+            Some("accepted") => Outcome::Done(json!({"work_item": cs_key, "accepted": true,
                                                      "change_log": cs["activity"]})),
-            Some("planned") => Outcome::Waiting(cs_key),
+            Some("planned") => Outcome::Waiting,
             Some(other) => Outcome::Failed(
                 format!(
-                    "changeset {cs_key} ended {other}: {}",
+                    "the proposal of {cs_key} ended {other}: {}",
                     cs["error"].as_str().unwrap_or("")
                 ),
-                json!({"changeset": cs_key, "state": other}),
+                json!({"work_item": cs_key, "state": other}),
             ),
-            None => Outcome::Failed("changeset vanished".into(), json!({})),
+            None => Outcome::Failed("the proposal vanished".into(), json!({})),
         })
     }
 
@@ -877,7 +890,7 @@ impl AgentDispatcher {
 enum Outcome {
     Done(Value),
     /// Waiting for a human (a plan under `human_engagement = plans`).
-    Waiting(String),
+    Waiting,
     Failed(String, Value),
 }
 
@@ -909,7 +922,7 @@ pub async fn enqueue_kickoff(
             .enqueue(&mk(
                 "architect",
                 "cleanup_philosophy",
-                "philosophy/philosophy",
+                &kodehub_store::c4::project_node_of(project),
                 vec![],
             ))
             .await?;
@@ -920,7 +933,7 @@ pub async fn enqueue_kickoff(
         .enqueue(&mk(
             "architect",
             "evaluate_requirements",
-            "philosophy/philosophy",
+            &kodehub_store::c4::project_node_of(project),
             prev,
         ))
         .await?;

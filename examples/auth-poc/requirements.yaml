@@ -1,5 +1,6 @@
 - _key: r1-generic-failure
   kind: business
+  tags: [secure-authentication]
   title: R1 — Generic failure
   statement: Failed logins return one generic error.
   intent: An attacker must not learn whether a username exists or which credential was wrong.
@@ -20,6 +21,7 @@
     - Rate limiting and lockout policy.
 - _key: r2-hashed-storage
   kind: technical
+  tags: [secure-authentication]
   title: R2 — Hashed storage
   statement: Passwords are stored only as Argon2id hashes.
   intent: A leaked user table must not reveal passwords.
@@ -33,3 +35,13 @@
   edge_cases: []
   out_of_scope:
     - Parameter tuning for production hardware.
+# A recorded decision is a requirement of kind `decision` (docs/ontology.md).
+- _key: generic-failure-message
+  kind: decision
+  tags: [secure-authentication]
+  title: Do not reveal which credential failed
+  statement: Return a single `invalid_credentials` result for every failed login.
+  rationale: Prevents username enumeration.
+  alternatives:
+    - Distinct "unknown user" and "wrong password" errors (rejected — enables enumeration).
+  made_by: human

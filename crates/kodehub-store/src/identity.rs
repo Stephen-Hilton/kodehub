@@ -2,8 +2,8 @@
 //! and permissions (spec §6, §11.1, §13A).
 //!
 //! These records are global (not inside a project's collection set). Ownership and permissions
-//! are edges: `kodehub_member_of` (user → org, `role`), `kodehub_access` (user | org → project,
-//! `permission`) and `kodehub_acts_for` (agent user → human user | org). A project's owner is
+//! are edges: `works_with` (user → org, `role`), `has_access` (user | org → project,
+//! `permission`) and `acts_for` (agent user → human user | org). A project's owner is
 //! recorded on its registry document (`owner`).
 //!
 //! Secrets are never stored: passwords as argon2 hashes, session and access tokens as BLAKE3
@@ -20,16 +20,18 @@ use serde_json::{json, Value};
 use crate::schema::PROJECTS;
 use crate::{Result, Store, StoreError};
 
-pub const USERS: &str = "kodehub_users";
-pub const ORGS: &str = "kodehub_orgs";
-pub const MEMBER_OF: &str = "kodehub_member_of";
-pub const ACCESS: &str = "kodehub_access";
-pub const ACTS_FOR: &str = "kodehub_acts_for";
-pub const SESSIONS: &str = "kodehub_sessions";
-pub const TOKENS: &str = "kodehub_tokens";
+pub const USERS: &str = "users";
+/// External AI clients that sign in like a user (D-061); never internal agents.
+pub const REMOTE_AGENTS: &str = "remote_agents";
+pub const ORGS: &str = "orgs";
+pub const MEMBER_OF: &str = "works_with";
+pub const ACCESS: &str = "has_access";
+pub const ACTS_FOR: &str = "acts_for";
+pub const SESSIONS: &str = "sessions";
+pub const TOKENS: &str = "tokens";
 
 /// Global document collections owned by this module.
-pub const IDENTITY_DOCS: &[&str] = &[USERS, ORGS, SESSIONS, TOKENS];
+pub const IDENTITY_DOCS: &[&str] = &[USERS, REMOTE_AGENTS, ORGS, SESSIONS, TOKENS];
 /// Global edge collections owned by this module.
 pub const IDENTITY_EDGES: &[&str] = &[MEMBER_OF, ACCESS, ACTS_FOR];
 
@@ -95,10 +97,10 @@ pub struct TokenScope {
 /// The authenticated caller of an API request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Principal {
-    /// User key (`kodehub_users/<key>`). For internal tokens, the agent role name.
+    /// User key (`users/<key>`). For internal tokens, the agent role name.
     pub user: String,
     pub kind: UserKind,
-    /// The human user (`kodehub_users/x`) or org (`kodehub_orgs/y`) an agent acts for.
+    /// The human user (`users/x`) or org (`orgs/y`) an agent acts for.
     pub acts_for: Option<String>,
     pub via: AuthVia,
     pub scope: Option<TokenScope>,
@@ -109,8 +111,20 @@ pub struct Principal {
 }
 
 impl Principal {
+    /// The caller's id: `users/<key>` for a human, `remote_agents/<key>` for an external agent,
+    /// `internal/<role>` for an orchestrator-run agent (not a document).
     pub fn id(&self) -> String {
-        format!("{USERS}/{}", self.user)
+        match (self.kind, self.via) {
+            (UserKind::Human, _) => format!("{USERS}/{}", self.user),
+            (UserKind::Agent, AuthVia::Internal) => format!("internal/{}", self.user),
+            (UserKind::Agent, _) => format!("{REMOTE_AGENTS}/{}", self.user),
+        }
+    }
+    /// An external agent (signed in with a token for a remote agent), as opposed to a human or
+    /// an internal agent run by the orchestrator. Remote agents never change code, build or
+    /// deploy (D-061).
+    pub fn is_remote_agent(&self) -> bool {
+        self.kind == UserKind::Agent && self.via != AuthVia::Internal
     }
     /// A human signed in with a session (the only identity allowed human-only actions).
     pub fn is_human(&self) -> bool {
@@ -370,10 +384,16 @@ impl Store {
         user: &str,
         disabled: bool,
     ) -> Result<()> {
-        let target = self.get_user(user).await?;
-        let allowed = by.is_admin && by.is_human()
-            || (target["kind"] == "agent" && self.controls_agent(by, user).await?);
-        if !allowed {
+        if self.g_get(REMOTE_AGENTS, user).await?.is_some() {
+            if !(by.is_admin && by.is_human() || self.controls_agent(by, user).await?) {
+                return Err(StoreError::Invalid("not allowed".into()));
+            }
+            self.g_patch(REMOTE_AGENTS, user, &json!({"disabled": disabled}))
+                .await?;
+            return Ok(());
+        }
+        self.get_user(user).await?;
+        if !(by.is_admin && by.is_human()) {
             return Err(StoreError::Invalid("not allowed".into()));
         }
         self.g_patch(USERS, user, &json!({"disabled": disabled}))
@@ -423,7 +443,7 @@ impl Store {
             "_key": key, "username": key, "kind": "agent", "display_name": name.trim(),
             "is_admin": false, "disabled": false, "created_at": now_iso(), "created_by": by.id(),
         });
-        let created = match self.g_insert(USERS, &doc).await {
+        let created = match self.g_insert(REMOTE_AGENTS, &doc).await {
             Err(e) if e.is_unique_violation() => {
                 return Err(StoreError::Conflict(format!(
                     "agent `{name}` already exists"
@@ -433,7 +453,7 @@ impl Store {
         };
         self.g_insert(
             ACTS_FOR,
-            &json!({"_from": format!("{USERS}/{key}"), "_to": acts_for, "created_at": now_iso()}),
+            &json!({"_from": format!("{REMOTE_AGENTS}/{key}"), "_to": acts_for, "created_at": now_iso()}),
         )
         .await?;
         let mut out = public_user(&created);
@@ -445,7 +465,7 @@ impl Store {
         Ok(self
             .g_aql(
                 "FOR e IN @@a FILTER e._from == @u LIMIT 1 RETURN e._to",
-                json!({"@a": ACTS_FOR, "u": format!("{USERS}/{agent}")}),
+                json!({"@a": ACTS_FOR, "u": format!("{REMOTE_AGENTS}/{agent}")}),
             )
             .await?
             .first()
@@ -472,10 +492,10 @@ impl Store {
     pub async fn list_agent_users(&self, by: &Principal) -> Result<Vec<Value>> {
         let rows = self
             .g_aql(
-                "FOR u IN @@u FILTER u.kind == 'agent'
+                "FOR u IN @@u
                    LET af = FIRST(FOR e IN @@a FILTER e._from == u._id RETURN e._to)
                    SORT u.created_at RETURN MERGE(u, {acts_for: af})",
-                json!({"@u": USERS, "@a": ACTS_FOR}),
+                json!({"@u": REMOTE_AGENTS, "@a": ACTS_FOR}),
             )
             .await?;
         let mut out = Vec::new();
@@ -646,7 +666,7 @@ impl Store {
             });
         }
         let agent = t["user"].as_str().unwrap_or_default();
-        let u = self.g_get(USERS, agent).await?.ok_or_else(unauth)?;
+        let u = self.g_get(REMOTE_AGENTS, agent).await?.ok_or_else(unauth)?;
         if u["disabled"] == true {
             return Err(unauth());
         }

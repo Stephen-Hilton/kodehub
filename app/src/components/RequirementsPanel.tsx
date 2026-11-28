@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import type { Group, Requirement } from "../lib/api";
+import { localKey, type Requirement, type TagCoverage } from "../lib/api";
 import { healthOf } from "../lib/health";
 import { Beaker, Edit, Play, Plus } from "./icons";
 
@@ -7,13 +7,14 @@ export function StatusBadge({ status }: { status: string }) {
   return <span className={`badge ${status}`}>{healthOf(status).label}</span>;
 }
 
-export function RequirementsPanel({ requirements, groups, selected, onSelect, onOpen, onAddEdgeCase, onNew, onRunTests, running, insights }: {
-  requirements: Requirement[]; groups: Group[]; selected: string | null;
+export function RequirementsPanel({ requirements, tags, selected, onSelect, onOpen, onAddEdgeCase, onNew, onRunTests, running, insights }: {
+  requirements: Requirement[]; tags: TagCoverage[]; selected: string | null;
   onSelect: (key: string | null) => void; onOpen: (key: string) => void; onAddEdgeCase: (key: string) => void;
   onNew: () => void; onRunTests: () => void; running: boolean; insights?: React.ReactNode;
 }) {
   const byId = useMemo(() => new Map(requirements.map((r) => [r._id, r])), [requirements]);
-  const grouped = new Set(groups.flatMap((g) => g.members));
+  // requirements group by tag (one may carry several tags and show under each)
+  const grouped = new Set(tags.flatMap((g) => g.members));
   const ungrouped = requirements.filter((r) => !grouped.has(r._id));
   const counts = { pass: 0, at_risk: 0, fail: 0, uncovered: 0 } as Record<string, number>;
   for (const r of requirements) counts[r.status === "uncovered" ? "uncovered" : r.status] = (counts[r.status] ?? 0) + 1;
@@ -26,7 +27,7 @@ export function RequirementsPanel({ requirements, groups, selected, onSelect, on
       <div
         key={r._key}
         className={`req ${selected === r._key ? "active" : ""}`}
-        data-testid={`req-${r._key}`}
+        data-testid={`req-${localKey(r._key)}`}
         onClick={() => onSelect(selected === r._key ? null : r._key)}
         onDoubleClick={() => onOpen(r._key)}
       >
@@ -42,7 +43,7 @@ export function RequirementsPanel({ requirements, groups, selected, onSelect, on
             <span className="chip" title="Edge cases">{r.edge_cases.length} edge case{r.edge_cases.length === 1 ? "" : "s"}</span>
             <span className="chip" title="Revision">rev {r.revision}</span>
             <span className="spacer" />
-            <button className="btn sm ghost-btn" title="Add edge case" data-testid={`add-edge-${r._key}`}
+            <button className="btn sm ghost-btn" title="Add edge case" data-testid={`add-edge-${localKey(r._key)}`}
               onClick={(e) => { e.stopPropagation(); onAddEdgeCase(r._key); }}>
               <Plus size={12} /> Edge case
             </button>
@@ -78,12 +79,12 @@ export function RequirementsPanel({ requirements, groups, selected, onSelect, on
         <span><i className="dot" style={{ background: "var(--fail)" }} />{counts.fail ?? 0} failing</span>
       </div>
       <div className="scroll">
-        {groups.map((g) => (
-          <div className="group" key={g.id}>
+        {tags.map((g) => (
+          <div className="group" key={g.tag} data-testid={`tag-${g.tag}`}>
             <div className="group-head">
               <span className="dot" style={{ background: healthOf(g.status).color }} />
-              <span style={{ flex: 1 }}>{g.title}</span>
-              <span className="group-logic">{g.logic}</span>
+              <span style={{ flex: 1 }}>#{g.tag}</span>
+              <span className="group-logic">{g.members.length}</span>
               <StatusBadge status={g.status} />
             </div>
             {g.members.map((m) => byId.get(m)).filter(Boolean).map((r) => item(r!))}
@@ -91,7 +92,7 @@ export function RequirementsPanel({ requirements, groups, selected, onSelect, on
         ))}
         {ungrouped.length > 0 && (
           <div className="group">
-            <div className="group-head"><span className="faint" style={{ flex: 1 }}>Ungrouped</span></div>
+            <div className="group-head"><span className="faint" style={{ flex: 1 }}>Untagged</span></div>
             {ungrouped.map(item)}
           </div>
         )}

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type Changeset, type Json } from "../lib/api";
+import { api, localKey, type Json, type Proposal } from "../lib/api";
 import { relTime, STATE_ORDER, stateIndex } from "../lib/health";
 import { Bot, Check, Link, Scale, Send, X } from "./icons";
 import { useToast } from "./Toasts";
@@ -10,8 +10,8 @@ const ROLE_COLORS: Record<string, string> = {
 
 type Todo = { label: string; done: boolean; now?: boolean };
 
-/** Per-agent checklist for the active changeset (doc 05: status, current task and to-do list). */
-export function agentTodos(cs: Changeset | undefined): Record<string, Todo[]> {
+/** Per-agent checklist for the active proposal (doc 05: status, current task and to-do list). */
+export function agentTodos(cs: Proposal | undefined): Record<string, Todo[]> {
   if (!cs) return {};
   const props = Object.values(cs.proposals ?? {});
   const code = props.filter((p: Json) => p.kind !== "test").length;
@@ -23,8 +23,8 @@ export function agentTodos(cs: Changeset | undefined): Record<string, Todo[]> {
     orchestrator: [
       { label: "plan", done: !!cs.plan, now: cs.state === "draft" },
       { label: "your approval", done: i >= stateIndex("approved"), now: cs.state === "planned" },
-      { label: "decisions", done: (cs.decisions?.length ?? 0) > 0 || cs.state === "merged" },
-      { label: "merge", done: cs.state === "merged", now: cs.state === "ready" },
+      { label: "decisions", done: (cs.decisions?.length ?? 0) > 0 || cs.state === "accepted" },
+      { label: "accept", done: cs.state === "accepted", now: cs.state === "ready" },
     ],
     tester: [
       { label: `tests from requirements${tests ? ` (${tests})` : ""}`, done: tests > 0, now: cs.state === "building" && tests === 0 },
@@ -40,7 +40,7 @@ export function agentTodos(cs: Changeset | undefined): Record<string, Todo[]> {
   };
 }
 
-function Team({ agents, active }: { agents: Json; active?: Changeset }) {
+function Team({ agents, active }: { agents: Json; active?: Proposal }) {
   const todos = agentTodos(active);
   return (
     <div style={{ padding: "4px 10px 8px" }} data-testid="agent-team">
@@ -76,17 +76,17 @@ function Pipeline({ state }: { state: string }) {
       <div className={`pipeline ${state}`} title={state}>
         {STATE_ORDER.slice(1).map((s, i) => {
           const pos = i + 1;
-          const cls = state === "merged" ? "done" : pos < idx ? "done" : pos === idx || (terminal && pos === 1) ? "now" : "";
+          const cls = state === "accepted" ? "done" : pos < idx ? "done" : pos === idx || (terminal && pos === 1) ? "now" : "";
           return <div key={s} className={cls} />;
         })}
       </div>
-      <div className="pipeline-labels"><span>plan</span><span>approve</span><span>build</span><span>review</span><span>test</span><span>merge</span></div>
+      <div className="pipeline-labels"><span>plan</span><span>approve</span><span>build</span><span>review</span><span>test</span><span>accept</span></div>
     </>
   );
 }
 
 /** Confidence flags shown on every card face. */
-function Flags({ c }: { c: Changeset }) {
+function Flags({ c }: { c: Proposal }) {
   const latest = new Map<string, Json>();
   for (const r of c.reviews ?? []) for (const f of r.findings ?? []) latest.set(f.id, f);
   const findings = [...latest.values()];
@@ -110,8 +110,8 @@ function Flags({ c }: { c: Changeset }) {
   );
 }
 
-/** Human resolution of an escalated changeset (send back with guidance, or accept and re-test). */
-function Resolve({ cs }: { cs: Changeset }) {
+/** Human resolution of an escalated proposal (send back with guidance, or accept and re-test). */
+function Resolve({ cs }: { cs: Proposal }) {
   const toast = useToast();
   const [choice, setChoice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -134,14 +134,14 @@ function Resolve({ cs }: { cs: Changeset }) {
   );
 }
 
-export function ChangesetCard({ cs, requirementsTitle }: { cs: Changeset; requirementsTitle: (k: string) => string }) {
+export function ProposalCard({ cs, requirementsTitle }: { cs: Proposal; requirementsTitle: (k: string) => string }) {
   const toast = useToast();
-  const [full, setFull] = useState<Changeset | null>(null);
+  const [full, setFull] = useState<Proposal | null>(null);
   const [busy, setBusy] = useState(false);
   const [showLog, setShowLog] = useState(false);
-  const closed = ["merged", "rejected"].includes(cs.state);
+  const closed = ["accepted", "rejected"].includes(cs.state);
   const [expanded, setExpanded] = useState(!closed);
-  useEffect(() => { api.changeset(cs._key).then(setFull).catch(() => {}); }, [cs]);
+  useEffect(() => { api.proposal(cs._key).then(setFull).catch(() => {}); }, [cs]);
   const c = full ?? cs;
   const act = async (f: () => Promise<unknown>, ok: string) => {
     setBusy(true);
@@ -154,16 +154,16 @@ export function ChangesetCard({ cs, requirementsTitle }: { cs: Changeset; requir
   const allFindings: Json[] = c.reviews?.flatMap((r) => r.findings) ?? [];
   const uniqueFindings = [...new Map(allFindings.map((f) => [f.id, f])).values()];
   const passed = (c.test_results ?? []).filter((t: Json) => t.status === "pass").length;
-  const stateBadge = c.state === "merged" ? "pass" : c.state === "escalated" || c.state === "rejected" ? "fail" : c.state === "planned" ? "at_risk" : "ghost";
+  const stateBadge = c.state === "accepted" ? "pass" : c.state === "escalated" || c.state === "rejected" ? "fail" : c.state === "planned" ? "at_risk" : "ghost";
   return (
-    <div className="card cs" data-testid={`changeset-${c._key}`} data-state={c.state}>
+    <div className="card cs" data-testid={`proposal-${c._key}`} data-state={c.state}>
       <div className="row" style={{ alignItems: "flex-start" }}>
         <div className="cs-title" style={{ flex: 1 }}>{c.title}</div>
         <span className={`badge ${stateBadge}`} data-testid="cs-state">{c.state}</span>
       </div>
       <div className="row" style={{ marginTop: 6, flexWrap: "wrap", gap: 4 }}>
         {c.requirements.map((r) => <span className="chip" key={r}>{requirementsTitle(r)}</span>)}
-        <span className="faint" style={{ fontSize: 11 }}>{relTime(c.merged_at ?? c.created_at)}</span>
+        <span className="faint" style={{ fontSize: 11 }}>{relTime(c.accepted_at ?? c.created_at)}</span>
       </div>
       <Pipeline state={c.state} />
       <Flags c={c} />
@@ -201,14 +201,14 @@ export function ChangesetCard({ cs, requirementsTitle }: { cs: Changeset; requir
             onClick={() => act(() => api.approve(c._key), "Plan approved — tester, coder and reviewer are on it.")}>
             <Check size={12} /> Approve plan
           </button>
-          <button className="btn sm danger" disabled={busy} onClick={() => act(() => api.reject(c._key, "rejected by human"), "Changeset rejected")}>
+          <button className="btn sm danger" disabled={busy} onClick={() => act(() => api.reject(c._key, "rejected by human"), "Proposal rejected")}>
             <X size={12} /> Reject
           </button>
         </div>
       )}
       {c.state === "ready" && (
         <div className="row" style={{ marginTop: 10 }}>
-          <button className="btn good sm" disabled={busy} onClick={() => act(() => api.merge(c._key), "Merged")} data-testid="cs-merge">Merge</button>
+          <button className="btn good sm" disabled={busy} onClick={() => act(() => api.accept(c._key), "Accepted into the project version")} data-testid="cs-accept">Accept</button>
         </div>
       )}
       {c.error && (
@@ -323,7 +323,7 @@ function Chat({ selectedNode, onClearRef }: { selectedNode: string | null; onCle
                     }}>Discard</button>
                   </div>
                 )}
-                {m.status === "applied" && <div className="faint" style={{ fontSize: 11, marginTop: 4 }}>✓ applied{m.changeset ? ` · changeset ${m.changeset}` : ""}</div>}
+                {m.status === "applied" && <div className="faint" style={{ fontSize: 11, marginTop: 4 }}>✓ applied{(m.work_item ?? m.changeset) ? ` · work item ${m.work_item ?? m.changeset}` : ""}</div>}
                 {m.status === "discarded" && <div className="faint" style={{ fontSize: 11, marginTop: 4 }}>discarded</div>}
               </div>
             )}
@@ -365,7 +365,7 @@ function Decisions() {
           <div className="faint" style={{ marginTop: 6, fontSize: 11.5 }}>{d.rationale}</div>
           <div className="row" style={{ marginTop: 8, gap: 4, flexWrap: "wrap" }}>
             <span className="chip">{d.made_by}</span>
-            {d.justifies?.map((j: string) => <span className="chip mono" key={j}>{j.split("/")[1]}</span>)}
+            {d.justifies?.map((j: string) => <span className="chip mono" key={j}>{localKey(j)}</span>)}
             <span className="spacer" /><span className="faint" style={{ fontSize: 11 }}>{relTime(d.created_at)}</span>
           </div>
         </div>
@@ -374,14 +374,14 @@ function Decisions() {
   );
 }
 
-export function AgentsPanel({ agents, changesets, requirementsTitle, selectedNode, onClearRef }: {
-  agents: Json; changesets: Changeset[]; requirementsTitle: (k: string) => string; selectedNode: string | null; onClearRef: () => void;
+export function AgentsPanel({ agents, proposals, requirementsTitle, selectedNode, onClearRef }: {
+  agents: Json; proposals: Proposal[]; requirementsTitle: (k: string) => string; selectedNode: string | null; onClearRef: () => void;
 }) {
-  const [tab, setTab] = useState<"changesets" | "chat" | "decisions">("changesets");
-  const open = changesets.filter((c) => !["merged", "rejected"].includes(c.state));
-  const done = changesets.filter((c) => ["merged", "rejected"].includes(c.state)).slice(0, 6);
+  const [tab, setTab] = useState<"proposals" | "chat" | "decisions">("proposals");
+  const open = proposals.filter((c) => !["accepted", "rejected"].includes(c.state));
+  const done = proposals.filter((c) => ["accepted", "rejected"].includes(c.state)).slice(0, 6);
   const prevOpen = useRef(open.length);
-  useEffect(() => { if (open.length > prevOpen.current) setTab("changesets"); prevOpen.current = open.length; }, [open.length]);
+  useEffect(() => { if (open.length > prevOpen.current) setTab("proposals"); prevOpen.current = open.length; }, [open.length]);
   return (
     <aside className="col sidebar right" data-testid="agents-panel">
       <div className="section-head">
@@ -392,16 +392,16 @@ export function AgentsPanel({ agents, changesets, requirementsTitle, selectedNod
       </div>
       <Team agents={agents} active={open[0]} />
       <div className="tabs">
-        <button className={`tab ${tab === "changesets" ? "active" : ""}`} onClick={() => setTab("changesets")} data-testid="tab-changesets">Changesets <span className="count">{open.length}</span></button>
+        <button className={`tab ${tab === "proposals" ? "active" : ""}`} onClick={() => setTab("proposals")} data-testid="tab-proposals">Proposals <span className="count">{open.length}</span></button>
         <button className={`tab ${tab === "chat" ? "active" : ""}`} onClick={() => setTab("chat")} data-testid="tab-chat">Orchestrator</button>
         <button className={`tab ${tab === "decisions" ? "active" : ""}`} onClick={() => setTab("decisions")} data-testid="tab-decisions">Decisions</button>
       </div>
-      {tab === "changesets" && (
+      {tab === "proposals" && (
         <div className="scroll" style={{ paddingBottom: 10 }}>
-          {open.length === 0 && done.length === 0 && <div className="empty">No changesets. Edit a requirement or ask the orchestrator.</div>}
-          {open.map((c) => <ChangesetCard key={c._key + c.state} cs={c} requirementsTitle={requirementsTitle} />)}
+          {open.length === 0 && done.length === 0 && <div className="empty">No proposals. Edit a requirement or ask the orchestrator.</div>}
+          {open.map((c) => <ProposalCard key={c._key + c.state} cs={c} requirementsTitle={requirementsTitle} />)}
           {done.length > 0 && <div className="section-head"><span className="section-title">Recently closed</span></div>}
-          {done.map((c) => <ChangesetCard key={c._key + c.state} cs={c} requirementsTitle={requirementsTitle} />)}
+          {done.map((c) => <ProposalCard key={c._key + c.state} cs={c} requirementsTitle={requirementsTitle} />)}
         </div>
       )}
       {tab === "chat" && <Chat selectedNode={selectedNode} onClearRef={onClearRef} />}

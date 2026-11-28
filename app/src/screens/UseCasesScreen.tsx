@@ -2,7 +2,7 @@
 // it relates to and the tests that define its expected outcome. Draft → live (after an
 // architect agent checks it against the live ones).
 import { useEffect, useState } from "react";
-import { api, type Json } from "../lib/api";
+import { api, localKey, type Json } from "../lib/api";
 import { useToast } from "../components/Toasts";
 
 export function UseCasesScreen({ requirements, tests }: { requirements: Json[]; tests: { id: string; label: string }[] }) {
@@ -50,13 +50,13 @@ function UseCaseCard({ uc, tests, onChange }: { uc: Json; tests: { id: string; l
   const [pick, setPick] = useState("");
   const tone = uc.state === "live" ? "pass" : uc.state === "checking" ? "risk" : "";
   return (
-    <div className="card uc" data-testid={`uc-${uc._key}`}>
+    <div className="card uc" data-testid={`uc-${localKey(uc._key)}`}>
       <div className="row">
         <b>{uc.name}</b>
-        <span className={`badge ${tone}`} data-testid={`uc-state-${uc._key}`}>{uc.state}</span>
+        <span className={`badge ${tone}`} data-testid={`uc-state-${localKey(uc._key)}`}>{uc.state}</span>
         <span className="spacer" />
         {uc.state === "draft" && (
-          <button className="btn sm primary" data-testid={`uc-live-${uc._key}`} disabled={!uc.tests?.length} title={uc.tests?.length ? "" : "Add an expected-outcome test first"}
+          <button className="btn sm primary" data-testid={`uc-live-${localKey(uc._key)}`} disabled={!uc.tests?.length} title={uc.tests?.length ? "" : "Add an expected-outcome test first"}
             onClick={() => api.setUseCaseState(uc._key, "live").then(onChange).catch((e) => toast("error", e.message))}>Go live</button>
         )}
         {uc.state !== "draft" && (
@@ -69,12 +69,12 @@ function UseCaseCard({ uc, tests, onChange }: { uc: Json; tests: { id: string; l
         Requirements: {uc.requirements?.map((r: Json) => r.title).join(", ") || "—"} · Expected-outcome tests: {uc.tests?.map((t: Json) => t.name).join(", ") || "none yet"}
       </div>
       <div className="row">
-        <select className="input" value={pick} onChange={(e) => setPick(e.target.value)} data-testid={`uc-test-pick-${uc._key}`}>
+        <select className="input" value={pick} onChange={(e) => setPick(e.target.value)} data-testid={`uc-test-pick-${localKey(uc._key)}`}>
           <option value="">Add an expected-outcome test…</option>
           {tests.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
         </select>
-        <button className="btn sm" disabled={!pick} data-testid={`uc-test-add-${uc._key}`}
-          onClick={() => api.linkUseCase(uc._key, "expected_by", pick).then(() => { setPick(""); onChange(); }).catch((e) => toast("error", e.message))}>Link</button>
+        <button className="btn sm" disabled={!pick} data-testid={`uc-test-add-${localKey(uc._key)}`}
+          onClick={() => api.linkUseCase(uc._key, "verified_by", pick).then(() => { setPick(""); onChange(); }).catch((e) => toast("error", e.message))}>Link</button>
       </div>
     </div>
   );

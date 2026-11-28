@@ -52,18 +52,13 @@ impl RecordedBackend {
     pub fn remaining(&self) -> usize {
         self.queues.lock().unwrap().values().map(|q| q.len()).sum()
     }
-}
 
-#[async_trait::async_trait]
-impl AgentBackend for RecordedBackend {
-    fn name(&self) -> &str {
-        "recorded"
-    }
-
-    async fn run(&self, task: &AgentTask) -> Result<AgentOutput> {
+    /// Take the next recorded answer for this task's role (in recording order). Agent
+    /// containers are fresh for every task, so the server keeps the recording's position and
+    /// hands each container its answer.
+    pub fn next_output(&self, task: &AgentTask) -> Result<Value> {
         self.calls.lock().unwrap().push(task.clone());
-        let out = self
-            .queues
+        self.queues
             .lock()
             .unwrap()
             .get_mut(&task.role)
@@ -75,7 +70,29 @@ impl AgentBackend for RecordedBackend {
                     task.role.as_str(),
                     task.label
                 ))
-            })?;
+            })
+    }
+
+    /// A one-answer recording (what an agent container replays).
+    pub fn single(task: &AgentTask, scenario: &str, output: Value) -> Self {
+        let mut queues = BTreeMap::new();
+        queues.insert(task.role, VecDeque::from([output]));
+        RecordedBackend {
+            queues: Mutex::new(queues),
+            calls: Mutex::new(Vec::new()),
+            scenario: scenario.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for RecordedBackend {
+    fn name(&self) -> &str {
+        "recorded"
+    }
+
+    async fn run(&self, task: &AgentTask) -> Result<AgentOutput> {
+        let out = self.next_output(task)?;
         Ok(AgentOutput {
             text: out.to_string(),
             json: out,

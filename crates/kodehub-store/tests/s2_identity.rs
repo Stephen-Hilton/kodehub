@@ -81,14 +81,12 @@ async fn users_tokens_and_permissions() {
         .unwrap();
     assert!(pat.starts_with("khp_"));
     // only the hash is stored
-    let all = s
-        .aql_global("FOR t IN kodehub_tokens RETURN t", json!({}))
-        .await;
+    let all = s.aql_global("FOR t IN tokens RETURN t", json!({})).await;
     assert!(!serde_json::to_string(&all).unwrap().contains(&pat));
     assert_eq!(rec["prefix"].as_str().unwrap(), &pat[..12]);
     let ap = s.authenticate(&pat).await.unwrap();
     assert!(!ap.is_human());
-    assert_eq!(ap.on_behalf_of().as_deref(), Some("kodehub_users/bob"));
+    assert_eq!(ap.on_behalf_of().as_deref(), Some("users/bob"));
     assert_eq!(
         s.project_permission(&ap, &alpha).await.unwrap(),
         Some(Permission::Read)
@@ -282,12 +280,21 @@ async fn orgs_settings_credentials_audit() {
     // no plaintext anywhere in the database
     let dump = serde_json::to_string(
         &s.db
-            .aql_raw("FOR c IN kodehub_credentials RETURN c", json!({}))
+            .aql_raw("FOR c IN secrets RETURN c", json!({}))
             .await
             .unwrap(),
     )
     .unwrap();
     assert!(!dump.contains("sk-ant"));
+    // each secret points at what it secures (D-061)
+    let secures =
+        s.db.aql_raw("FOR e IN secures SORT e._to RETURN e._to", json!({}))
+            .await
+            .unwrap();
+    assert_eq!(
+        secures,
+        vec![json!(format!("orgs/{o}")), json!("users/carol")]
+    );
 
     // audit
     s.audit(
@@ -306,7 +313,7 @@ async fn orgs_settings_credentials_audit() {
         })
         .await
         .unwrap();
-    assert_eq!(rows[0]["actor"], json!("kodehub_users/alice"));
+    assert_eq!(rows[0]["actor"], json!("users/alice"));
     assert_eq!(rows[0]["actor_class"], json!("human"));
     assert!(!rows[0].to_string().contains("nope"));
 
